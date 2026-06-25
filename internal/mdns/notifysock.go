@@ -227,7 +227,7 @@ func (n *NotifySocket) handle(conn *net.UnixConn) {
 		n.log(fmt.Sprintf("notify: REJECTED connection from uid %d (not permitted)", uid))
 		return
 	}
-	conn.SetReadDeadline(time.Now().Add(notifyReadDeadline))
+	_ = conn.SetReadDeadline(time.Now().Add(notifyReadDeadline))
 	b, err := io.ReadAll(io.LimitReader(conn, maxNotifyMsg))
 	if err != nil {
 		n.log(fmt.Sprintf("notify: read from uid %d: %v", uid, err))

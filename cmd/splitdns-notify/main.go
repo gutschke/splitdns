@@ -372,7 +372,7 @@ func sendUnix(packed []byte, path string) error {
 		return err
 	}
 	defer c.Close()
-	c.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	_ = c.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	_, err = c.Write(packed)
 	return err
 }

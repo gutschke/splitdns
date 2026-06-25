@@ -53,6 +53,16 @@ func reexec() int {
 		fmt.Fprintln(os.Stderr, "netnstest: unshare unavailable; skipping netns e2e")
 		return 0
 	}
+	// Probe whether an unprivileged user+net namespace can actually be created here.
+	// On many CI runners userns uid-mapping is restricted (`unshare: write failed
+	// /proc/self/uid_map: Operation not permitted`), and unshare then exits non-zero
+	// BEFORE exec'ing the test binary — indistinguishable by exit code from a genuine
+	// test failure. Probing first lets a missing capability SKIP cleanly. The probe
+	// mirrors the real flags so it fails iff the real re-exec would.
+	if err := exec.Command("unshare", "-Urn", "--", "true").Run(); err != nil {
+		fmt.Fprintln(os.Stderr, "netnstest: user+net namespaces unavailable here ("+err.Error()+"); skipping netns e2e")
+		return 0
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "netnstest: os.Executable:", err)

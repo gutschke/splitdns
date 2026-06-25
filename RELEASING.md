@@ -4,14 +4,14 @@ Checklist for cutting a tagged release of `splitdns`.
 
 ## Pre-publish gate (first commit / every release)
 
-1. `make install-hooks` is active, or run the privacy gate manually:
+1. `make install-hooks` is active, or run the pristine gate manually. It enforces BOTH
+   no-site-private-strings and no-AI-tool-attribution over the tracked files:
    ```sh
    ./scripts/check-pristine.sh        # must exit 0
    ```
 2. Confirm nothing private would be tracked:
    ```sh
-   git status --ignored               # local/ docs/ dist/ bin/ cover.out .claude/ must be Ignored
-   grep -rIil 'claude\|anthropic\|copilot\|co-authored-by\|generated with' $(git ls-files)   # must be empty
+   git status --ignored               # build artifacts + private trees (local/ docs/ dist/ bin/ cover.out) must be Ignored
    ```
 3. Full gate suite:
    ```sh

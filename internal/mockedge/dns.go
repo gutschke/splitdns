@@ -38,7 +38,7 @@ func NewDNS() (*DNSMock, error) {
 	d.srv = &dns.Server{PacketConn: pc, Handler: dns.HandlerFunc(d.handle)}
 	started := make(chan struct{})
 	d.srv.NotifyStartedFunc = func() { close(started) }
-	go d.srv.ActivateAndServe()
+	go func() { _ = d.srv.ActivateAndServe() }()
 	<-started
 	return d, nil
 }
@@ -47,7 +47,7 @@ func NewDNS() (*DNSMock, error) {
 func (d *DNSMock) Addr() string { return d.addr }
 
 // Close stops the server.
-func (d *DNSMock) Close() { d.srv.Shutdown() }
+func (d *DNSMock) Close() { _ = d.srv.Shutdown() }
 
 // SetA sets the A answers for name (fqdn-normalized, lowercased).
 func (d *DNSMock) SetA(name string, ips ...string) {
@@ -106,7 +106,7 @@ func (d *DNSMock) handle(w dns.ResponseWriter, r *dns.Msg) {
 	m.SetReply(r)
 	if rcode != dns.RcodeSuccess {
 		m.Rcode = rcode
-		w.WriteMsg(m)
+		_ = w.WriteMsg(m)
 		return
 	}
 	if len(r.Question) == 1 {
@@ -137,7 +137,7 @@ func (d *DNSMock) handle(w dns.ResponseWriter, r *dns.Msg) {
 			}
 		}
 	}
-	w.WriteMsg(m)
+	_ = w.WriteMsg(m)
 }
 
 func lower(s string) string {

@@ -365,7 +365,7 @@ func (s *Server) Start(addrs []string, udp, tcp bool) error {
 			}
 			srv := &dns.Server{PacketConn: pc, Handler: s}
 			s.track(srv, pc.LocalAddr())
-			go srv.ActivateAndServe()
+			go func() { _ = srv.ActivateAndServe() }()
 		}
 		if tcp {
 			l, err := net.Listen(netmatch.ListenNetwork("tcp", addr), addr)
@@ -374,7 +374,7 @@ func (s *Server) Start(addrs []string, udp, tcp bool) error {
 			}
 			srv := &dns.Server{Listener: l, Handler: s, ReadTimeout: s.cfg.ReadTimeout, IdleTimeout: func() time.Duration { return s.cfg.IdleTimeout }}
 			s.track(srv, l.Addr())
-			go srv.ActivateAndServe()
+			go func() { _ = srv.ActivateAndServe() }()
 		}
 	}
 	return nil
@@ -400,7 +400,7 @@ func (s *Server) Shutdown() {
 	servers := append([]*dns.Server(nil), s.servers...)
 	s.mu.Unlock()
 	for _, srv := range servers {
-		srv.Shutdown()
+		_ = srv.Shutdown()
 	}
 }
 

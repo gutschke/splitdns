@@ -39,7 +39,9 @@ jobs:
         run: go vet ./...
       - name: govulncheck (BLOCKING)
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          # Install the tool with module mode (the repo-wide GOFLAGS=-mod=vendor would
+          # otherwise reject `go install ...@latest` with "cannot query module").
+          env GOFLAGS= GOWORK=off go install golang.org/x/vuln/cmd/govulncheck@latest
           "$(go env GOPATH)/bin/govulncheck" ./...
 
   lint:

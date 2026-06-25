@@ -35,5 +35,7 @@ issues:
     # The signal-rooted context is legitimately created in main and tests.
     - path: 'cmd/splitdnsd/main\.go'
       linters: [forbidigo]
+    # Tests legitimately ignore fire-and-forget errors (Write/SetDeadline/Shutdown on
+    # in-test conns and servers); errcheck on production code stays on.
     - path: '_test\.go'
-      linters: [forbidigo, bodyclose, noctx]
+      linters: [forbidigo, bodyclose, noctx, errcheck]

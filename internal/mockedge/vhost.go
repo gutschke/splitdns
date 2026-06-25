@@ -57,7 +57,7 @@ func (f *VHostFeedMock) serve() {
 		f.mu.Lock()
 		body := f.body
 		f.mu.Unlock()
-		conn.Write([]byte(body))
+		_, _ = conn.Write([]byte(body))
 		conn.Close()
 	}
 }

@@ -213,7 +213,7 @@ func (s *Server) Start(ctx context.Context) error {
 		mux.HandleFunc("/control/", s.handleControl)
 	}
 	s.hs = &http.Server{Handler: s.accessGuard(s.methodGuard(mux)), ReadHeaderTimeout: 5 * time.Second}
-	go s.hs.Serve(ln)
+	go func() { _ = s.hs.Serve(ln) }() // returns ErrServerClosed on Shutdown; nothing to do
 	return nil
 }
 
@@ -263,7 +263,7 @@ func (s *Server) Addr() string {
 // Shutdown stops the server.
 func (s *Server) Shutdown(ctx context.Context) {
 	if s.hs != nil {
-		s.hs.Shutdown(ctx)
+		_ = s.hs.Shutdown(ctx)
 	}
 }
 
