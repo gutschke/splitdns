@@ -15,7 +15,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -53,9 +52,9 @@ func TestBinaryCoverage(t *testing.T) {
 	if testing.Short() {
 		t.Skip("bincover builds and runs the real binary; skipped in -short")
 	}
-	goBin := filepath.Join(runtime.GOROOT(), "bin", "go")
-	if _, err := os.Stat(goBin); err != nil {
-		t.Skipf("go toolchain not found at %s", goBin)
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go toolchain not found on PATH")
 	}
 	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
