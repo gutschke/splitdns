@@ -240,7 +240,7 @@ func (c *Client) AllRecords(ctx context.Context, zoneID string) ([]Record, error
 			return nil, fmt.Errorf("cfapi: decode records: %w", err)
 		}
 		for _, r := range recs {
-			out = append(out, Record{ID: r.ID, Type: r.Type, Name: r.Name, Content: r.Content, Proxied: r.Proxied, TTL: r.TTL, Priority: r.Priority})
+			out = append(out, Record(r))
 		}
 		if env.Info == nil || env.Info.TotalPages <= page || len(recs) == 0 {
 			break

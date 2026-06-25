@@ -14,6 +14,7 @@
 package netnstest
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -75,17 +76,18 @@ func reexec() int {
 	cmd.Env = append(os.Environ(), markerEnv+"=1", parentEnv+"="+parent)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 
-	switch err := cmd.Run().(type) {
-	case nil:
-		return 0
-	case *exec.ExitError:
-		return err.ExitCode()
-	default:
-		// Could not create the namespace (userns disabled, seccomp, etc.). Skip rather
-		// than fail the whole build — these are best-effort e2e gates.
-		fmt.Fprintln(os.Stderr, "netnstest: cannot create netns ("+err.Error()+"); skipping")
+	err = cmd.Run()
+	if err == nil {
 		return 0
 	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return ee.ExitCode()
+	}
+	// Could not create the namespace (userns disabled, seccomp, etc.). Skip rather
+	// than fail the whole build — these are best-effort e2e gates.
+	fmt.Fprintln(os.Stderr, "netnstest: cannot create netns ("+err.Error()+"); skipping")
+	return 0
 }
 
 // enterChild runs the isolation pre-flight and configures the namespace.

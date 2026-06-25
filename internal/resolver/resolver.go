@@ -81,11 +81,10 @@ func answerStatic(snap *model.Snapshot, req *dns.Msg, name string, qtype uint16)
 	}
 	resp := reply(req)
 	resp.Authoritative = true
-	matched := appendMatching(resp, recs, name, qtype)
-	if !matched {
-		// Static owner exists but lacks this type: authoritative NODATA (no SOA — the
-		// static table is not a zone). Still authoritative, never forwarded.
-	}
+	// appendMatching adds the records of this type. A static owner that exists but lacks
+	// this type yields authoritative NODATA (no SOA — the static table is not a zone);
+	// still authoritative, never forwarded.
+	appendMatching(resp, recs, name, qtype)
 	return Outcome{Msg: resp}, true
 }
 

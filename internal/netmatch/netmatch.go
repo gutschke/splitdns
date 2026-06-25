@@ -180,9 +180,7 @@ func SelectListenAddrs(mode string, explicit []string, port int) ([]string, erro
 	switch mode {
 	case "explicit":
 		out := make([]string, 0, len(explicit))
-		for _, e := range explicit {
-			out = append(out, e)
-		}
+		out = append(out, explicit...)
 		return out, nil
 	case "", "private-auto":
 		ifaces, err := net.Interfaces()

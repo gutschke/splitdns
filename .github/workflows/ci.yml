@@ -39,9 +39,11 @@ jobs:
         run: go vet ./...
       - name: govulncheck (BLOCKING)
         run: |
-          # Install the tool with module mode (the repo-wide GOFLAGS=-mod=vendor would
-          # otherwise reject `go install ...@latest` with "cannot query module").
-          env GOFLAGS= GOWORK=off go install golang.org/x/vuln/cmd/govulncheck@latest
+          # Install with module mode (the repo-wide GOFLAGS=-mod=vendor would otherwise
+          # reject `go install` with "cannot query module"). Pin a version whose go.mod
+          # directive is <= the pinned toolchain — govulncheck >= 1.5 needs Go 1.25, but
+          # GOTOOLCHAIN=local holds us at 1.24.
+          env GOFLAGS= GOWORK=off go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
           "$(go env GOPATH)/bin/govulncheck" ./...
 
   lint:

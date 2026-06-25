@@ -305,7 +305,7 @@ func decodeRec(r *http.Request, dst *CFRecord) {
 		TTL      int     `json:"ttl"`
 		Priority float64 `json:"priority"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
+	_ = json.NewDecoder(r.Body).Decode(&body)
 	dst.Type, dst.Name, dst.Content = body.Type, body.Name, body.Content
 	dst.Proxied, dst.TTL, dst.Priority = body.Proxied, body.TTL, body.Priority
 }
@@ -338,7 +338,7 @@ func writePage(w http.ResponseWriter, all []any, r *http.Request) {
 		end = total
 	}
 	raw, _ := json.Marshal(all[start:end])
-	json.NewEncoder(w).Encode(map[string]any{
+	_ = json.NewEncoder(w).Encode(map[string]any{
 		"success": true, "errors": []any{},
 		"result":      json.RawMessage(raw),
 		"result_info": map[string]int{"page": page, "total_pages": totalPages},
@@ -347,7 +347,7 @@ func writePage(w http.ResponseWriter, all []any, r *http.Request) {
 
 func writeOK(w http.ResponseWriter, result any) {
 	raw, _ := json.Marshal(result)
-	json.NewEncoder(w).Encode(map[string]any{
+	_ = json.NewEncoder(w).Encode(map[string]any{
 		"success": true, "errors": []any{},
 		"result":      json.RawMessage(raw),
 		"result_info": map[string]int{"page": 1, "total_pages": 1},
@@ -356,7 +356,7 @@ func writeOK(w http.ResponseWriter, result any) {
 
 func writeErr(w http.ResponseWriter, status, code int, msg string) {
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(map[string]any{
+	_ = json.NewEncoder(w).Encode(map[string]any{
 		"success": false,
 		"errors":  []map[string]any{{"code": code, "message": msg}},
 	})

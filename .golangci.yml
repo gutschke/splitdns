@@ -31,9 +31,15 @@ linters-settings:
     analyze-types: true
 
 issues:
+  # Report every finding (default caps hide issues behind the first few of each kind).
+  max-issues-per-linter: 0
+  max-same-issues: 0
   exclude-rules:
     # The signal-rooted context is legitimately created in main and tests.
     - path: 'cmd/splitdnsd/main\.go'
+      linters: [forbidigo]
+    # The golden/netns harnesses are test infrastructure: a root context is legitimate.
+    - path: 'internal/golden/'
       linters: [forbidigo]
     # Tests legitimately ignore fire-and-forget errors (Write/SetDeadline/Shutdown on
     # in-test conns and servers); errcheck on production code stays on.

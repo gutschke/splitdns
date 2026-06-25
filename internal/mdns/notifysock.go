@@ -195,7 +195,8 @@ func (n *NotifySocket) Run(ctx context.Context, progress func()) {
 			}
 			// Idle heartbeat: the per-Accept deadline fired with no connection. Tick progress
 			// so the supervisor sees a live worker, then keep accepting.
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
 				progress()
 				continue
 			}
