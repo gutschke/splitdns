@@ -1,0 +1,17 @@
+Package: splitdns-notify
+Source: splitdnsd
+Version: 0.1.0
+Architecture: amd64
+Maintainer: gutschke <gutschke@users.noreply.github.com>
+Installed-Size: 3663
+Section: net
+Priority: optional
+Homepage: https://github.com/gutschke/splitdns
+Description: mDNS hostname announcer for splitdnsd
+ splitdns-notify sends authoritative multicast-DNS responses to announce a
+ host's name and addresses, prompting a splitdnsd resolver to refresh its view
+ of the LAN (and, where enabled, its guarded dynamic-DNS write-back).
+ .
+ It is a small static helper with no runtime dependencies and ships neither the
+ server binary nor any service, so it is safe to install on hosts that should
+ announce themselves to — but never run — splitdnsd. See splitdns-notify(8).

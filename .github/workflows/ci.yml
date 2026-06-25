@@ -1,0 +1,84 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Hermetic: build from the vendored module tree, never download a toolchain.
+env:
+  GOTOOLCHAIN: local
+  GOFLAGS: -mod=vendor
+
+jobs:
+  # Pristine gate: refuse any site-private string in public files. The denylist is
+  # itself private, so it is supplied via the SPLITDNS_PRIVATE_PATTERNS repo secret;
+  # without it the scan skips cleanly (the local pre-commit hook is the primary gate).
+  pristine:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: write denylist from secret (if configured)
+        env:
+          PATTERNS: ${{ secrets.SPLITDNS_PRIVATE_PATTERNS }}
+        run: |
+          if [ -n "$PATTERNS" ]; then mkdir -p local && printf '%s\n' "$PATTERNS" > local/private-patterns.txt; fi
+      - name: check-pristine
+        run: ./scripts/check-pristine.sh
+
+  # Cheap, fast-failing gates first: vet + the known-vulnerability scan.
+  vet-vuln:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+          cache: true
+      - name: go vet
+        run: go vet ./...
+      - name: govulncheck (BLOCKING)
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+          cache: true
+      - name: golangci-lint (BLOCKING — enforces the §3 context gate)
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+  test-race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+          cache: true
+      # The race detector needs cgo; production binaries are still built static.
+      - name: go test -race
+        env:
+          CGO_ENABLED: '1'
+        run: go test -race ./...
+
+  fuzz-short:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+          cache: true
+      # Bounded fuzz of every FuzzXxx target; runner has few cores so memory is fine.
+      - name: make test-fuzz-short
+        env:
+          FUZZTIME: 30s
+        run: ./scripts/fuzz-short.sh

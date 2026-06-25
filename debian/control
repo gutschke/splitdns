@@ -1,0 +1,37 @@
+Source: splitdnsd
+Section: net
+Priority: optional
+Maintainer: gutschke <gutschke@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13), golang-1.24 | golang-go (>= 2:1.24~)
+Standards-Version: 4.6.2
+Homepage: https://github.com/gutschke/splitdns
+Rules-Requires-Root: no
+
+Package: splitdnsd
+Architecture: any
+Depends: ${misc:Depends}, adduser
+Recommends: splitdns-notify (= ${binary:Version})
+Description: split-horizon DNS resolver with optional Cloudflare mirror
+ splitdnsd is a lightweight authoritative and forwarding DNS resolver for a
+ trusted LAN. It serves *.local names from mDNS, answers reverse (PTR) zones,
+ forwards other queries over DNS-over-TLS, and can optionally mirror
+ Cloudflare-hosted zones (read-only) and perform guarded, opt-in dynamic-DNS
+ write-back.
+ .
+ The query hot path performs no external I/O (it reads an atomically published
+ snapshot), so a slow or unreachable upstream cannot wedge resolution.
+ .
+ Configuration is not shipped: copy the example from /usr/share/doc/splitdnsd/
+ to /etc/splitdns/splitdnsd.toml and edit it. See splitdns.conf(5).
+
+Package: splitdns-notify
+Architecture: any
+Depends: ${misc:Depends}
+Description: mDNS hostname announcer for splitdnsd
+ splitdns-notify sends authoritative multicast-DNS responses to announce a
+ host's name and addresses, prompting a splitdnsd resolver to refresh its view
+ of the LAN (and, where enabled, its guarded dynamic-DNS write-back).
+ .
+ It is a small static helper with no runtime dependencies and ships neither the
+ server binary nor any service, so it is safe to install on hosts that should
+ announce themselves to — but never run — splitdnsd. See splitdns-notify(8).

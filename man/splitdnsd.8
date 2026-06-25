@@ -1,0 +1,72 @@
+.TH SPLITDNSD 8 "2026-06-16" "splitdns" "System Administration"
+.SH NAME
+splitdnsd \- lightweight split-horizon DNS resolver for the local LAN
+.SH SYNOPSIS
+.B splitdnsd
+.RB [ \-config
+.IR path ]
+.RB [ \-check\-config ]
+.RB [ \-version ]
+.SH DESCRIPTION
+.B splitdnsd
+is a standalone authoritative/forwarding DNS server for a trusted LAN. It
+resolves
+.I *.local
+hosts via mDNS, answers reverse (PTR) queries for the site's locally managed
+address spaces, and forwards everything else to upstream public resolvers over DoT.
+Optionally, it mirrors zones hosted on Cloudflare and serves them authoritatively on
+the LAN, preferring direct internal addresses over proxy/tunnel/SSO indirection; the
+Cloudflare integration is not required for the forwarding and local-name features.
+.PP
+The query-answering hot path performs no external I/O: it reads an
+immutable, atomically published snapshot, so a slow or unreachable Cloudflare,
+upstream, or mDNS peer can never wedge resolution.
+.SH OPTIONS
+.TP
+.BI \-config " path"
+Path to the TOML configuration file. Default
+.IR /etc/splitdns/splitdnsd.toml .
+A missing file is not an error; built-in defaults apply. See
+.BR splitdns.conf (5).
+.TP
+.B \-check\-config
+Load and validate the configuration, print the resolved listen-address set, the
+access allow/refuse lists, and the resolved reverse zones, then exit. Use this
+before (re)starting the service to confirm the effective policy.
+.TP
+.B \-version
+Print the version and exit.
+.SH "ACCESS AND LISTEN POLICY"
+By default
+.B splitdnsd
+binds only local-scope addresses (RFC 1918, ULA, loopback, link-local) and never
+global-unicast addresses, which are more likely to leak through the firewall, and
+it answers queries only from private/local clients. Both are configurable; see
+.BR splitdns.conf (5).
+.SH "EXIT STATUS"
+.TP
+.B 0
+Normal termination, or a successful
+.BR \-check\-config / \-version .
+.TP
+.B 2
+Configuration could not be loaded, validated, or resolved.
+.SH FILES
+.TP
+.I /etc/splitdns/splitdnsd.toml
+Configuration file. See
+.BR splitdns.conf (5).
+.TP
+.I /etc/splitdns/secrets/
+Scoped Cloudflare API tokens referenced by the config (e.g.
+.IR cf-read.token " for the mirror, " cf-edit.token " for dynamic-DNS write-back);"
+the exact paths are set by \fBread_token_file\fR / \fBedit_token_file\fR.
+.TP
+.I /var/lib/splitdns
+Versioned-JSON warm-start cache.
+.SH "SEE ALSO"
+.BR splitdns.conf (5),
+.BR splitdns-notify (8),
+.BR systemd.service (5)
+.SH AUTHORS
+The splitdns authors.

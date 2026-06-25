@@ -1,0 +1,18 @@
+#!/bin/sh
+set -e
+if [ "$1" = "configure" ]; then
+  if ! getent group splitdns >/dev/null; then addgroup --system splitdns; fi
+  if ! getent passwd splitdns >/dev/null; then
+    adduser --system --no-create-home --ingroup splitdns \
+      --home /var/lib/splitdns --shell /usr/sbin/nologin splitdns
+  fi
+  install -d -m 0750 -o splitdns -g splitdns /etc/splitdns
+  install -d -m 0750 -o splitdns -g splitdns /etc/splitdns/secrets
+  install -d -m 0700 -o splitdns -g splitdns /var/lib/splitdns
+  if [ ! -e /etc/splitdns/splitdnsd.toml ]; then
+    echo "splitdnsd: copy /usr/share/doc/splitdnsd/splitdnsd.example.toml to" >&2
+    echo "           /etc/splitdns/splitdnsd.toml and edit it before starting." >&2
+  fi
+fi
+#DEBHELPER#
+exit 0

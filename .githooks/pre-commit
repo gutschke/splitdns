@@ -1,0 +1,27 @@
+#!/bin/sh
+# pre-commit: two guards against leaking site-private data into a public repo.
+# Install with `make install-hooks` (sets core.hooksPath to .githooks).
+set -eu
+
+root=$(git rev-parse --show-toplevel)
+
+# 1. Refuse to commit apparent secret material by FILENAME, even if .gitignore was
+#    bypassed (git add -f). Cloudflare tokens etc. belong only on the deployed host.
+staged=$(git diff --cached --name-only --diff-filter=ACM || true)
+secrets=$(printf '%s\n' "$staged" | grep -iE '\.(token|secret|pem|key)$|(^|/)\.env($|\.)|(^|/)secrets/' || true)
+if [ -n "$secrets" ]; then
+  echo "pre-commit: BLOCKED — refusing to commit apparent secret file(s):" >&2
+  printf '%s\n' "$secrets" | sed 's/^/  /' >&2
+  echo "pre-commit: secrets live only on the deployed host (/etc/splitdns/secrets/)." >&2
+  echo "pre-commit: if this is a false positive, rename the file or commit with --no-verify." >&2
+  exit 1
+fi
+
+# 2. Refuse to commit if any site-private STRING leaked into a public file.
+if ! "$root/scripts/check-pristine.sh"; then
+  echo >&2
+  echo "pre-commit: BLOCKED — site-private data found in public files (see above)." >&2
+  echo "pre-commit: scrub it (use documentation-range placeholders) or move it under" >&2
+  echo "            local/ ; update local/private-inventory.md + private-patterns.txt." >&2
+  exit 1
+fi

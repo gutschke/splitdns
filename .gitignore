@@ -1,0 +1,38 @@
+# Build artifacts
+/bin/
+/cover.out
+
+# Per-developer local agent/editor state (may reference local paths; never published).
+/.claude/
+
+# PRIVATE / site-local files — NEVER committed or packaged. The real config and
+# any captured production data (real domains, IPs, CF fixtures) live here only.
+# The repo and the .deb stay pristine; we ship only examples/ and respect local
+# modifications under /etc/splitdns/ on the deployed host.
+/local/
+
+# Private design notes — they describe the real (private) production system, so
+# they are not published. Kept in-tree as working reference only. A sanitized
+# public design doc can be generated separately if the repo is ever published.
+/docs/
+/dist/
+
+# Canonical packaging (dpkg-buildpackage) build artifacts.
+/debian/.debhelper/
+/debian/splitdnsd/
+/debian/files
+/debian/*.substvars
+/debian/debhelper-build-stamp
+/splitdnsd
+/splitdns-notify
+
+# Secret material — NEVER commit. Cloudflare API tokens and anything secret-bearing
+# live only on the deployed host (/etc/splitdns/secrets/), never in the repo.
+*.token
+*.secret
+.env
+.env.*
+secrets/
+# ...but vendored third-party code must stay tracked even if a future dep ships a
+# fixture matching the patterns above.
+!vendor/**

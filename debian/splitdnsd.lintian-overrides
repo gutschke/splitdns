@@ -1,0 +1,2 @@
+# Go produces statically linked binaries by design (built with CGO disabled).
+splitdnsd: statically-linked-binary [usr/sbin/splitdnsd]

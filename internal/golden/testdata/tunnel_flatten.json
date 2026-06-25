@@ -1,0 +1,62 @@
+{
+  "description": "a cfargotunnel CNAME is flattened to the owner's presented A/AAAA; the CNAME itself is never served",
+  "config": {
+    "local_zones": [
+      "example.com"
+    ]
+  },
+  "zones": [
+    {
+      "name": "example.com",
+      "id": "z1",
+      "records": [
+        {
+          "type": "CNAME",
+          "name": "app.example.com",
+          "content": "xyz.cfargotunnel.com",
+          "proxied": true,
+          "ttl": 300
+        }
+      ]
+    }
+  ],
+  "tunnel_addrs": {
+    "app.example.com.": {
+      "v4": [
+        "203.0.113.60"
+      ],
+      "v6": [
+        "2001:db8::60"
+      ]
+    }
+  },
+  "queries": [
+    {
+      "name": "app.example.com",
+      "type": "A",
+      "rcode": "NOERROR",
+      "aa": true,
+      "answer": [
+        "app.example.com.\t300\tIN\tA\t203.0.113.60"
+      ]
+    },
+    {
+      "name": "app.example.com",
+      "type": "AAAA",
+      "rcode": "NOERROR",
+      "aa": true,
+      "answer": [
+        "app.example.com.\t300\tIN\tAAAA\t2001:db8::60"
+      ]
+    },
+    {
+      "name": "app.example.com",
+      "type": "CNAME",
+      "rcode": "NOERROR",
+      "aa": true,
+      "authority": [
+        "example.com.\t300\tIN\tSOA\texample.com. hostmaster.example.com. 1 7200 3600 1209600 300"
+      ]
+    }
+  ]
+}

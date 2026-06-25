@@ -1,0 +1,2 @@
+# Go produces statically linked binaries by design (built with CGO disabled).
+splitdns-notify: statically-linked-binary [usr/bin/splitdns-notify]

@@ -1,0 +1,26 @@
+#!/usr/bin/make -f
+export GOTOOLCHAIN := local
+export CGO_ENABLED := 0
+GO := $(shell ./scripts/select-go.sh)
+DEB_VERSION := $(shell dpkg-parsechangelog -SVersion)
+LDFLAGS := -s -w -X main.version=$(DEB_VERSION)
+
+%:
+	dh $@ --buildsystem=none
+
+override_dh_auto_build:
+	$(GO) build -mod=vendor -trimpath -buildvcs=false -ldflags "$(LDFLAGS)" -o splitdnsd ./cmd/splitdnsd
+	$(GO) build -mod=vendor -trimpath -buildvcs=false -ldflags "$(LDFLAGS)" -o splitdns-notify ./cmd/splitdns-notify
+
+# The test suite is run via `make test`, not during the package build (hermetic).
+override_dh_auto_test:
+
+override_dh_auto_clean:
+	rm -f splitdnsd splitdns-notify
+
+# The example config is meant to be copied verbatim — do not gzip it.
+override_dh_compress:
+	dh_compress -X.toml
+
+# Binaries are built stripped (-s -w); there is no debug info for dwz to process.
+override_dh_dwz:

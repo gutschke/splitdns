@@ -1,0 +1,9 @@
+# Normalize line endings.
+* text=auto eol=lf
+
+# Vendored third-party code: exclude from language stats and diffs.
+vendor/** linguist-vendored
+
+# Generated/data files.
+internal/golden/testdata/** linguist-generated
+*.deb binary

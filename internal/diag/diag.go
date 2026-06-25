@@ -1,0 +1,1235 @@
+// Package diag is the read-only diagnostics HTTP endpoint (requirement R10, design
+// §4.8). It renders the live snapshot — zones, records, reverse/stub zones, vhosts,
+// the mDNS view, and health/staleness — as HTML or JSON. It is hardened: localhost
+// only by default, GET only, NO reflected query params, NO secrets, and CF ZoneID/
+// RecordID are REDACTED (account-correlatable, and the hot path never reads them).
+package diag
+
+import (
+	"context"
+	"crypto/subtle"
+	"encoding/json"
+	"fmt"
+	"html/template"
+	"net"
+	"net/http"
+	"net/netip"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/miekg/dns"
+
+	"github.com/gutschke/splitdns/internal/anscache"
+	"github.com/gutschke/splitdns/internal/ddns"
+	"github.com/gutschke/splitdns/internal/forwarder"
+	"github.com/gutschke/splitdns/internal/model"
+	"github.com/gutschke/splitdns/internal/netmatch"
+	"github.com/gutschke/splitdns/internal/qlog"
+	"github.com/gutschke/splitdns/internal/supervisor"
+)
+
+// Server serves the diagnostics views. It reads the live planes through accessors so
+// the control plane can swap snapshots atomically underneath it.
+type Server struct {
+	addr           string
+	snapshot       func() *model.Snapshot
+	view           func() *model.MDNSView
+	cacheStats     func() (anscache.Stats, bool) // nil or (_, false) => cache disabled
+	qlog           *qlog.Log                     // query telemetry; nil => section omitted
+	backends       func() []forwarder.BackendStatus
+	workers        func() map[string]supervisor.WorkerStats
+	selftest       func(context.Context) []TestResult
+	ddnsSim        func(ctx context.Context, host string, addrs []netip.Addr, ignoreEligible bool) ddns.SimResult
+	clientName     func(netip.Addr) string // resolve a client IP to a name (cache/mDNS only)
+	allow          func(netip.Addr) bool   // nil => allow all sources
+	socketMode     os.FileMode             // Unix-socket permission (0 => 0660)
+	controls       Controls
+	loopback       bool // set at Start: is the bound address loopback-only?
+	controlsActive bool // set at Start: controls enabled AND (password set OR loopback)
+	log            func(string)
+	version        string
+
+	hs      *http.Server
+	ctlMu   sync.Mutex
+	ctlLast map[string]time.Time // per-action last-run, for rate limiting
+}
+
+// New builds a diagnostics Server. snapshot/view must be non-nil; log may be nil.
+func New(addr string, snapshot func() *model.Snapshot, view func() *model.MDNSView, version string, log func(string)) *Server {
+	if log == nil {
+		log = func(string) {}
+	}
+	if addr == "" {
+		addr = "127.0.0.1:8080"
+	}
+	return &Server{addr: addr, snapshot: snapshot, view: view, version: version, log: log, ctlLast: map[string]time.Time{}}
+}
+
+// WithCacheStats wires a provider for the forward-path answer-cache counters. fn
+// returns (stats, true) when the cache is enabled and (zero, false) when it is off.
+func (s *Server) WithCacheStats(fn func() (anscache.Stats, bool)) *Server {
+	s.cacheStats = fn
+	return s
+}
+
+// WithQueryLog wires the query telemetry (recent queries + top clients + totals).
+func (s *Server) WithQueryLog(l *qlog.Log) *Server { s.qlog = l; return s }
+
+// WithBackends wires a provider for upstream/backend health (circuit-breaker status).
+func (s *Server) WithBackends(fn func() []forwarder.BackendStatus) *Server { s.backends = fn; return s }
+
+// WithWorkers wires a provider for supervisor worker stats (restarts/stalls/panics).
+func (s *Server) WithWorkers(fn func() map[string]supervisor.WorkerStats) *Server {
+	s.workers = fn
+	return s
+}
+
+// Controls configures the DANGEROUS, mutating control actions. They are exposed only
+// when AllowControl is true, are POST-only, and are authorized either by a matching
+// Password or — when Password is empty — only on a loopback bind. Each action is a
+// callback; a nil callback means that action is unavailable.
+type Controls struct {
+	AllowControl  bool
+	Password      string
+	FlushCache    func()                               // drop every answer-cache entry
+	RefreshMirror func()                               // force a Cloudflare mirror refresh (restarts the mirror worker)
+	Restart       func()                               // trigger a graceful daemon restart (systemd brings it back)
+	SetBackend    func(addr string, enabled bool) bool // disable/enable an upstream on the fly (false => unknown addr)
+	ResetBackends func()                               // clear all manual backend disables
+}
+
+func (c Controls) enabled() bool { return c.AllowControl }
+
+// WithControls wires the mutating control plane. Safe to omit (controls disabled).
+func (s *Server) WithControls(c Controls) *Server { s.controls = c; return s }
+
+// WithClientNames wires a resolver from a client IP to a display name (from the mDNS
+// view / answer cache only — no network lookups). Used to annotate the query telemetry.
+func (s *Server) WithClientNames(fn func(netip.Addr) string) *Server { s.clientName = fn; return s }
+
+// WithAccess restricts which source IPs may reach the endpoint. nil (the default) allows
+// all. Unix-socket clients are always allowed.
+func (s *Server) WithAccess(allow func(netip.Addr) bool) *Server { s.allow = allow; return s }
+
+// WithSocketMode sets the permission applied to a Unix-socket bind (0 => 0660).
+func (s *Server) WithSocketMode(m os.FileMode) *Server { s.socketMode = m; return s }
+
+// TestResult is one self-test outcome (Tier-1 active probe — reads/probes, mutates nothing).
+type TestResult struct {
+	Name     string        `json:"name"`
+	OK       bool          `json:"ok"`
+	Detail   string        `json:"detail"`
+	Duration time.Duration `json:"-"`
+	DurMS    float64       `json:"ms"`
+}
+
+// WithSelfTest wires the on-demand self-test runner (GET /selftest). fn runs active
+// probes (upstream reachability, CF token validity, end-to-end local resolve, …) and
+// returns their results; it must not mutate state. nil omits the endpoint.
+func (s *Server) WithSelfTest(fn func(context.Context) []TestResult) *Server {
+	s.selftest = fn
+	return s
+}
+
+// WithDDNSSimulate wires the DDNS dry-run simulator (GET /ddns-simulate?host=&addr=…). It
+// reports the Cloudflare API calls write-back WOULD make for an announcement, without
+// making them and even when DDNS is disabled. nil omits the endpoint.
+func (s *Server) WithDDNSSimulate(fn func(ctx context.Context, host string, addrs []netip.Addr, ignoreEligible bool) ddns.SimResult) *Server {
+	s.ddnsSim = fn
+	return s
+}
+
+// Start binds and serves until ctx is cancelled. It returns once bound (so tests can
+// query immediately). Binding a non-loopback address is allowed (configurable) but
+// warned about, since the endpoint exposes inventory and is meant to stay local.
+func (s *Server) Start(ctx context.Context) error {
+	var ln net.Listener
+	if path, ok := unixAddr(s.addr); ok {
+		// Unix socket: local-only and filesystem-permission-controlled (0660). Counts as
+		// loopback for the control gate — the filesystem perms ARE the authentication.
+		s.loopback = true
+		if !strings.HasPrefix(path, "@") { // not the abstract namespace
+			_ = os.Remove(path) // clear a stale socket from a previous run
+		}
+		l, err := net.Listen("unix", path)
+		if err != nil {
+			return fmt.Errorf("diag: listen unix %s: %w", path, err)
+		}
+		if !strings.HasPrefix(path, "@") {
+			mode := s.socketMode
+			if mode == 0 {
+				mode = 0o660
+			}
+			if cerr := os.Chmod(path, mode); cerr != nil {
+				l.Close()
+				return fmt.Errorf("diag: chmod %s: %w", path, cerr)
+			}
+		}
+		ln = l
+		s.addr = path
+	} else {
+		// TCP. Classify the bind as loopback-only, failing CLOSED: anything we cannot
+		// positively prove is loopback — a wildcard bind, or a hostname we will not
+		// resolve — is treated as non-loopback (a hostname must not default to loopback).
+		s.loopback = false
+		if host, _, err := net.SplitHostPort(s.addr); err == nil {
+			if ip := net.ParseIP(host); ip != nil {
+				s.loopback = ip.IsLoopback()
+			}
+		}
+		if !s.loopback {
+			s.log(fmt.Sprintf("diag: binding non-loopback %s — keep this behind auth; it exposes the zone inventory", s.addr))
+		}
+		l, err := net.Listen(netmatch.ListenNetwork("tcp", s.addr), s.addr)
+		if err != nil {
+			return fmt.Errorf("diag: listen %s: %w", s.addr, err)
+		}
+		ln = l
+		s.addr = l.Addr().String() // record the real bound addr (ephemeral port in tests)
+	}
+	// Controls are usable only when enabled AND (a password is set OR the bind is
+	// loopback/unix). Otherwise the /control/ route is NOT registered at all — "refused"
+	// is enforced by the absence of the route, not by a runtime branch a later refactor
+	// could bypass.
+	s.controlsActive = s.controls.enabled() && (s.controls.Password != "" || s.loopback)
+	if s.controls.enabled() && !s.controlsActive {
+		s.log("diag: allow_control is set on a non-loopback bind with NO control_password — control actions are DISABLED; set control_password or bind to loopback")
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", s.handleRoot)
+	mux.HandleFunc("/diag.json", s.handleJSON)
+	mux.HandleFunc("/healthz", s.handleHealth)
+	if s.selftest != nil {
+		mux.HandleFunc("/selftest", s.handleSelfTest)
+	}
+	if s.ddnsSim != nil {
+		mux.HandleFunc("/ddns-simulate", s.handleDDNSSimulate)
+	}
+	if s.controlsActive {
+		mux.HandleFunc("/control/", s.handleControl)
+	}
+	s.hs = &http.Server{Handler: s.accessGuard(s.methodGuard(mux)), ReadHeaderTimeout: 5 * time.Second}
+	go s.hs.Serve(ln)
+	return nil
+}
+
+// unixAddr reports whether addr names a Unix socket and returns its path. Accepted forms:
+// "unix:/path", an absolute path ("/run/…"), or a Linux abstract name ("@name").
+func unixAddr(addr string) (string, bool) {
+	switch {
+	case strings.HasPrefix(addr, "unix:"):
+		return strings.TrimPrefix(addr, "unix:"), true
+	case strings.HasPrefix(addr, "/"), strings.HasPrefix(addr, "@"):
+		return addr, true
+	default:
+		return "", false
+	}
+}
+
+// accessGuard restricts which source IPs may reach the endpoint when an allow-list is
+// configured. Unix-socket clients (no IP) are always allowed (local). Applies to every
+// route, read and control alike.
+func (s *Server) accessGuard(h http.Handler) http.Handler {
+	if s.allow == nil {
+		return h
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil { // unix socket: RemoteAddr has no host:port — local, allow
+			h.ServeHTTP(w, r)
+			return
+		}
+		ip, perr := netip.ParseAddr(host)
+		if perr != nil || !s.allow(ip.Unmap()) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+// Addr returns the bound address (after Start).
+func (s *Server) Addr() string {
+	if s.hs == nil {
+		return s.addr
+	}
+	return s.addr
+}
+
+// Shutdown stops the server.
+func (s *Server) Shutdown(ctx context.Context) {
+	if s.hs != nil {
+		s.hs.Shutdown(ctx)
+	}
+}
+
+// methodGuard enforces GET/HEAD for the read-only views; the /control/ routes are
+// POST-only and police their own method and authorization in handleControl.
+func (s *Server) methodGuard(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/control/") {
+			h.ServeHTTP(w, r)
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			http.Error(w, "read-only endpoint", http.StatusMethodNotAllowed)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+// controlMinInterval rate-limits the disruptive/expensive actions so even an authorized
+// client can't restart-loop the daemon or hammer the Cloudflare API. flush-cache is
+// idempotent and cheap, so it is unlimited (and the test relies on that).
+var controlMinInterval = map[string]time.Duration{
+	"refresh-mirror": 10 * time.Second,
+	"restart":        10 * time.Second,
+	"selftest":       2 * time.Second, // active probes; don't let a client hammer them
+	"ddns-simulate":  1 * time.Second,
+}
+
+// handleSelfTest runs the on-demand self-tests (GET) under a bounded context and renders
+// HTML or JSON. It probes fixed targets only (no user-supplied destinations), and is
+// rate-limited to avoid probe flooding.
+func (s *Server) handleSelfTest(w http.ResponseWriter, r *http.Request) {
+	if !s.controlRateOK("selftest") {
+		http.Error(w, "self-tests rate-limited; retry shortly", http.StatusTooManyRequests)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	results := s.selftest(ctx)
+	for i := range results {
+		results[i].DurMS = float64(results[i].Duration.Microseconds()) / 1000
+	}
+	if strings.Contains(r.Header.Get("Accept"), "text/html") {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if err := selfTestTmpl.Execute(w, results); err != nil {
+			s.log(fmt.Sprintf("diag: selftest render: %v", err))
+		}
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(results)
+}
+
+// handleDDNSSimulate runs a dry DDNS simulation for host=&addr=… (repeatable addr). It
+// only reads state and computes a plan — it never writes to Cloudflare — so it is a GET.
+func (s *Server) handleDDNSSimulate(w http.ResponseWriter, r *http.Request) {
+	host := strings.TrimSpace(r.FormValue("host"))
+	if host == "" {
+		http.Error(w, "usage: /ddns-simulate?host=<short-host>&addr=<ip>[&addr=<ip>…]", http.StatusBadRequest)
+		return
+	}
+	if !s.controlRateOK("ddns-simulate") { // rate-limit only real simulations, not 400s
+		http.Error(w, "rate-limited; retry shortly", http.StatusTooManyRequests)
+		return
+	}
+	var addrs []netip.Addr
+	var bad []string
+	for _, a := range r.Form["addr"] {
+		if ip, err := netip.ParseAddr(strings.TrimSpace(a)); err == nil {
+			addrs = append(addrs, ip)
+		} else if a != "" {
+			bad = append(bad, a)
+		}
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	res := s.ddnsSim(ctx, host, addrs, r.FormValue("explore") == "1")
+	if len(bad) > 0 {
+		res.Note = strings.TrimSpace(res.Note + " (ignored unparseable addrs: " + strings.Join(bad, ", ") + ")")
+	}
+	if strings.Contains(r.Header.Get("Accept"), "text/html") {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if err := ddnsSimTmpl.Execute(w, res); err != nil {
+			s.log(fmt.Sprintf("diag: ddns-simulate render: %v", err))
+		}
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(res)
+}
+
+var ddnsSimTmpl = template.Must(template.New("ddnssim").Funcs(template.FuncMap{
+	"add": func(a, b int) int { return a + b },
+}).Parse(`<!doctype html>
+<html><head><meta charset="utf-8"><title>DDNS simulate</title>
+<style>body{font:14px/1.4 system-ui,sans-serif;margin:1.5rem;color:#222}
+table{border-collapse:collapse}td,th{padding:.2rem .6rem;text-align:left;border-bottom:1px solid #eee}
+.muted{color:#777} .banner{padding:.5rem .7rem;border-radius:4px;margin:.4rem 0}
+.explore{background:#fff3cd;border:1px solid #ffe69c} .conf{background:#eef6ee;border:1px solid #cfe6cf}</style>
+</head><body>
+<h1>DDNS simulate <span class="muted">{{.Host}}</span></h1><p><a href="/">&larr; back</a></p>
+{{if .Override}}<div class="banner explore"><b>EXPLORE mode</b> — the eligibility allowlist was <b>IGNORED</b>.
+This is a <b>what-if</b> for planning policy, <b>not what runs today</b>.</div>
+{{else}}<div class="banner conf"><b>As configured</b> — this reflects your current policy exactly.</div>{{end}}
+<p>Outcome: <b>{{.Outcome}}</b> &mdash; write-back is {{if .Enabled}}ENABLED{{else}}disabled{{end}}{{if .DryRun}} (dry-run){{end}}.
+<b>No Cloudflare calls were made.</b>{{if .Note}}<br><span class="muted">{{.Note}}</span>{{end}}</p>
+{{if .Calls}}<table><tr><th>#</th><th>op</th><th>name</th><th>type</th><th>content</th><th>was</th></tr>
+{{range $i, $c := .Calls}}<tr><td class="muted">{{add $i 1}}</td><td>{{$c.Op}}</td><td>{{$c.Name}}</td><td>{{$c.Type}}</td><td>{{$c.Content}}</td><td class="muted">{{$c.Old}}</td></tr>
+{{end}}</table>
+<p class="muted">Runs <b>top-to-bottom</b> in this order: <b>updates &rarr; creates &rarr; deletes</b>. Applying the new addresses before removing the old ones keeps the name resolving throughout (no NXDOMAIN gap). <b>Deletes</b> drop addresses your announcement didn't include — write-back converges the host's records to <b>exactly</b> the addresses announced, so announce all the ones you want to keep.</p>
+{{else}}<p class="muted">No API calls would be made.</p>{{end}}
+</body></html>`))
+
+var selfTestTmpl = template.Must(template.New("selftest").Parse(`<!doctype html>
+<html><head><meta charset="utf-8"><title>splitdnsd self-tests</title>
+<style>body{font:14px/1.4 system-ui,sans-serif;margin:1.5rem;color:#222}
+table{border-collapse:collapse}td,th{padding:.2rem .6rem;text-align:left;border-bottom:1px solid #eee}
+.ok{color:#080;font-weight:600}.flag{color:#b00;font-weight:600}</style></head><body>
+<h1>Self-tests</h1><p><a href="/">&larr; back</a></p>
+<table><tr><th>check</th><th>result</th><th>detail</th><th>ms</th></tr>
+{{range .}}<tr><td>{{.Name}}</td>
+<td>{{if .OK}}<span class="ok">PASS</span>{{else}}<span class="flag">FAIL</span>{{end}}</td>
+<td>{{.Detail}}</td><td>{{printf "%.1f" .DurMS}}</td></tr>
+{{end}}</table></body></html>`))
+
+// handleControl dispatches a mutating control action after authorizing it. POST only.
+func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		http.Error(w, "control actions are POST-only", http.StatusMethodNotAllowed)
+		return
+	}
+	// CSRF defense (Fetch Metadata): a cross-site (or same-site/subdomain) browser form
+	// carries Sec-Fetch-Site != same-origin; reject it. Non-browser clients (curl) omit
+	// the header, and the in-page same-origin form sends "same-origin", so both pass.
+	if sfs := r.Header.Get("Sec-Fetch-Site"); sfs != "" && sfs != "same-origin" && sfs != "none" {
+		http.Error(w, "cross-site control request refused", http.StatusForbidden)
+		return
+	}
+	if code, msg := s.controlAuthorized(r); code != http.StatusOK {
+		http.Error(w, msg, code)
+		return
+	}
+	action := strings.TrimPrefix(r.URL.Path, "/control/")
+	if !s.controlRateOK(action) {
+		http.Error(w, "control action rate-limited; retry shortly", http.StatusTooManyRequests)
+		return
+	}
+	switch action {
+	case "flush-cache":
+		if s.controls.FlushCache == nil {
+			http.Error(w, "flush-cache unavailable (no cache)", http.StatusNotFound)
+			return
+		}
+		s.controls.FlushCache()
+		s.controlOK(w, r, "answer cache flushed")
+	case "refresh-mirror":
+		if s.controls.RefreshMirror == nil {
+			http.Error(w, "refresh-mirror unavailable", http.StatusNotFound)
+			return
+		}
+		s.controls.RefreshMirror()
+		s.controlOK(w, r, "mirror refresh triggered")
+	case "restart":
+		if s.controls.Restart == nil {
+			http.Error(w, "restart unavailable", http.StatusNotFound)
+			return
+		}
+		s.controlOK(w, r, "restarting daemon")
+		// Trigger AFTER the response is written so the caller sees confirmation; the
+		// graceful-shutdown path then tears us down and systemd brings us back.
+		s.controls.Restart()
+	case "backend":
+		if s.controls.SetBackend == nil {
+			http.Error(w, "backend control unavailable", http.StatusNotFound)
+			return
+		}
+		switch op := r.FormValue("op"); op {
+		case "reset":
+			if s.controls.ResetBackends != nil {
+				s.controls.ResetBackends()
+			}
+			s.controlOK(w, r, "backend overrides reset to defaults")
+		case "enable", "disable":
+			addr := r.FormValue("addr")
+			if !s.controls.SetBackend(addr, op == "enable") {
+				http.Error(w, "unknown backend addr", http.StatusNotFound)
+				return
+			}
+			s.controlOK(w, r, fmt.Sprintf("backend %s %sd", addr, op))
+		default:
+			http.Error(w, "op must be enable, disable, or reset", http.StatusBadRequest)
+		}
+	default:
+		http.Error(w, "unknown control action", http.StatusNotFound)
+	}
+}
+
+// controlAuthorized returns http.StatusOK when the request may run a control action, or
+// an error status + message otherwise. Order: master switch, then password (if set), then
+// loopback-only fallback when no password is configured.
+func (s *Server) controlAuthorized(r *http.Request) (int, string) {
+	if !s.controls.enabled() {
+		return http.StatusForbidden, "control actions are disabled (set [diag] allow_control)"
+	}
+	if s.controls.Password != "" {
+		got := r.Header.Get("X-Diag-Password")
+		if got == "" {
+			got = r.PostFormValue("password")
+		}
+		if subtle.ConstantTimeCompare([]byte(got), []byte(s.controls.Password)) != 1 {
+			return http.StatusUnauthorized, "missing or incorrect control password"
+		}
+		return http.StatusOK, ""
+	}
+	// No password configured: honor only on a loopback bind.
+	if !s.loopback {
+		return http.StatusForbidden, "control_password required for a non-loopback bind"
+	}
+	return http.StatusOK, ""
+}
+
+// controlRateOK enforces a per-action minimum interval (returns false => 429).
+func (s *Server) controlRateOK(action string) bool {
+	iv := controlMinInterval[action]
+	if iv == 0 {
+		return true
+	}
+	s.ctlMu.Lock()
+	defer s.ctlMu.Unlock()
+	now := time.Now()
+	if last, ok := s.ctlLast[action]; ok && now.Sub(last) < iv {
+		return false
+	}
+	s.ctlLast[action] = now
+	return true
+}
+
+// controlOK logs the action and replies (redirecting a browser form back to the page).
+func (s *Server) controlOK(w http.ResponseWriter, r *http.Request, msg string) {
+	s.log("diag control: " + msg)
+	if strings.Contains(r.Header.Get("Accept"), "text/html") {
+		w.Header().Set("Location", "/")
+		w.WriteHeader(http.StatusSeeOther)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	fmt.Fprintln(w, msg)
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	snap := s.snap()
+	status := "ok"
+	if !snap.CFHealthy {
+		status = "degraded"
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	fmt.Fprintf(w, "%s\nzones=%d built=%s\n", status, len(snap.Zones), snap.BuiltAt.Format(time.RFC3339))
+}
+
+func (s *Server) handleJSON(w http.ResponseWriter, r *http.Request) {
+	page := s.build()
+	w.Header().Set("Content-Type", "application/json")
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(page)
+}
+
+func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	page := s.build()
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := pageTmpl.Execute(w, page); err != nil {
+		s.log(fmt.Sprintf("diag: render: %v", err))
+	}
+}
+
+func (s *Server) snap() *model.Snapshot {
+	if snap := s.snapshot(); snap != nil {
+		return snap
+	}
+	return &model.Snapshot{}
+}
+
+// --- redacted view model (NO ZoneID/RecordID, NO token) ---
+
+type page struct {
+	Version   string        `json:"version"`
+	BuiltAt   time.Time     `json:"built_at"`
+	CFHealthy bool          `json:"cf_healthy"`
+	Zones     []zoneView    `json:"zones"`
+	Reverse   []string      `json:"reverse_zones"`
+	Stub      []stubView    `json:"stub_zones"`
+	VHosts    []string      `json:"vhosts"`
+	VHostV4   string        `json:"vhost_v4,omitempty"`
+	VHostV6   string        `json:"vhost_v6,omitempty"`
+	MDNSFwd   []hostView    `json:"mdns_forward"`
+	MDNSRev   []hostView    `json:"mdns_reverse"`
+	Cache     *cacheView    `json:"answer_cache,omitempty"`
+	Queries   *queryStats   `json:"queries,omitempty"`
+	Backends  []backendView `json:"backends,omitempty"`
+	Workers   []workerView  `json:"workers,omitempty"`
+	Controls  *controlsView `json:"-"` // HTML-only (the JSON view stays purely read-only)
+	SelfTest  bool          `json:"-"` // HTML-only: render the self-tests link
+	DDNSSim   bool          `json:"-"` // HTML-only: render the DDNS-simulate form
+}
+
+// controlsView drives the HTML control panel; it lists which actions are wired and
+// whether a password field is needed.
+type controlsView struct {
+	NeedPassword  bool
+	FlushCache    bool
+	RefreshMirror bool
+	Restart       bool
+	Backend       bool // on-the-fly backend enable/disable available
+}
+
+// cacheView is the forward-path answer-cache summary (RFC 2308/8767/9520 caching).
+type cacheView struct {
+	anscache.Stats
+	HitRatio string `json:"hit_ratio"` // "NN.N%" over hits+misses, for at-a-glance reading
+}
+
+// queryStats is the query-telemetry rollup plus the recent ring and busiest clients.
+type queryStats struct {
+	Total      uint64            `json:"total"`
+	Clients    int               `json:"clients"`
+	ByDecision map[string]uint64 `json:"by_decision"`
+	Recent     []queryView       `json:"recent"`
+	Top        []clientView      `json:"top_clients"`
+}
+
+type queryView struct {
+	Seq        uint64  `json:"seq"`
+	Time       string  `json:"time"`
+	Client     string  `json:"client"`
+	ClientName string  `json:"client_name,omitempty"`
+	Name       string  `json:"name"`
+	Type       string  `json:"type"`
+	Decision   string  `json:"decision"`
+	Rcode      string  `json:"rcode"`
+	LatencyMS  float64 `json:"latency_ms"`
+}
+
+type clientView struct {
+	Client   string `json:"client"`
+	Name     string `json:"name,omitempty"`
+	Count    uint64 `json:"count"`
+	LastSeen string `json:"last_seen"`
+}
+
+type backendView struct {
+	Addr      string  `json:"addr"`
+	Net       string  `json:"net"`
+	Role      string  `json:"role"`
+	State     string  `json:"state"`
+	Healthy   bool    `json:"healthy"`
+	Disabled  bool    `json:"disabled"`
+	Consec    int     `json:"consecutive_failures"`
+	FailRatio float64 `json:"fail_ratio"`
+	FailPct   string  `json:"-"` // pre-rendered "NN%" for the HTML view
+	OpenFor   string  `json:"open_for,omitempty"`
+	Cooldown  string  `json:"cooldown_remaining,omitempty"`
+}
+
+type workerView struct {
+	Name        string `json:"name"`
+	Restarts    int64  `json:"restarts"`
+	Stalls      int64  `json:"stalls"`
+	Panics      int64  `json:"panics"`
+	ProgressAge string `json:"progress_age"`
+}
+
+type zoneView struct {
+	Apex           string   `json:"apex"`
+	Serial         uint32   `json:"serial"`
+	Stale          bool     `json:"stale"`
+	SyntheticStale bool     `json:"synthetic_stale"`
+	Records        []rrView `json:"records"`
+}
+
+type rrView struct {
+	Owner     string `json:"owner"`
+	Type      string `json:"type"`
+	TTL       uint32 `json:"ttl"`
+	RDATA     string `json:"rdata"`
+	Proxied   bool   `json:"proxied,omitempty"`
+	Synthetic bool   `json:"synthetic,omitempty"`
+}
+
+type stubView struct {
+	Apex    string   `json:"apex"`
+	Targets []string `json:"targets"`
+}
+
+type hostView struct {
+	Name    string   `json:"name"`
+	Records []string `json:"records"`
+}
+
+func (s *Server) build() page {
+	snap := s.snap()
+	view := s.view()
+	if view == nil {
+		view = &model.MDNSView{}
+	}
+	p := page{
+		Version:   s.version,
+		BuiltAt:   snap.BuiltAt,
+		CFHealthy: snap.CFHealthy,
+	}
+	if snap.VHostV4.IsValid() {
+		p.VHostV4 = snap.VHostV4.String()
+	}
+	if snap.VHostV6.IsValid() {
+		p.VHostV6 = snap.VHostV6.String()
+	}
+
+	for apex, z := range snap.Zones {
+		zv := zoneView{Apex: apex, Serial: z.LastFetchedSerial, Stale: z.Stale, SyntheticStale: z.SyntheticStale}
+		zv.Records = append(zv.Records, ownerRecords(z)...)
+		sortRR(zv.Records)
+		p.Zones = append(p.Zones, zv)
+	}
+	sort.Slice(p.Zones, func(i, j int) bool { return p.Zones[i].Apex < p.Zones[j].Apex })
+
+	for apex := range snap.ReverseZ {
+		p.Reverse = append(p.Reverse, apex)
+	}
+	sort.Slice(p.Reverse, func(i, j int) bool { return lessReverseDNS(p.Reverse[i], p.Reverse[j]) })
+
+	for apex, sz := range snap.StubZones {
+		sv := stubView{Apex: apex}
+		for _, t := range sz.Target {
+			sv.Targets = append(sv.Targets, t.String())
+		}
+		p.Stub = append(p.Stub, sv)
+	}
+	sort.Slice(p.Stub, func(i, j int) bool { return p.Stub[i].Apex < p.Stub[j].Apex })
+
+	for v := range snap.VHosts {
+		p.VHosts = append(p.VHosts, v)
+	}
+	sort.Strings(p.VHosts)
+
+	p.MDNSFwd = hostViews(view.Forward)
+	p.MDNSRev = hostViews(view.Reverse)
+	// mDNS reverse keys are in-addr/ip6.arpa names; order them by address, not alphabet.
+	sort.Slice(p.MDNSRev, func(i, j int) bool { return lessReverseDNS(p.MDNSRev[i].Name, p.MDNSRev[j].Name) })
+
+	if s.cacheStats != nil {
+		if st, on := s.cacheStats(); on {
+			p.Cache = &cacheView{Stats: st, HitRatio: hitRatio(st.Hits, st.Misses)}
+		}
+	}
+	if s.qlog != nil {
+		p.Queries = buildQueryStats(s.qlog, s.clientName)
+	}
+	if s.backends != nil {
+		p.Backends = buildBackends(s.backends())
+	}
+	if s.workers != nil {
+		p.Workers = buildWorkers(s.workers())
+	}
+	if s.controlsActive {
+		p.Controls = &controlsView{
+			NeedPassword:  s.controls.Password != "",
+			FlushCache:    s.controls.FlushCache != nil,
+			RefreshMirror: s.controls.RefreshMirror != nil,
+			Restart:       s.controls.Restart != nil,
+			Backend:       s.controls.SetBackend != nil,
+		}
+	}
+	p.SelfTest = s.selftest != nil
+	p.DDNSSim = s.ddnsSim != nil
+	return p
+}
+
+// hitRatio renders hits/(hits+misses) as a percentage string, "—" when no lookups yet.
+func hitRatio(hits, misses uint64) string {
+	total := hits + misses
+	if total == 0 {
+		return "—"
+	}
+	return fmt.Sprintf("%.1f%%", 100*float64(hits)/float64(total))
+}
+
+// recentQueryLimit caps how many recent queries the page renders (the ring may hold more).
+const recentQueryLimit = 100
+
+func buildQueryStats(l *qlog.Log, nameFor func(netip.Addr) string) *queryStats {
+	name := func(a netip.Addr) string {
+		if nameFor == nil || !a.IsValid() {
+			return ""
+		}
+		return nameFor(a)
+	}
+	tot := l.Totals()
+	qs := &queryStats{Total: tot.Total, Clients: tot.Clients, ByDecision: map[string]uint64{}}
+	for d, n := range tot.ByDecision {
+		qs.ByDecision[string(d)] = n
+	}
+	for _, e := range l.Recent(recentQueryLimit) {
+		qs.Recent = append(qs.Recent, queryView{
+			Seq:        e.Seq,
+			Time:       e.Time.Format("15:04:05"),
+			Client:     addrStr(e.Client),
+			ClientName: name(e.Client),
+			Name:       e.Name,
+			Type:       e.Qtype,
+			Decision:   string(e.Decision),
+			Rcode:      e.Rcode,
+			LatencyMS:  float64(e.Latency.Microseconds()) / 1000,
+		})
+	}
+	for _, c := range l.TopClients(20) {
+		qs.Top = append(qs.Top, clientView{
+			Client:   addrStr(c.Client),
+			Name:     name(c.Client),
+			Count:    c.Count,
+			LastSeen: c.LastSeen.Format("15:04:05"),
+		})
+	}
+	return qs
+}
+
+func buildBackends(bs []forwarder.BackendStatus) []backendView {
+	out := make([]backendView, 0, len(bs))
+	for _, b := range bs {
+		bv := backendView{
+			Addr: b.Addr, Net: b.Net, Role: b.Role, State: b.State, Healthy: b.Healthy,
+			Disabled: b.Disabled, Consec: b.Consec, FailRatio: b.FailRatio,
+			FailPct: fmt.Sprintf("%.0f%%", b.FailRatio*100),
+		}
+		if b.OpenFor > 0 {
+			bv.OpenFor = b.OpenFor.Round(time.Second).String()
+		}
+		if b.Cooldown > 0 {
+			bv.Cooldown = b.Cooldown.Round(time.Second).String()
+		}
+		out = append(out, bv)
+	}
+	return out
+}
+
+func buildWorkers(m map[string]supervisor.WorkerStats) []workerView {
+	out := make([]workerView, 0, len(m))
+	for name, ws := range m {
+		out = append(out, workerView{
+			Name: name, Restarts: ws.Restarts, Stalls: ws.Stalls, Panics: ws.Panics,
+			ProgressAge: ws.ProgressAge.Round(time.Second).String(),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+func addrStr(a netip.Addr) string {
+	if !a.IsValid() {
+		return "?"
+	}
+	return a.String()
+}
+
+// ownerRecords flattens a zone's real records, wildcard records, and synthetic
+// tunnel addresses into redacted rows (never the CF object IDs).
+func ownerRecords(z *model.Zone) []rrView {
+	var out []rrView
+	emit := func(owner string, rr model.RR, synthetic bool) {
+		out = append(out, rrView{
+			Owner:     ownerLabel(owner),
+			Type:      dns.TypeToString[rr.Type],
+			TTL:       rr.TTL,
+			RDATA:     rr.RDATA(),
+			Proxied:   rr.Proxied,
+			Synthetic: synthetic || rr.Synthetic,
+		})
+	}
+	for owner, byType := range z.Records {
+		for _, rrs := range byType {
+			for _, rr := range rrs {
+				emit(owner, rr, false)
+			}
+		}
+	}
+	for _, rrs := range z.Wildcards {
+		for _, rr := range rrs {
+			emit("*", rr, false)
+		}
+	}
+	for owner, byType := range z.TunnelAddr {
+		for _, rrs := range byType {
+			for _, rr := range rrs {
+				emit(owner, rr, true)
+			}
+		}
+	}
+	return out
+}
+
+func hostViews(m map[string][]model.RR) []hostView {
+	var out []hostView
+	for name, rrs := range m {
+		hv := hostView{Name: name}
+		for _, rr := range rrs {
+			hv.Records = append(hv.Records, dns.TypeToString[rr.Type]+" "+rr.RDATA())
+		}
+		sort.Strings(hv.Records)
+		out = append(out, hv)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+func ownerLabel(owner string) string {
+	if owner == "" {
+		return "@"
+	}
+	return owner
+}
+
+// lessReverseDNS orders reverse-DNS names (in-addr.arpa / ip6.arpa) intuitively: by their
+// labels in REVERSE order — most-significant address component first — comparing numeric
+// labels numerically. So zones group in address order (e.g. 192.0.2/24 before 192.168/16,
+// and 9.x before 10.x) rather than the misleading left-to-right alphabetical order, where
+// "2.0.192.in-addr.arpa." would sort after "168.192.in-addr.arpa.".
+func lessReverseDNS(a, b string) bool {
+	ra, rb := reverseLabels(a), reverseLabels(b)
+	for i := 0; i < len(ra) && i < len(rb); i++ {
+		if ra[i] == rb[i] {
+			continue
+		}
+		na, ea := strconv.Atoi(ra[i])
+		nb, eb := strconv.Atoi(rb[i])
+		if ea == nil && eb == nil {
+			return na < nb // both numeric (decimal octets): compare numerically
+		}
+		return ra[i] < rb[i] // labels (or hex nibbles): lexical, which is correct for hex digits
+	}
+	return len(ra) < len(rb)
+}
+
+// reverseLabels splits a name on "." (dropping the trailing dot) and reverses the labels,
+// so "2.0.192.in-addr.arpa." becomes [arpa, in-addr, 192, 0, 2].
+func reverseLabels(name string) []string {
+	labels := strings.Split(strings.TrimSuffix(name, "."), ".")
+	for i, j := 0, len(labels)-1; i < j; i, j = i+1, j-1 {
+		labels[i], labels[j] = labels[j], labels[i]
+	}
+	return labels
+}
+
+func sortRR(rr []rrView) {
+	sort.Slice(rr, func(i, j int) bool {
+		if rr[i].Owner != rr[j].Owner {
+			return rr[i].Owner < rr[j].Owner
+		}
+		if rr[i].Type != rr[j].Type {
+			return rr[i].Type < rr[j].Type
+		}
+		return rr[i].RDATA < rr[j].RDATA
+	})
+}
+
+var pageTmpl = template.Must(template.New("diag").Parse(`<!doctype html>
+<html><head><meta charset="utf-8"><title>splitdnsd diagnostics</title>
+<style>
+body{font:14px/1.4 system-ui,sans-serif;margin:1.5rem;color:#222}
+h1{font-size:1.3rem} h2{font-size:1.05rem;margin-top:1.5rem;border-bottom:1px solid #ddd}
+table{border-collapse:collapse;margin:.3rem 0} td,th{padding:.15rem .6rem;text-align:left}
+td{font-variant-numeric:tabular-nums} /* stop counters jittering column width on update */
+tr:nth-child(even){background:#f6f6f6} .flag{color:#b00;font-weight:600}
+.ok{color:#080} .muted{color:#777} table.sortable th{cursor:pointer}
+</style></head><body>
+<h1>splitdnsd diagnostics <span class="muted">{{.Version}}</span></h1>
+<p>Built {{.BuiltAt}} — Cloudflare mirror:
+{{if .CFHealthy}}<span class="ok">healthy</span>{{else}}<span class="flag">degraded (serving stale)</span>{{end}}</p>
+{{if .SelfTest}}<p><a href="/selftest">Run self-tests &rarr;</a></p>{{end}}
+{{if .DDNSSim}}<form method="get" action="/ddns-simulate" style="margin:.3rem 0">
+<b>DDNS simulate</b> <span class="muted">(never writes)</span> &mdash; host <input name="host" size="12">
+addr <input name="addr" size="16" placeholder="1.2.3.4 (public)">
+<button name="explore" value="" title="exactly what write-back does with your current config">As configured &rarr;</button>
+<button name="explore" value="1" title="ignore the eligibility allowlist — explore what enabling this host would do">Explore: ignore allowlist &rarr;</button></form>{{end}}
+
+{{with .Controls}}
+<h2>Controls <span class="flag">danger</span></h2>
+<div id="ctl" data-need-pw="{{.NeedPassword}}">
+{{if .NeedPassword}}<form id="pwform" autocomplete="on" style="margin:.2rem 0">
+<input type="text" name="username" value="diag" autocomplete="username" tabindex="-1" aria-hidden="true" style="position:absolute;left:-9999px">
+<input type="password" id="diagpw" name="password" autocomplete="current-password" placeholder="control password" size="18">
+<button type="submit">Unlock</button>
+<span class="muted">— use your password manager; kept for this session</span></form>{{end}}
+{{if .FlushCache}}<button class="ctl" data-action="flush-cache">Flush answer cache</button>{{end}}
+{{if .RefreshMirror}}<button class="ctl" data-action="refresh-mirror">Force mirror refresh</button>{{end}}
+{{if .Restart}}<button class="ctl" data-action="restart" data-confirm="Restart the daemon?">Restart daemon</button>{{end}}
+</div>
+{{end}}
+
+{{with .Cache}}
+<h2>Answer cache <span class="muted">forward path</span></h2>
+<div data-live="answer_cache"><table>
+<tr><th>hit ratio</th><td data-f="hit_ratio">{{.HitRatio}}</td><th>entries</th><td data-f="entries">{{.Entries}} / {{.Capacity}}</td></tr>
+<tr><th>hits</th><td data-f="hits">{{.Hits}}</td><th>misses</th><td data-f="misses">{{.Misses}}</td></tr>
+<tr><th>stale serves</th><td data-f="stale_serves">{{.StaleServes}}</td><th>servfail hits</th><td data-f="fail_hits">{{.FailHits}}</td></tr>
+<tr><th>inserts</th><td data-f="inserts">{{.Inserts}}</td><th>evictions</th><td data-f="evictions">{{.Evictions}}</td></tr>
+</table></div>
+{{end}}
+
+{{if .Backends}}
+<h2>Upstreams <span class="muted">circuit breaker</span></h2>
+<p class="muted">Selection is <b>sequential failover</b>: queries go to the first healthy
+upstream in this order; if it fails or its breaker is open, the next is tried, and so on.
+It is NOT round-robin or query-all-take-first. (If every upstream is tripped the breaker
+fails open and tries them anyway.){{if and $.Controls $.Controls.Backend}} Use the
+buttons to disable/enable an upstream on the fly (until re-enabled or restart) to force
+traffic onto another.{{end}}</p>
+<div data-live="backends"><table><thead><tr><th>backend</th><th>net</th><th>role</th><th>state</th><th>consec fails</th><th>fail ratio</th><th>tripped for</th><th>cooldown</th>{{if and $.Controls $.Controls.Backend}}<th></th>{{end}}</tr></thead><tbody>
+{{range .Backends}}<tr data-key="{{.Addr}}">
+<td data-f="addr">{{.Addr}}</td><td data-f="net">{{.Net}}</td><td data-f="role">{{.Role}}</td>
+<td data-f="state" class="{{if .Healthy}}ok{{else}}flag{{end}}">{{.State}}</td>
+<td data-f="consecutive_failures">{{.Consec}}</td><td data-f="fail_ratio">{{.FailPct}}</td>
+<td data-f="open_for" class="muted">{{.OpenFor}}</td><td data-f="cooldown_remaining" class="muted">{{.Cooldown}}</td>
+{{if and $.Controls $.Controls.Backend}}<td data-f="btn">{{if .Disabled}}<button class="ctl" data-action="backend" data-op="enable" data-addr="{{.Addr}}">enable</button>{{else}}<button class="ctl" data-action="backend" data-op="disable" data-addr="{{.Addr}}">disable</button>{{end}}</td>{{end}}</tr>
+{{end}}</tbody></table></div>
+{{if and $.Controls $.Controls.Backend}}<button class="ctl" data-action="backend" data-op="reset">Reset backend overrides</button>{{end}}
+{{end}}
+
+{{with .Workers}}
+<h2>Workers <span class="muted">supervisor</span></h2>
+<div data-live="workers"><table><thead><tr><th>worker</th><th>restarts</th><th>stalls</th><th>panics</th><th>last progress</th></tr></thead><tbody>
+{{range .}}<tr data-key="{{.Name}}"><td data-f="name">{{.Name}}</td>
+<td data-f="restarts"{{if .Restarts}} class="flag"{{end}}>{{.Restarts}}</td>
+<td data-f="stalls"{{if .Stalls}} class="flag"{{end}}>{{.Stalls}}</td>
+<td data-f="panics"{{if .Panics}} class="flag"{{end}}>{{.Panics}}</td>
+<td data-f="progress_age" class="muted">{{.ProgressAge}} ago</td></tr>
+{{end}}</tbody></table></div>
+{{end}}
+
+{{with .Queries}}
+<h2>Queries</h2>
+<div data-live="queries">
+<p><b data-f="total">{{.Total}}</b> total, <b data-f="clients">{{.Clients}}</b> clients</p>
+<p class="muted" data-f="by_decision">{{range $d, $n := .ByDecision}}{{$d}}={{$n}} {{end}}</p>
+<h3>Busiest clients <span class="muted">(click a header to sort)</span></h3>
+<table class="sortable" data-rows="top_clients" data-defsort="2:num:desc"><thead><tr><th>client</th><th>name</th><th>queries</th><th>last seen</th></tr></thead><tbody>
+{{range .Top}}<tr data-key="{{.Client}}"><td data-f="client">{{.Client}}</td><td data-f="name" class="muted">{{.Name}}</td><td data-f="count">{{.Count}}</td><td data-f="last_seen" class="muted">{{.LastSeen}}</td></tr>{{end}}</tbody></table>
+<h3>Recent queries <span class="muted">(click a header to sort)</span></h3>
+<table class="sortable" data-rows="recent" data-defsort="key:num:desc"><thead><tr><th>time</th><th>client</th><th>name</th><th>type</th><th>decision</th><th>rcode</th><th>ms</th></tr></thead><tbody>
+{{range .Recent}}<tr data-key="{{.Seq}}"><td data-f="time" class="muted">{{.Time}}</td><td data-f="client">{{.Client}}{{if .ClientName}} <span data-f="cname" class="muted">{{.ClientName}}</span>{{end}}</td><td data-f="name">{{.Name}}</td><td data-f="type">{{.Type}}</td>
+<td data-f="decision">{{.Decision}}</td><td data-f="rcode">{{.Rcode}}</td><td data-f="ms">{{printf "%.1f" .LatencyMS}}</td></tr>{{end}}</tbody></table>
+</div>
+{{end}}
+
+{{range .Zones}}
+<h2>{{.Apex}} <span class="muted">serial {{.Serial}}</span>
+{{if .Stale}}<span class="flag">STALE</span>{{end}}
+{{if .SyntheticStale}}<span class="flag">SYNTHETIC-STALE</span>{{end}}</h2>
+<table><tr><th>owner</th><th>type</th><th>ttl</th><th>rdata</th><th></th></tr>
+{{range .Records}}<tr><td>{{.Owner}}</td><td>{{.Type}}</td><td>{{.TTL}}</td><td>{{.RDATA}}</td>
+<td class="muted">{{if .Synthetic}}synthetic {{end}}{{if .Proxied}}proxied{{end}}</td></tr>
+{{end}}</table>
+{{end}}
+
+<h2>Reverse zones</h2><table>{{range .Reverse}}<tr><td>{{.}}</td></tr>{{end}}</table>
+<h2>Stub zones</h2><table>{{range .Stub}}<tr><td>{{.Apex}}</td><td>{{range .Targets}}{{.}} {{end}}</td></tr>{{end}}</table>
+<h2>VHosts</h2><p>reverse proxy {{.VHostV4}} {{.VHostV6}}</p>
+<table>{{range .VHosts}}<tr><td>{{.}}</td></tr>{{end}}</table>
+<h2>mDNS forward</h2><div data-live="mdns_forward"><table><tbody>
+{{range .MDNSFwd}}<tr data-key="{{.Name}}"><td data-f="name">{{.Name}}</td><td data-f="records">{{range .Records}}{{.}}; {{end}}</td></tr>{{end}}
+</tbody></table></div>
+<h2>mDNS reverse</h2><div data-live="mdns_reverse"><table><tbody>
+{{range .MDNSRev}}<tr data-key="{{.Name}}"><td data-f="name">{{.Name}}</td><td data-f="records">{{range .Records}}{{.}}; {{end}}</td></tr>{{end}}
+</tbody></table></div>
+<script>
+(function(){
+  'use strict';
+  // ---- small DOM helpers ----
+  function fcell(el, n){ return el.querySelector('[data-f="' + n + '"]'); }
+  function patchText(node, val){ if(node){ var s = String(val); if(node.textContent !== s) node.textContent = s; } }
+  function td(text, cls){ var c = document.createElement('td'); if(cls) c.className = cls; if(text != null) c.textContent = text; return c; }
+
+  // ---- selection / focus guard: never patch a region the user is working in ----
+  var dragging = false;
+  function hasSelIn(el){
+    var sel = window.getSelection();
+    if(sel && sel.rangeCount && !sel.isCollapsed){ try { if(sel.getRangeAt(0).intersectsNode(el)) return true; } catch(e){} }
+    var a = document.activeElement;
+    if(a && el.contains(a) && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.isContentEditable)) return true;
+    return false;
+  }
+  function locked(el){ return dragging || hasSelIn(el); }
+
+  // ---- click-to-sort: store the comparator as state, reapply after every patch ----
+  function cellVal(tr, col){ return col === 'key' ? tr.dataset.key : (tr.cells[col] ? tr.cells[col].textContent.trim() : ''); }
+  function applySort(table){
+    var s = table._sort; if(!s) return;
+    var body = table.tBodies[0]; var rows = Array.prototype.slice.call(body.rows);
+    rows.sort(function(a, b){
+      var x = cellVal(a, s.col), y = cellVal(b, s.col), c;
+      if(s.type === 'num'){ c = (parseFloat(x) || 0) - (parseFloat(y) || 0); }
+      else { var nx = parseFloat(x), ny = parseFloat(y); c = (!isNaN(nx) && !isNaN(ny)) ? nx - ny : x.localeCompare(y); }
+      return s.dir === 'desc' ? -c : c;
+    });
+    rows.forEach(function(r){ body.appendChild(r); });
+  }
+  document.querySelectorAll('table.sortable').forEach(function(t){
+    if(t.dataset.defsort){ var p = t.dataset.defsort.split(':'); t._sort = { col: p[0] === 'key' ? 'key' : parseInt(p[0], 10), type: p[1] || 'str', dir: p[2] || 'asc' }; applySort(t); }
+    var ths = t.tHead ? t.tHead.rows[0].cells : [];
+    Array.prototype.forEach.call(ths, function(th, idx){
+      th.addEventListener('click', function(){
+        var dir = (t._sort && t._sort.col === idx && t._sort.dir === 'asc') ? 'desc' : 'asc';
+        var body = t.tBodies[0], sample = (body.rows[0] && body.rows[0].cells[idx]) ? body.rows[0].cells[idx].textContent.trim() : '';
+        var type = (sample !== '' && !isNaN(parseFloat(sample))) ? 'num' : 'str';
+        t._sort = { col: idx, type: type, dir: dir }; applySort(t);
+      });
+    });
+  });
+
+  // ---- keyed row reconcile (add/update/remove, ends in data order) ----
+  function reconcile(tbody, rows, keyOf, make, fill){
+    var existing = {};
+    Array.prototype.forEach.call(tbody.children, function(tr){ existing[tr.dataset.key] = tr; });
+    var seen = {};
+    rows.forEach(function(d){
+      var k = String(keyOf(d)); seen[k] = true;
+      var tr = existing[k];
+      if(!tr){ tr = make(d); tr.dataset.key = k; }
+      else if(fill){ fill(tr, d); }
+      tbody.appendChild(tr);
+    });
+    Object.keys(existing).forEach(function(k){ if(!seen[k]) existing[k].remove(); });
+  }
+
+  function fillBackend(tr, x){
+    patchText(fcell(tr, 'addr'), x.addr); patchText(fcell(tr, 'net'), x.net); patchText(fcell(tr, 'role'), x.role);
+    var st = fcell(tr, 'state'); patchText(st, x.state); var cls = x.healthy ? 'ok' : 'flag'; if(st.className !== cls) st.className = cls;
+    patchText(fcell(tr, 'consecutive_failures'), x.consecutive_failures);
+    patchText(fcell(tr, 'fail_ratio'), Math.round((x.fail_ratio || 0) * 100) + '%');
+    patchText(fcell(tr, 'open_for'), x.open_for || ''); patchText(fcell(tr, 'cooldown_remaining'), x.cooldown_remaining || '');
+    var cell = fcell(tr, 'btn');
+    if(cell){
+      var op = x.disabled ? 'enable' : 'disable', b = cell.querySelector('button');
+      if(!b || b.dataset.op !== op){
+        cell.textContent = ''; b = document.createElement('button'); b.className = 'ctl';
+        b.dataset.action = 'backend'; b.dataset.op = op; b.dataset.addr = x.addr; b.textContent = op;
+        b.addEventListener('click', function(){ doControl(b); }); cell.appendChild(b);
+      }
+    }
+  }
+  function makeBackend(x){ var tr = document.createElement('tr');
+    tr.innerHTML = '<td data-f="addr"></td><td data-f="net"></td><td data-f="role"></td><td data-f="state"></td><td data-f="consecutive_failures"></td><td data-f="fail_ratio"></td><td data-f="open_for" class="muted"></td><td data-f="cooldown_remaining" class="muted"></td>';
+    if(document.querySelector('[data-live="backends"] [data-f="btn"]')) tr.appendChild(td('', null)).setAttribute('data-f', 'btn');
+    fillBackend(tr, x); return tr; }
+
+  function makeRecent(x){
+    var tr = document.createElement('tr');
+    tr.appendChild(td(x.time, 'muted'));
+    tr.appendChild(td(x.client, null)); // client cell; the resolved name span is added by fillRecent
+    tr.appendChild(td(x.name)); tr.appendChild(td(x.type)); tr.appendChild(td(x.decision)); tr.appendChild(td(x.rcode));
+    tr.appendChild(td((x.latency_ms || 0).toFixed(1)));
+    fillRecent(tr, x);
+    return tr;
+  }
+  // A recorded query is immutable EXCEPT its opportunistic client name, which can resolve
+  // later as mDNS (or DHCP, eventually) learns the host — so keep that span up to date.
+  function fillRecent(tr, x){
+    var cell = tr.cells[1], span = cell.querySelector('[data-f="cname"]');
+    if(x.client_name){
+      if(!span){ cell.appendChild(document.createTextNode(' ')); span = document.createElement('span'); span.className = 'muted'; span.dataset.f = 'cname'; cell.appendChild(span); }
+      patchText(span, x.client_name);
+    } else if(span){ span.remove(); }
+  }
+
+  // mDNS forward/reverse: keyed by host/arpa name; only the records cell changes.
+  function mdnsRecords(tr, x){ patchText(fcell(tr, 'records'), (x.records || []).map(function(r){ return r + '; '; }).join('')); }
+  function makeMDNS(x){ var tr = document.createElement('tr'); tr.innerHTML = '<td data-f="name"></td><td data-f="records"></td>'; fcell(tr, 'name').textContent = x.name; mdnsRecords(tr, x); return tr; }
+  function mdnsPatch(root, d){ reconcile(root.querySelector('tbody'), d || [], function(x){ return x.name; }, makeMDNS, mdnsRecords); }
+
+  // ---- per-section patchers (key === data-live === /diag.json field) ----
+  var patchers = {
+    answer_cache: function(root, d){
+      ['hits','misses','stale_serves','fail_hits','inserts','evictions','hit_ratio'].forEach(function(n){ patchText(fcell(root, n), d[n]); });
+      patchText(fcell(root, 'entries'), d.entries + ' / ' + d.capacity);
+    },
+    workers: function(root, d){
+      reconcile(root.querySelector('tbody'), d, function(x){ return x.name; },
+        function(){ var tr = document.createElement('tr'); tr.innerHTML = '<td data-f="name"></td><td data-f="restarts"></td><td data-f="stalls"></td><td data-f="panics"></td><td data-f="progress_age" class="muted"></td>'; return tr; },
+        function(tr, x){ patchText(fcell(tr,'name'), x.name); patchText(fcell(tr,'restarts'), x.restarts); patchText(fcell(tr,'stalls'), x.stalls); patchText(fcell(tr,'panics'), x.panics); patchText(fcell(tr,'progress_age'), x.progress_age + ' ago'); });
+    },
+    backends: function(root, d){
+      var table = root.querySelector('table');
+      reconcile(table.tBodies[0], d, function(x){ return x.addr; }, makeBackend, fillBackend);
+      applySort(table);
+    },
+    queries: function(root, d){
+      patchText(fcell(root, 'total'), d.total); patchText(fcell(root, 'clients'), d.clients);
+      var bd = ''; Object.keys(d.by_decision || {}).sort().forEach(function(k){ bd += k + '=' + d.by_decision[k] + ' '; });
+      patchText(fcell(root, 'by_decision'), bd);
+      var top = root.querySelector('table[data-rows="top_clients"]');
+      reconcile(top.tBodies[0], d.top_clients || [], function(x){ return x.client; },
+        function(x){ var tr = document.createElement('tr'); tr.innerHTML = '<td data-f="client"></td><td data-f="name" class="muted"></td><td data-f="count"></td><td data-f="last_seen" class="muted"></td>'; fcell(tr,'client').textContent = x.client; return tr; },
+        function(tr, x){ patchText(fcell(tr,'name'), x.name || ''); patchText(fcell(tr,'count'), x.count); patchText(fcell(tr,'last_seen'), x.last_seen || ''); });
+      applySort(top);
+      var rec = root.querySelector('table[data-rows="recent"]');
+      reconcile(rec.tBodies[0], d.recent || [], function(x){ return x.seq; }, makeRecent, fillRecent); // only the client name can change
+      applySort(rec);
+    },
+    mdns_forward: mdnsPatch,
+    mdns_reverse: mdnsPatch
+  };
+
+  function patchSection(root, data){
+    if(locked(root)){ root._dirty = data; return; } // defer while the user is selecting/typing here
+    root._dirty = null;
+    var fn = patchers[root.dataset.live]; if(fn) fn(root, data);
+  }
+  function patchAll(data){
+    document.querySelectorAll('[data-live]').forEach(function(root){ var k = root.dataset.live; if(data[k] !== undefined) patchSection(root, data[k]); });
+  }
+  function flushDirty(){ document.querySelectorAll('[data-live]').forEach(function(root){ if(root._dirty && !locked(root)) patchSection(root, root._dirty); }); }
+
+  // ---- visibility-aware polling with backoff ----
+  var POLL_BASE = 4000, POLL_MAX = 30000, delay = POLL_BASE, timer = null;
+  function schedule(){ clearTimeout(timer); if(!document.hidden) timer = setTimeout(poll, delay); }
+  function poll(){
+    fetch('/diag.json', { cache: 'no-store' }).then(function(r){ if(!r.ok) throw new Error(r.status); return r.json(); })
+      .then(function(d){ patchAll(d); delay = POLL_BASE; })
+      .catch(function(){ delay = Math.min(delay * 2, POLL_MAX); })
+      .then(schedule);
+  }
+  document.addEventListener('visibilitychange', function(){ if(document.hidden) clearTimeout(timer); else { delay = POLL_BASE; poll(); } });
+  var selT; document.addEventListener('selectionchange', function(){ clearTimeout(selT); selT = setTimeout(flushDirty, 150); });
+  document.addEventListener('pointerdown', function(){ dragging = true; });
+  document.addEventListener('pointerup', function(){ dragging = false; flushDirty(); });
+  document.addEventListener('focusout', flushDirty);
+
+  // ---- control actions (password via input + session; seamless refresh, no reload) ----
+  var ctl = document.getElementById('ctl'), needPw = ctl && ctl.dataset.needPw === 'true';
+  var pwInput = document.getElementById('diagpw'), pwForm = document.getElementById('pwform');
+  if(pwInput){ var saved = sessionStorage.getItem('diagpw'); if(saved) pwInput.value = saved; }
+  if(pwForm){ pwForm.addEventListener('submit', function(e){ e.preventDefault(); if(pwInput.value){ sessionStorage.setItem('diagpw', pwInput.value); pwInput.blur(); } }); }
+  function curpw(){ if(!needPw) return ''; var p = (pwInput && pwInput.value) || sessionStorage.getItem('diagpw') || ''; if(p) sessionStorage.setItem('diagpw', p); return p; }
+  function doControl(btn){
+    if(btn.dataset.confirm && !confirm(btn.dataset.confirm)) return;
+    var q = ''; if(btn.dataset.op){ q = 'op=' + encodeURIComponent(btn.dataset.op); if(btn.dataset.addr) q += '&addr=' + encodeURIComponent(btn.dataset.addr); }
+    var headers = {};
+    if(needPw){ var p = curpw(); if(!p){ if(pwInput) pwInput.focus(); alert('Enter the control password, then Unlock.'); return; } headers['X-Diag-Password'] = p; }
+    fetch('/control/' + btn.dataset.action + (q ? '?' + q : ''), { method: 'POST', headers: headers }).then(function(r){
+      if(r.status === 401){ sessionStorage.removeItem('diagpw'); if(pwInput){ pwInput.value = ''; pwInput.focus(); } alert('Wrong password — try again'); }
+      else if(r.status === 429){ alert('Rate-limited; retry shortly'); }
+      else if(r.ok){ poll(); } // seamless data refresh instead of a full reload
+      else { r.text().then(function(t){ alert('Error: ' + t); }); }
+    }).catch(function(e){ alert('Request failed: ' + e); });
+  }
+  document.querySelectorAll('button.ctl').forEach(function(b){ b.addEventListener('click', function(){ doControl(b); }); });
+
+  poll(); // kick off live updates
+})();
+</script>
+</body></html>`))

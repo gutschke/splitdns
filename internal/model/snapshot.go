@@ -1,0 +1,63 @@
+package model
+
+import (
+	"net/netip"
+	"time"
+)
+
+// Snapshot is the immutable zone/static/vhost view the hot path reads via a
+// single atomic.Pointer load (§2.1, §2.3). Build a new one and Store it; never
+// mutate a published Snapshot.
+type Snapshot struct {
+	Zones       map[string]*Zone     // canonical apex FQDN (trailing dot) -> zone
+	StubZones   map[string]*StubZone // FQDN -> forward target (sub.example.com.)
+	ReverseZ    map[string]*RevZone  // configured PTR zones (e.g. 2.0.192.in-addr.arpa.)
+	VHosts      map[string]bool      // redirect set from :818 (relative labels)
+	Excluded    map[string]bool      // apex FQDNs NOT subject to vhost redirect (config-driven)
+	Static      map[string][]RR      // static specials + seeded hosts (forward + PTR)
+	AllowSuffix []string             // authoritative/stub/static suffixes (rebind scope, §4.2)
+	BuiltAt     time.Time
+	CFHealthy   bool // false => serving stale CF data (degraded)
+
+	// VHostV4/VHostV6 are the reverse proxy redirect targets the R3 vhost/naked/www rule
+	// answers with (design §2.4 step 6). Zero value => that family is NODATA.
+	VHostV4 netip.Addr
+	VHostV6 netip.Addr
+}
+
+// Zone is a Cloudflare-mirrored authoritative zone.
+type Zone struct {
+	ID, Apex          string
+	NS                []RR
+	SOA               RR                         // ALWAYS present (§2.4d)
+	Records           map[string]map[uint16][]RR // relative owner -> qtype -> RRset
+	Wildcards         map[uint16][]RR            // '*' owner RRsets
+	ENT               map[string]bool            // empty-non-terminal owners (RFC 4592)
+	TunnelAddr        map[string]map[uint16][]RR // owner -> {A,AAAA} flattened addrs
+	LastFetchedSerial uint32
+	SyntheticStale    bool // HTTPS/SVCB/tunnel older than ceiling on warm-start
+	Stale             bool // loaded from disk, refresh pending
+}
+
+// StubZone is a non-CF delegated subtree forwarded to a stub resolver.
+type StubZone struct {
+	Apex   string
+	Target []netip.AddrPort // e.g. 192.0.2.53:53
+}
+
+// RevZone is a configured reverse zone with its OWN synthesized SOA, used for
+// reverse NODATA in the AUTHORITY section — never borrows a CF zone's SOA (§2.4d).
+type RevZone struct {
+	Apex string // e.g. "2.0.192.in-addr.arpa."
+	SOA  RR     // owner == reverse apex
+}
+
+// MDNSView is the SEPARATE, independently-published volatile plane for *.local
+// hosts (§2.2). Decoupling it means mDNS churn never reallocates the CF zone map.
+type MDNSView struct {
+	// Forward maps a bare lowercase hostname -> A/AAAA RRs.
+	Forward map[string][]RR
+	// Reverse maps an in-addr/ip6 arpa name -> PTR RRs.
+	Reverse map[string][]RR
+	BuiltAt time.Time
+}

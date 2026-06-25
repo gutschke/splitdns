@@ -1,0 +1,135 @@
+{
+  "description": "redirected apex + www + known vhost -\u003e nginx; apex non-address RRsets stay real; a non-vhost host serves its real A",
+  "config": {
+    "local_zones": [
+      "example.com"
+    ],
+    "vhost_v4": "192.0.2.10",
+    "vhost_v6": "2001:db8::10",
+    "vhosts": [
+      "shop"
+    ]
+  },
+  "zones": [
+    {
+      "name": "example.com",
+      "id": "z1",
+      "records": [
+        {
+          "type": "A",
+          "name": "example.com",
+          "content": "203.0.113.1",
+          "proxied": true,
+          "ttl": 300
+        },
+        {
+          "type": "MX",
+          "name": "example.com",
+          "content": "mail.example.com",
+          "ttl": 300,
+          "priority": 10
+        },
+        {
+          "type": "TXT",
+          "name": "example.com",
+          "content": "v=spf1 -all",
+          "ttl": 300
+        },
+        {
+          "type": "A",
+          "name": "www.example.com",
+          "content": "203.0.113.1",
+          "proxied": true,
+          "ttl": 300
+        },
+        {
+          "type": "A",
+          "name": "shop.example.com",
+          "content": "203.0.113.3",
+          "proxied": true,
+          "ttl": 300
+        },
+        {
+          "type": "A",
+          "name": "api.example.com",
+          "content": "203.0.113.2",
+          "ttl": 300
+        }
+      ]
+    }
+  ],
+  "queries": [
+    {
+      "name": "example.com",
+      "type": "A",
+      "rcode": "NOERROR",
+      "aa": true,
+      "answer": [
+        "example.com.\t60\tIN\tA\t192.0.2.10"
+      ]
+    },
+    {
+      "name": "example.com",
+      "type": "AAAA",
+      "rcode": "NOERROR",
+      "aa": true,
+      "answer": [
+        "example.com.\t60\tIN\tAAAA\t2001:db8::10"
+      ]
+    },
+    {
+      "name": "example.com",
+      "type": "MX",
+      "rcode": "NOERROR",
+      "aa": true,
+      "answer": [
+        "example.com.\t300\tIN\tMX\t10 mail.example.com."
+      ]
+    },
+    {
+      "name": "example.com",
+      "type": "TXT",
+      "rcode": "NOERROR",
+      "aa": true,
+      "answer": [
+        "example.com.\t300\tIN\tTXT\t\"v=spf1 -all\""
+      ]
+    },
+    {
+      "name": "example.com",
+      "type": "CNAME",
+      "rcode": "NOERROR",
+      "aa": true,
+      "authority": [
+        "example.com.\t300\tIN\tSOA\texample.com. hostmaster.example.com. 1 7200 3600 1209600 300"
+      ]
+    },
+    {
+      "name": "www.example.com",
+      "type": "A",
+      "rcode": "NOERROR",
+      "aa": true,
+      "answer": [
+        "www.example.com.\t60\tIN\tA\t192.0.2.10"
+      ]
+    },
+    {
+      "name": "shop.example.com",
+      "type": "A",
+      "rcode": "NOERROR",
+      "aa": true,
+      "answer": [
+        "shop.example.com.\t60\tIN\tA\t192.0.2.10"
+      ]
+    },
+    {
+      "name": "api.example.com",
+      "type": "A",
+      "rcode": "NOERROR",
+      "aa": true,
+      "answer": [
+        "api.example.com.\t300\tIN\tA\t203.0.113.2"
+      ]
+    }
+  ]
+}

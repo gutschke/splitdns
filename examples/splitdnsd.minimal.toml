@@ -1,0 +1,16 @@
+# splitdnsd MINIMAL configuration — mode 1 (forwarder + LAN names), no Cloudflare.
+#
+# This is the smallest useful config: DoT forwarding to public resolvers, *.local
+# via mDNS, and reverse (PTR) zones for your managed address space. No API token,
+# no write path. Copy to /etc/splitdns/splitdnsd.toml and adjust the reverse zone.
+#
+# Every key here is also a built-in default except [zones].reverse, so a truly empty
+# file forwards + serves *.local out of the box. See splitdns.conf(5) for the rest.
+
+[upstream]
+servers = ["1.1.1.1", "8.8.8.8"]   # DoT; each host is contacted on port 853
+
+[zones]
+# Reverse zones for the LAN you manage (octet/nibble-reversed). Adjust to your space:
+#   192.168.0.0/16 => 168.192.in-addr.arpa.
+reverse = ["168.192.in-addr.arpa."]

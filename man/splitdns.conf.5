@@ -1,0 +1,313 @@
+.TH SPLITDNS.CONF 5 "2026-06-16" "splitdns" "File Formats"
+.SH NAME
+splitdnsd.toml \- configuration file for splitdnsd(8)
+.SH DESCRIPTION
+The
+.B splitdnsd
+daemon reads a TOML configuration file (default
+.IR /etc/splitdns/splitdnsd.toml )
+layered over built-in defaults. Any key may be omitted to accept its default.
+Unknown keys are rejected so typos fail loudly rather than silently doing
+nothing. Validate a file with
+.RB \(dq "splitdnsd \-check\-config" \(dq.
+.PP
+The file is organized into tables. Each is described below with its keys, types,
+and defaults.
+.SH "[listen]"
+Controls which local addresses the :53 server binds.
+.TP
+.B mode
+String. \fB"private-auto"\fR (default) binds only local-scope addresses
+(RFC 1918, ULA, loopback, link-local) and never global addresses.
+\fB"explicit"\fR binds exactly the addresses in \fBaddresses\fR.
+.TP
+.B addresses
+Array of \fIhost:port\fR strings. Required when \fBmode = "explicit"\fR. As with
+\fB[diag].addr\fR, the host pins the address family: \fB0.0.0.0\fR binds IPv4 only,
+\fB[::]\fR binds IPv6 only, and an empty host binds both.
+.TP
+.B port
+Integer. UDP/TCP port. Default \fB53\fR.
+.TP
+.B udp ", " tcp
+Booleans. Enable the UDP and TCP listeners. Both default \fBtrue\fR; at least
+one must be enabled.
+.SH "[access]"
+Query access policy. \fBrefuse\fR takes precedence over \fBallow\fR.
+.TP
+.B allow
+Array of CIDRs permitted to query. Default: all private/local ranges
+(\fB10.0.0.0/8\fR, \fB172.16.0.0/12\fR, \fB192.168.0.0/16\fR, \fB127.0.0.0/8\fR,
+\fB169.254.0.0/16\fR, \fBfc00::/7\fR, \fB::1/128\fR, \fBfe80::/10\fR). Narrow it to
+specific subnets if you prefer.
+.TP
+.B refuse
+Array of CIDRs always denied, overriding \fBallow\fR. Default empty.
+.SH "[upstream]"
+Forwarding of non-local queries.
+.TP
+.B servers
+Array of \fIhost:port\fR upstream resolvers (DoT). Default
+\fB["1.1.1.1", "8.8.8.8"]\fR (each host becomes a DoT endpoint on port 853).
+.TP
+.B cleartext_fallback
+Boolean. Permit an audited one-shot cleartext retry when DoT fails. Default
+\fBfalse\fR.
+.TP
+.B breaker
+Boolean. Enable the per-upstream circuit breaker: an upstream that is down (several
+consecutive failures) or flapping (a high failure ratio over a rolling window) is
+skipped so queries fail over to a healthy upstream without paying its timeout. It
+fails open \(em if every upstream is tripped it still tries them \(em so it is never
+worse than no breaker. Recovery is probed after a short cooldown. Default \fBtrue\fR.
+.SH "[zones]"
+Authoritative inventory.
+.TP
+.B local
+Array of Cloudflare-hosted zone names served from the local mirror.
+.TP
+.B reverse
+Array of \fIstable\fR reverse-zone apexes the server is authoritative for. Reverse
+names are octet/nibble-reversed: \fB192.168.0.0/16\fR is \fB168.192.in-addr.arpa.\fR,
+and \fB2001:db8::/32\fR is \fB8.b.d.0.1.0.0.2.ip6.arpa.\fR A reverse
+zone covers all internal subnetting, so list the enclosing space (a managed
+\fB10.0.0.0/16\fR carved into /24s needs only \fB0.10.in-addr.arpa.\fR). All PTR
+queries outside the resolved zones are forwarded.
+.TP
+.B reverse_detect
+String scope of address spaces to additionally \fIauto-detect\fR from local
+interfaces and \fBre-detect on network change\fR: \fB"off"\fR (default),
+\fB"private"\fR (RFC 1918 + ULA), \fB"global"\fR (global-unicast only), or
+\fB"all"\fR. Use \fB"global"\fR to track a DYNAMIC ISP-assigned GUA prefix that may
+change over time. A detected zone contained within an explicit \fBreverse\fR zone
+is dropped (so a more-specific detected zone never shadows a stable one), and a
+prefix not on an octet (IPv4) or nibble (IPv6) boundary is refused and reported,
+never guessed.
+.PP
+.RS
+.B Note:
+auto-detection keys off the interface prefix length; IPv6 SLAAC interfaces are
+usually /64, so detection can under-represent a managed /48. List stable spaces
+explicitly in \fBreverse\fR and reserve \fBreverse_detect\fR for genuinely dynamic
+spaces such as the ISP-assigned GUA.
+.RE
+.SH "[zones.stub]"
+A table mapping a delegated subtree apex (FQDN, trailing dot) to an array of stub
+resolver \fIhost:port\fR addresses, e.g.
+.RB \(dq "\(dqsub.example.com.\(dq = [\(dq192.0.2.53:53\(dq]" \(dq.
+.SH "[vhost]"
+.TP
+.B feed
+\fIhost:port\fR of the reverse proxy's virtual-host feed (newline-separated names).
+.TP
+.B proxy_v4 ", " proxy_v6
+Reverse-proxy addresses the naked domain, \fIwww\fR, and known virtual hosts are
+redirected to. The proxy may be any product (nginx, Caddy, Traefik, \&...). With
+neither set, the redirect is disabled and names are served authoritatively.
+.TP
+.B exclude_zones
+Array of apex zone names that are \fInot\fR subject to the vhost/naked/www redirect;
+they serve their real records (or flattened tunnel addresses) instead. Site-specific.
+.SH "[cloudflare]"
+.TP
+.B read_token_file
+Path to the read-only Cloudflare API token used by the mirror.
+.TP
+.B edit_token_file
+Path to the DNS:Edit token used only by the dynamic-DNS writer. Empty disables
+write-back entirely. Default empty.
+.TP
+.B base_url
+Override the Cloudflare API base URL (used by the test harness). Default empty.
+.TP
+.B tunnel_suffixes
+Array of CNAME-target suffixes flattened to the owner's real A/AAAA addresses.
+Default: \fB["cfargotunnel.com"]\fR (Cloudflare Tunnel). Add others to flatten records
+fronted by a different tunnel/proxy.
+.SH "[ddns]"
+Guarded dynamic-DNS write-back of public-IP changes to Cloudflare. Write-back is
+\fIpush-driven\fR: a trusted process announces a host's new public address with
+.BR splitdns-notify (8)
+and the writer updates that host's non-proxied Cloudflare records. Two independent
+guards authorize a write: the announcement must arrive on an authenticated trigger
+path \(em a peer-cred-checked \fBnotify_socket\fR (allowed by uid via \fBnotify_uids\fR
+or by group via \fBnotify_groups\fR), a valid \fBTSIG\fR signature (\fBtsig_keys\fR), or,
+unless \fBrequire_signature\fR is set, a \fBtrusted_sources\fR address \(em and the host
+must be on the \fBeligible\fR allowlist.
+.TP
+.B enabled
+Boolean. Master switch. Default \fBfalse\fR.
+.TP
+.B dry_run
+Boolean. When true, log intended edits without making them. Default \fBtrue\fR.
+.TP
+.B rate
+Duration string (e.g. \fB"10m"\fR). Minimum interval between writes per host.
+.TP
+.B eligible
+Array of host FQDNs. \fBRequired allowlist\fR for live writes: when empty (default)
+the writer is forced to dry-run (deny-all); a non-empty list restricts write-back to
+the named hosts.
+.TP
+.B trusted_sources
+Array of CIDRs. \fIUnsigned\fR mDNS announcements whose \fIsource address\fR falls in
+this set may \fItrigger\fR write-back; announcements from any other source still serve
+.BR *.local
+but never write. This is a weaker, source-IP-based trust (a source address can be
+spoofed). Empty (default) means only \fBnotify_socket\fR or a signed announcement can
+trigger DDNS.
+.TP
+.B tsig_keys
+Array of shared HMAC keys (RFC 8945), each an inline table with \fBname\fR and either
+\fBsecret\fR (base64) or \fBsecret_file\fR (path to a base64 secret; preferred \(em keep
+the key out of this world-readable file, mode it \fB0400 splitdns:splitdns\fR). An
+optional \fBalgorithm\fR defaults to \fBhmac-sha256\fR. An announcement carrying a valid
+TSIG for one of these keys may trigger write-back \fIregardless of source IP\fR \(em
+cryptographic authentication that cannot be spoofed, the recommended path for off-box
+notifiers. Generate a key with \fBsplitdns-notify \-\-genkey\fR.
+.TP
+.B require_signature
+Boolean. When true, only \fBTSIG\fR-signed (or \fBnotify_socket\fR) announcements may
+trigger write-back; a \fBtrusted_sources\fR address alone no longer suffices. Default
+\fBfalse\fR (back-compat). Recommended \fBtrue\fR for any exposed or multi-host
+deployment.
+.TP
+.B notify_socket
+Path to the authenticated local trigger channel. The daemon checks the connecting
+peer's credentials via \fBSO_PEERCRED\fR. Empty disables it. Default
+\fB/run/splitdns/notify.sock\fR.
+.TP
+.B notify_uids
+Array of integer uids permitted to connect to \fBnotify_socket\fR, in addition to
+root and the daemon's own uid (always allowed).
+.TP
+.B notify_groups
+Array of group names whose members may trigger DDNS via \fBnotify_socket\fR with \fBno
+shared key\fR. The daemon stamps a POSIX ACL on the socket granting these groups connect
+rights (it owns the socket, so this needs no privilege and no group membership of its
+own) and authorizes a connecting peer by group membership. Name a service's own group
+(e.g. \fBwww-data\fR, \fBdhcp\fR) so that service can trigger immediately \(em no
+\fBusermod\fR, no key. \fBNever\fR name \fBsplitdns\fR (its group also grants access to
+\fI/etc/splitdns\fR and the secrets there) or a broad group such as \fBusers\fR.
+Membership is resolved from the local group database (it does not see LDAP/SSS groups).
+A filesystem without ACL support is logged and the option is skipped (DNS unaffected).
+.TP
+.B notify_socket_mode
+Octal permission for \fBnotify_socket\fR. Default \fB"0660"\fR. Do not use \fB"0666"\fR:
+it removes the filesystem gate and lets any local process flood the reject log.
+.SH "[notify]"
+Defaults for the
+.BR splitdns-notify (8)
+helper, which announces over up to three best-effort channels \(em all attempted when
+enabled, none required: the local authenticated unix \fBsocket\fR (tried first), the
+unicast \fBservers\fR below, and (unless \fB\-no\-multicast\fR) link-local multicast.
+.TP
+.B socket
+Path to the resolver's authenticated unix socket the helper connects to (the trusted
+DDNS-trigger path). Default \fB/run/splitdns/notify.sock\fR, which matches the resolver's
+\fB[ddns].notify_socket\fR default \(em so a stock setup needs no socket configuration on
+either side. If you change \fB[ddns].notify_socket\fR on the resolver, set this (or pass
+\fB\-socket\fR) to match. The \fB\-socket\fR flag overrides this; \fB\-no\-socket\fR skips
+the socket entirely.
+.TP
+.B servers
+Array of \fIadditional\fR unicast resolver targets (\fIhost\fR or \fIhost:port\fR; default
+port \fB5353\fR) an announcement is sent to when the caller passes no \fB\-server\fR flag.
+These are independent of the socket and multicast: an empty list does NOT mean "no
+delivery" \(em the socket and multicast are still used. Set it for resolvers on subnets
+that multicast does not reach.
+.TP
+.BR tsig_key ", " tsig_secret ", " tsig_secret_file ", " tsig_algorithm
+The TSIG key the helper SIGNS announcements with: a key \fBname\fR plus its base64
+secret, given inline (\fBtsig_secret\fR) or, preferably, from a mode-0400 file
+(\fBtsig_secret_file\fR). \fBtsig_algorithm\fR defaults to \fBhmac-sha256\fR. The same
+key must appear under \fB[ddns].tsig_keys\fR on the resolver. On a host that only runs
+.BR splitdns-notify (8)
+these usually live in \fI/etc/splitdns/notify.toml\fR.
+.SH "[diag]"
+The diagnostics HTTP endpoint. Its read-only views (zone inventory, mDNS, answer-cache
+stats, recent queries, busiest clients, upstream/backend health, worker stats) are
+always available on GET; the page also self-updates. The DANGEROUS control actions are
+off by default; see \fBallow_control\fR.
+.PP
+.RS
+.B Note:
+this is a LAN-grade convenience tool, not a hardened production surface \(em it is plain
+HTTP with no built-in user authentication. For real/public deployments leave it on
+loopback or a Unix socket behind an authenticating reverse proxy, or do not enable it.
+.RE
+.TP
+.B addr
+\fIhost:port\fR for the diagnostics HTTP endpoint, or a \fBUnix socket\fR. Keep it
+localhost-only. Default \fB"127.0.0.1:8080"\fR. For host:port the host pins the address
+family: an IPv4 literal including the \fB0.0.0.0\fR wildcard binds IPv4 ONLY, an IPv6
+literal (including \fB[::]\fR) binds IPv6 only, and an empty host (\fB":8080"\fR)
+binds both. This matters for \fB0.0.0.0\fR specifically: it is IPv4-only here, not
+dual-stack. Alternatively, a value beginning with \fB/\fR or \fB@\fR, or a
+\fBunix:/path\fR form, binds a Unix-domain socket (mode 0660) instead \(em local-only,
+filesystem-permission-controlled, and ideal behind an nginx/socat front. A Unix socket
+counts as loopback for the control gate.
+.TP
+.B allow
+Array of CIDRs. When non-empty, only these source IPs may reach the endpoint (read and
+control); everything else gets 403. Empty (default) allows all. Unix-socket clients are
+always allowed. This is a coarse guard, not authentication \(em pair it with a Unix
+socket or an authenticating reverse proxy for real protection.
+.TP
+.B socket_mode
+Octal permission string for a Unix-socket bind (e.g. \fB"0660"\fR, \fB"0666"\fR). Empty
+uses \fB0660\fR. Loosen it (e.g. \fB"0666"\fR) when a reverse proxy in another container
+must reach the socket across a uid boundary.
+.PP
+.RS
+The diagnostics endpoint is BEST-EFFORT: if it cannot bind (a missing or non-writable
+socket directory, a stale socket, a permission error on a shared reverse-proxy path) the
+daemon logs a warning and keeps running. \fBLosing diagnostics never affects DNS
+service.\fR
+.RE
+.TP
+.B allow_control
+Boolean. Master switch for the mutating control actions (flush the answer cache, force
+a Cloudflare mirror refresh, restart the daemon). Default \fBfalse\fR \(em the endpoint
+is read-only. The actions are POST-only, CSRF-guarded (cross-site browser requests are
+rejected via \fBSec-Fetch-Site\fR), and rate-limited (\fBrefresh-mirror\fR/\fBrestart\fR
+once per 10s). They are authorized either by a matching \fBcontrol_password\fR or \(em
+when no password is set \(em ONLY on a loopback bind (a hostname or wildcard bind counts
+as non-loopback; only a literal loopback IP qualifies). \fBallow_control\fR on a
+non-loopback address with no password leaves the control route unregistered (logged
+loudly) so dangerous actions are never exposed unauthenticated on the LAN. Note: the
+endpoint is plain HTTP, so a password guards against casual/CSRF misuse, not a network
+eavesdropper \(em bind to loopback or front it with TLS/auth for stronger protection.
+.TP
+.B control_password ", " control_password_file
+The control-action password (the \fB_file\fR form reads it from a 0400 file and wins
+when both are set). Sent as the \fBX-Diag-Password\fR header or a \fBpassword\fR form
+field, compared in constant time. Empty (default) means no password \(em controls are
+then honored only on a loopback bind.
+.SH "[cache]"
+.TP
+.B dir
+Directory for the versioned-JSON warm-start cache. Default \fB"/var/lib/splitdns"\fR.
+.TP
+.B answers
+Boolean. Enable the forward-path answer cache: forwarded (non-local) responses are
+cached by TTL so repeat lookups are answered locally instead of re-querying upstream.
+NXDOMAIN/NODATA are negatively cached from the SOA minimum (RFC 2308), brief failures
+are cached to spare a flapping upstream (RFC 9520), and TTLs are floored at 5s and
+capped at 24h. Authoritative/local answers are never cached. Default \fBtrue\fR.
+.TP
+.B serve_stale
+Boolean. When an entry has expired \fIand\fR the upstream is failing, keep answering
+from the stale copy (with a short 30s TTL, retained up to 24h) instead of returning
+SERVFAIL \(em the fail-static behavior (RFC 8767). Default \fBtrue\fR.
+.TP
+.B max_entries
+Integer. LRU capacity of the answer cache. Default \fB10000\fR.
+.SH EXAMPLE
+A fully annotated example appears in
+.IR /usr/share/doc/splitdnsd/splitdnsd.example.toml .
+.SH "SEE ALSO"
+.BR splitdnsd (8),
+.BR splitdns-notify (8)
+.SH AUTHORS
+The splitdns authors.

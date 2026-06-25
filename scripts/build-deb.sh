@@ -1,0 +1,216 @@
+#!/bin/sh
+# build-deb.sh — assemble pristine .deb packages via the zero-build-dep dpkg-deb
+# fallback (design §11.2). The canonical dpkg-buildpackage path lives in debian/;
+# this script needs only dpkg-deb and a Go toolchain, so it works in minimal envs.
+#
+# Two packages are produced (design §11.4):
+#   splitdnsd      — the server: binary, systemd unit, example config, man pages,
+#                    plus the user/dir/enable maintainer scripts.
+#   splitdns-notify — the standalone mDNS-announce helper: a single static binary
+#                    and its man page, with NO server binary, unit, user, or config.
+#                    Installable on hosts that should announce themselves to — but
+#                    never run — splitdnsd.
+# splitdnsd Recommends splitdns-notify, so a normal server install still pulls the
+# helper, but the two are otherwise independent and co-installable.
+#
+# Version-forwarding (§11.3): the package version embeds the building Go version, so
+# a rebuild on a newer apt Go is a distinct, higher version.
+set -eu
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+cd "$root"
+
+GO=$("$root/scripts/select-go.sh" | head -1)
+export GOTOOLCHAIN=local CGO_ENABLED=0
+gover=$(GOTOOLCHAIN=local "$GO" version | sed -n 's/.*go\([0-9.]*\).*/\1/p')
+
+BASE_VERSION=${BASE_VERSION:-0.1.0}
+ARCH=$(dpkg --print-architecture 2>/dev/null || echo amd64)
+PKGVER="${BASE_VERSION}~go${gover}"
+STAGE=$(mktemp -d)
+trap 'rm -rf "$STAGE"' EXIT
+
+echo "build-deb: go=$gover version=$PKGVER arch=$ARCH"
+
+# 1. Build static, stripped, reproducible binaries.
+LDFLAGS="-s -w -X main.version=${PKGVER}"
+"$GO" build -trimpath -buildvcs=false -ldflags "$LDFLAGS" -o "$STAGE/splitdnsd" ./cmd/splitdnsd
+"$GO" build -trimpath -buildvcs=false -ldflags "$LDFLAGS" -o "$STAGE/splitdns-notify" ./cmd/splitdns-notify
+
+OUT=${OUT:-"$root/dist"}
+mkdir -p "$OUT"
+
+# ----------------------------------------------------------------------------
+# Package 1: splitdns-notify — the standalone helper.
+# A single static binary + its man page. No maintainer scripts: it creates no
+# user, ships no service, and owns no config — nothing to set up or tear down.
+# ----------------------------------------------------------------------------
+N="$STAGE/notify"
+install -D -m 0755 "$STAGE/splitdns-notify" "$N/usr/bin/splitdns-notify"
+install -D -m 0644 man/splitdns-notify.8    "$N/usr/share/man/man8/splitdns-notify.8"
+install -D -m 0644 examples/notify.example.toml "$N/usr/share/doc/splitdns-notify/notify.example.toml"
+gzip -9 -f "$N/usr/share/man/man8/splitdns-notify.8"
+
+mkdir -p "$N/DEBIAN"
+cat > "$N/DEBIAN/control" <<EOF
+Package: splitdns-notify
+Version: ${PKGVER}
+Architecture: ${ARCH}
+Maintainer: gutschke <gutschke@users.noreply.github.com>
+Section: net
+Priority: optional
+Built-Using: go (= ${gover})
+Homepage: https://github.com/gutschke/splitdns
+Description: mDNS hostname announcer for splitdnsd
+ splitdns-notify sends authoritative multicast-DNS responses to announce a
+ host's name and addresses, prompting a splitdnsd resolver to refresh its view
+ of the LAN (and, where enabled, its guarded dynamic-DNS write-back).
+ .
+ It is a small static helper with no runtime dependencies and ships neither the
+ server binary nor any service, so it is safe to install on hosts that should
+ announce themselves to — but never run — splitdnsd. See splitdns-notify(8).
+EOF
+
+DEB_N="$OUT/splitdns-notify_${PKGVER}_${ARCH}.deb"
+dpkg-deb --build --root-owner-group "$N" "$DEB_N"
+echo "build-deb: wrote $DEB_N"
+
+# ----------------------------------------------------------------------------
+# Package 2: splitdnsd — the server.
+# NOTE: the live config is NOT shipped (no conffile owning /etc/splitdns) — the
+# operator copies the example and edits it, so apt upgrades never clobber local
+# modifications (design §12.2).
+# ----------------------------------------------------------------------------
+S="$STAGE/server"
+install -D -m 0755 "$STAGE/splitdnsd"  "$S/usr/sbin/splitdnsd"
+install -D -m 0644 man/splitdnsd.8     "$S/usr/share/man/man8/splitdnsd.8"
+install -D -m 0644 man/splitdns.conf.5 "$S/usr/share/man/man5/splitdns.conf.5"
+install -D -m 0644 examples/splitdnsd.example.toml "$S/usr/share/doc/splitdnsd/splitdnsd.example.toml"
+install -D -m 0644 packaging/splitdnsd.service     "$S/lib/systemd/system/splitdnsd.service"
+gzip -9 -f "$S/usr/share/man/man8/splitdnsd.8"
+gzip -9 -f "$S/usr/share/man/man5/splitdns.conf.5"
+
+mkdir -p "$S/DEBIAN"
+cat > "$S/DEBIAN/control" <<EOF
+Package: splitdnsd
+Version: ${PKGVER}
+Architecture: ${ARCH}
+Maintainer: gutschke <gutschke@users.noreply.github.com>
+Section: net
+Priority: optional
+Depends: adduser, init-system-helpers (>= 1.54~)
+Recommends: splitdns-notify (= ${PKGVER})
+Built-Using: go (= ${gover})
+Homepage: https://github.com/gutschke/splitdns
+Description: split-horizon DNS resolver with Cloudflare mirror
+ splitdnsd is a lightweight authoritative + forwarding DNS resolver. It mirrors
+ Cloudflare-hosted zones for LAN clients (read-only), serves *.local names from
+ mDNS, answers reverse zones, redirects vhosts to a local reverse proxy, and can
+ optionally perform guarded, opt-in dynamic-DNS write-back.
+ .
+ Configuration is NOT shipped: copy /usr/share/doc/splitdnsd/splitdnsd.example.toml
+ to /etc/splitdns/splitdnsd.toml and edit it. See splitdns.conf(5).
+EOF
+
+cat > "$S/DEBIAN/postinst" <<'EOF'
+#!/bin/sh
+set -e
+if [ "$1" = "configure" ]; then
+  if ! getent group splitdns >/dev/null; then addgroup --system splitdns; fi
+  if ! getent passwd splitdns >/dev/null; then
+    adduser --system --no-create-home --ingroup splitdns \
+      --home /var/lib/splitdns --shell /usr/sbin/nologin splitdns
+  fi
+  install -d -m 0750 -o splitdns -g splitdns /etc/splitdns
+  install -d -m 0750 -o splitdns -g splitdns /etc/splitdns/secrets
+  install -d -m 0700 -o splitdns -g splitdns /var/lib/splitdns
+  if [ ! -e /etc/splitdns/splitdnsd.toml ]; then
+    echo "splitdnsd: enabled to start at boot, but it will NOT run until configured." >&2
+    echo "           Copy /usr/share/doc/splitdnsd/splitdnsd.example.toml to" >&2
+    echo "           /etc/splitdns/splitdnsd.toml, edit it, then: systemctl start splitdnsd" >&2
+  fi
+  if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+  fi
+  # Enable by default so DNS survives a reboot without the admin remembering to do it.
+  # deb-systemd-helper (not raw `systemctl enable`) remembers the admin's choice: it
+  # enables on first install, but on upgrade only re-enables when the unit was enabled
+  # before — a deliberate `systemctl disable` is never overridden. Being enabled is
+  # harmless before configuration because the unit's ConditionPathExists gate keeps it
+  # skipped (no crash-loop) until splitdnsd.toml exists.
+  if command -v deb-systemd-helper >/dev/null 2>&1; then
+    if deb-systemd-helper --quiet was-enabled splitdnsd.service; then
+      deb-systemd-helper enable splitdnsd.service >/dev/null || true
+    else
+      deb-systemd-helper update-state splitdnsd.service >/dev/null || true
+    fi
+  fi
+  if [ -d /run/systemd/system ]; then
+    # Bring the service to RUNNING after install: start on first install, restart on
+    # upgrade so the new binary takes effect. Deliberately NOT try-restart — try-restart
+    # is a no-op when the unit is momentarily not active (e.g. back-to-back installs, or
+    # a prior cycle that left it stopped), which silently leaves DNS down. start/restart
+    # always end with the unit running. deb-systemd-invoke acts ONLY on an enabled unit,
+    # so a deliberate `systemctl disable` is still honored; and the unit's
+    # ConditionPathExists gate keeps this a clean no-op until splitdnsd.toml exists, so an
+    # unconfigured fresh install still does not actually run.
+    if [ -n "$2" ]; then
+      _action=restart   # $2 = previously-configured version => this is an upgrade
+    else
+      _action=start     # first install
+    fi
+    if command -v deb-systemd-invoke >/dev/null 2>&1; then
+      deb-systemd-invoke "$_action" splitdnsd.service || true
+    else
+      systemctl "$_action" splitdnsd.service || true
+    fi
+  fi
+fi
+exit 0
+EOF
+chmod 0755 "$S/DEBIAN/postinst"
+
+cat > "$S/DEBIAN/prerm" <<'EOF'
+#!/bin/sh
+set -e
+if [ "$1" = "remove" ] && [ -d /run/systemd/system ]; then
+  systemctl stop splitdnsd.service || true
+fi
+exit 0
+EOF
+chmod 0755 "$S/DEBIAN/prerm"
+
+cat > "$S/DEBIAN/postrm" <<'EOF'
+#!/bin/sh
+set -e
+# Mirror the postinst enablement with deb-systemd-helper so the enable-state
+# bookkeeping is cleaned up. On remove, mask the unit so it can't be started while
+# the binary is gone but the config lingers; on purge, drop the remembered state and
+# unmask. Guarded so a system without the helper (or without systemd) degrades cleanly.
+if [ -d /run/systemd/system ]; then
+  systemctl daemon-reload || true
+fi
+if command -v deb-systemd-helper >/dev/null 2>&1; then
+  if [ "$1" = "remove" ]; then
+    deb-systemd-helper mask splitdnsd.service >/dev/null || true
+  fi
+  if [ "$1" = "purge" ]; then
+    deb-systemd-helper purge splitdnsd.service >/dev/null || true
+    deb-systemd-helper unmask splitdnsd.service >/dev/null || true
+  fi
+fi
+exit 0
+EOF
+chmod 0755 "$S/DEBIAN/postrm"
+
+DEB_S="$OUT/splitdnsd_${PKGVER}_${ARCH}.deb"
+dpkg-deb --build --root-owner-group "$S" "$DEB_S"
+echo "build-deb: wrote $DEB_S"
+
+# 4. Report.
+for DEB in "$DEB_N" "$DEB_S"; do
+  echo "=== $(basename "$DEB") ==="
+  dpkg-deb --info "$DEB" | sed -n '1,14p'
+  echo "--- contents ---"
+  dpkg-deb --contents "$DEB"
+done

@@ -1,0 +1,174 @@
+# splitdnsd EXAMPLE configuration.
+#
+# This file is PRISTINE: it contains only documentation-range placeholders
+# (RFC 5737 / RFC 3849 addresses, RFC 2606 example.* domains) and ships with the
+# package and source. It is NOT installed as the live config. Copy it to
+#   /etc/splitdns/splitdnsd.toml
+# and edit it for your site; the package never overwrites your local file.
+#
+# Full reference: splitdns.conf(5).  Validate with:  splitdnsd -check-config
+#
+# Every value is optional; omitting a key keeps the built-in default.
+
+[listen]
+# "private-auto" (default) binds only local-scope addresses (RFC1918, ULA,
+# loopback, link-local) and never global ones. "explicit" binds exactly the
+# addresses listed.
+mode = "private-auto"
+# addresses = ["192.0.2.1:53", "[2001:db8::1]:53"]   # mode="explicit"
+port = 53
+udp  = true
+tcp  = true
+
+[access]
+# Clients allowed to query (refuse[] beats allow[]). Default = all private/local
+# ranges (the three RFC 1918 blocks, loopback, link-local, IPv6 ULA). Narrow this
+# if you want to serve only specific subnets.
+allow = [
+  "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+  "127.0.0.0/8", "169.254.0.0/16",
+  "fc00::/7", "::1/128", "fe80::/10",
+]
+# refuse = ["198.51.100.0/24"]
+
+[upstream]
+# Non-local queries are forwarded here over DNS-over-TLS (DoT). An audited one-shot
+# cleartext fallback is available but OFF by default (set cleartext_fallback=true to
+# opt in). Defaults are Cloudflare and Google public resolvers (DNSSEC-validating).
+servers = ["1.1.1.1", "8.8.8.8"]
+# breaker = true   # per-upstream circuit breaker: skip an upstream that is down or
+                   # flapping so queries fail over to a healthy one fast. Fail-open
+                   # (never worse than no breaker). Default on.
+
+[zones]
+# Cloudflare-hosted authoritative zones served from the local mirror.
+local = ["example.com", "example.net"]
+
+# Reverse (PTR) zones for locally managed spaces; all other PTRs are forwarded.
+# Reverse names are octet/nibble-reversed (192.0.2.0/24 => 2.0.192.in-addr.arpa.).
+reverse = [
+  "2.0.192.in-addr.arpa.",                       # 192.0.2.0/24 (example)
+  "8.b.d.0.1.0.0.2.ip6.arpa.",                   # 2001:db8::/32 (example)
+]
+# Dynamically auto-detect + re-detect on network change. Use "global" to track a
+# changing ISP-assigned GUA prefix.  off | private | global | all
+reverse_detect = "off"
+
+[zones.stub]
+# Delegated subtrees forwarded to a stub resolver.
+# "sub.example.com." = ["192.0.2.53:53"]
+
+[vhost]
+# Reverse-proxy redirect (any product: nginx, Caddy, Traefik, ...): naked domain / www / vhosts.
+# feed     = "192.0.2.10:818"
+# proxy_v4 = "192.0.2.10"
+# proxy_v6 = ""
+# Apexes NOT subject to the redirect (serve their real records / tunnel addresses):
+# exclude_zones = ["example.test"]
+
+[cloudflare]
+# OPTIONAL — only needed to mirror Cloudflare-hosted zones (see [zones].local).
+# Without a readable read token the mirror is disabled and those zones just forward.
+# Two SCOPED tokens, each in its own 0400 file owned by the splitdns account; NEVER
+# commit token values anywhere. read = Zone:Read+DNS:Read; edit = DNS:Edit (write-back
+# only — empty disables DDNS). base_url is for tests; leave unset in production.
+read_token_file = "/etc/splitdns/secrets/cf-read.token"
+edit_token_file = ""
+# base_url = ""
+# CNAME-target suffixes flattened to the owner's real A/AAAA (default: Cloudflare
+# Tunnel). Add others if you front records through a different tunnel/proxy:
+# tunnel_suffixes = ["cfargotunnel.com"]
+
+[ddns]
+# Push-driven write-back: a host's new public IP is announced with splitdns-notify(8)
+# and mirrored to its non-proxied Cloudflare records. Authorization is layered:
+#
+#   eligible        REQUIRED allowlist of writable host FQDNs. Empty => deny-all on
+#                   the live path (the writer is forced to dry-run). Set this before
+#                   enabling real writes.
+#   tsig_keys       Shared HMAC keys (RFC 8945). A SIGNED announcement carrying a valid
+#                   MAC for one of these keys may trigger write-back regardless of source
+#                   IP — cryptographic auth that cannot be spoofed; the recommended path
+#                   for off-box notifiers. Run `splitdns-notify --genkey` to mint a key and
+#                   print both ends' config. Prefer secret_file over an inline secret
+#                   (keep the key out of this world-readable file).
+#   require_signature  If true, ONLY signed (or unix-socket) announcements may trigger
+#                   write-back; trusted_sources alone no longer suffices. Default false
+#                   (back-compat); recommended true for any exposed/multi-host deployment.
+#   trusted_sources CIDRs whose UNSIGNED mDNS announcements may TRIGGER write-back — a
+#                   weaker, source-IP-based trust (spoofable). Empty => only the unix
+#                   socket or a signed announcement can trigger DDNS; mDNS from anywhere
+#                   still serves *.local but never writes.
+#   notify_socket   Authenticated local trigger channel (peer-cred checked). Empty
+#                   disables it. splitdns-notify(8) prefers this over UDP.
+#   notify_uids     Extra peer uids permitted on the socket (root and the daemon's
+#                   own uid are always allowed).
+#   notify_groups   Groups whose members may trigger via the LOCAL socket with NO key:
+#                   the daemon stamps a POSIX ACL granting these groups connect rights
+#                   and authorizes a peer by membership. Name the service's own group
+#                   (e.g. "www-data", "dhcp") so e.g. nginx or the DHCP client can trigger
+#                   immediately. NEVER name "splitdns" (that would also grant access to
+#                   /etc/splitdns) or a broad group like "users". Local groups only.
+#   notify_socket_mode  Octal socket permission. Default "0660". (Never "0666".)
+enabled         = false
+dry_run         = true
+rate            = "10m"
+eligible        = []
+trusted_sources = []
+notify_socket   = "/run/splitdns/notify.sock"
+# notify_uids   = [0]
+# notify_groups = ["www-data", "dhcp"]
+# notify_socket_mode = "0660"
+# require_signature = true
+# tsig_keys = [
+#   { name = "edge-router", secret_file = "/etc/splitdns/secrets/edge-router.tsig" },
+# ]
+
+[notify]
+# Defaults for splitdns-notify(8). It announces over up to three best-effort channels,
+# all attempted: the local unix socket (tried first), the unicast servers, and multicast.
+# servers are ADDITIONAL unicast targets used when the helper runs with no -server flag
+# (host or host:port; default port 5353); empty does NOT mean "no delivery" — the socket
+# and multicast are still used. socket is the resolver socket path (default
+# /run/splitdns/notify.sock, matching [ddns].notify_socket above); -socket overrides it.
+# The tsig_* fields make the helper SIGN its announcements so the resolver authenticates
+# them regardless of source IP; prefer tsig_secret_file over an inline tsig_secret. On
+# notify-only hosts these usually live in /etc/splitdns/notify.toml.
+# servers = ["192.0.2.53:5353"]
+# socket           = "/run/splitdns/notify.sock"
+# tsig_key         = "edge-router"
+# tsig_secret_file = "/etc/splitdns/secrets/edge-router.tsig"
+# tsig_algorithm   = "hmac-sha256"   # default; hmac-sha512 / hmac-sha1 also accepted
+
+[diag]
+# Diagnostics HTTP. Read-only views (zones, mDNS, answer-cache stats, recent queries,
+# busiest clients, upstream/backend health, worker stats) are always on. The host pins
+# the address family: 0.0.0.0 = IPv4 only, [::] = IPv6 only, ":8080" (empty host) = both.
+# Keep it on a trusted interface. addr may also be a Unix socket (local-only, mode 0660,
+# great behind nginx/socat): a path like "/run/splitdns/diag.sock" or "unix:/run/...".
+addr = "127.0.0.1:8080"
+# Optional: restrict which source IPs may reach the endpoint (read + control). Empty =
+# all. Unix-socket clients are always allowed. Coarse guard, not authentication.
+# allow = ["10.0.0.0/8", "192.168.0.0/16"]
+# Unix-socket permission (octal). Default 0660. Loosen to 0666 if a reverse proxy in
+# another container must reach the socket across a uid boundary.
+# socket_mode = "0660"
+# NOTE: the diag endpoint is BEST-EFFORT — if the socket can't be created (missing dir,
+# permissions, stale socket) the daemon just warns and keeps serving DNS.
+# DANGEROUS control actions (flush cache, force mirror refresh, restart daemon) are OFF
+# by default. Enable with allow_control; they are POST-only and authorized by a matching
+# control_password OR — with no password — only on a loopback bind (never unauthenticated
+# on a non-loopback address). Plain HTTP: a password stops casual/CSRF misuse, not an
+# eavesdropper — prefer loopback or a TLS/auth front for real exposure.
+# allow_control        = false
+# control_password_file = "/etc/splitdns/secrets/diag.pass"   # 0400; or control_password = "..."
+
+[cache]
+dir = "/var/lib/splitdns"
+# Forward-path answer cache: cache forwarded responses by TTL (floor 5s, cap 24h),
+# negatively cache NXDOMAIN/NODATA (RFC 2308), and serve-stale on upstream failure
+# (RFC 8767) so a transient upstream outage doesn't take DNS down. Local/authoritative
+# answers are never cached. Stats appear on the diagnostics page.
+# answers      = true
+# serve_stale  = true
+# max_entries  = 10000

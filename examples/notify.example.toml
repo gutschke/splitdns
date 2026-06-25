@@ -1,0 +1,40 @@
+# notify.example.toml — configuration for the splitdns-notify(8) helper.
+#
+# Copy to /etc/splitdns/notify.toml on a host that announces itself to a splitdnsd
+# resolver. It is OPTIONAL: with no config file at all, splitdns-notify still works —
+# it tries the local authenticated unix socket first, then multicast to the LAN. A
+# config file just saves repeating -server / TSIG options on every invocation.
+#
+# Only the [notify] table is read; the file is parsed leniently, so a host that also
+# runs the server can keep everything in splitdnsd.toml instead.
+
+[notify]
+# Delivery uses up to three best-effort channels, all attempted: the local unix socket
+# (tried first), the unicast servers below, and multicast (unless -no-multicast).
+
+# Additional unicast resolver target(s) used when the helper is run with no -server flag
+# (host or host:port; default port 5353). Point these at a stable name/VIP that follows
+# the resolver across fail-over to backup hardware. Empty/omitted does NOT mean "no
+# delivery" — the socket and multicast are still used; set this for resolvers on subnets
+# that multicast does not reach.
+# servers = ["resolver.lan"]
+
+# Resolver unix-socket path (the trusted local DDNS-trigger channel). Default
+# /run/splitdns/notify.sock, matching the resolver's [ddns].notify_socket — so leave it
+# unless you changed that on the resolver. The -socket flag overrides this; -no-socket
+# skips the socket. (Only meaningful when this host IS the resolver; off-box it's absent.)
+# socket = "/run/splitdns/notify.sock"
+
+# --- TSIG signing (optional, recommended for off-box notifiers) ---
+# When a key is set, the announcement is HMAC-signed (RFC 8945) so the resolver can
+# authenticate it regardless of source IP — this defeats UDP source-IP spoofing of a
+# DDNS trigger without giving up fire-and-forget delivery. The same key (name + secret)
+# must be listed under [ddns].tsig_keys on the resolver. Mint a matching pair with:
+#
+#     splitdns-notify --genkey edge-router
+#
+# Prefer tsig_secret_file (mode 0400) over an inline tsig_secret so the key is not
+# world-readable. tsig_algorithm defaults to hmac-sha256.
+# tsig_key         = "edge-router"
+# tsig_secret_file = "/etc/splitdns/secrets/edge-router.tsig"
+# tsig_algorithm   = "hmac-sha256"

@@ -1,0 +1,53 @@
+{
+  "description": "a CONFIGURED (non-default) tunnel suffix is flattened; an IPv4-only owner yields A only and a clean AAAA NODATA (not NXDOMAIN)",
+  "config": {
+    "local_zones": [
+      "example.com"
+    ],
+    "tunnel_suffixes": [
+      "edge.example"
+    ]
+  },
+  "zones": [
+    {
+      "name": "example.com",
+      "id": "z1",
+      "records": [
+        {
+          "type": "CNAME",
+          "name": "play.example.com",
+          "content": "foo.edge.example",
+          "proxied": true,
+          "ttl": 300
+        }
+      ]
+    }
+  ],
+  "tunnel_addrs": {
+    "play.example.com.": {
+      "v4": [
+        "203.0.113.70"
+      ]
+    }
+  },
+  "queries": [
+    {
+      "name": "play.example.com",
+      "type": "A",
+      "rcode": "NOERROR",
+      "aa": true,
+      "answer": [
+        "play.example.com.\t300\tIN\tA\t203.0.113.70"
+      ]
+    },
+    {
+      "name": "play.example.com",
+      "type": "AAAA",
+      "rcode": "NOERROR",
+      "aa": true,
+      "authority": [
+        "example.com.\t300\tIN\tSOA\texample.com. hostmaster.example.com. 1 7200 3600 1209600 300"
+      ]
+    }
+  ]
+}

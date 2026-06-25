@@ -1,0 +1,39 @@
+# Lint gates for splitdnsd (S04). The load-bearing reliability rule (§1, §3) is
+# enforced by review + the forbidigo gate below: every external call carries a
+# context with a deadline; context.Background()/TODO() must not appear past the
+# worker boundary (control-plane workers create the only roots).
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  enable:
+    - govet
+    - staticcheck
+    - errcheck
+    - ineffassign
+    - unused
+    - bodyclose      # every http.Response body closed (CF API, sidecars)
+    - noctx          # no HTTP requests without a context
+    - forbidigo
+    - contextcheck   # context is propagated, not dropped
+    - errorlint
+
+linters-settings:
+  forbidigo:
+    forbid:
+      # Anti-hang: ban bare context roots outside the few sanctioned worker
+      # entrypoints. Allowed only in main.go and *_test.go (see exclude-rules).
+      - p: ^context\.Background$
+        msg: "use the worker-scoped context with a deadline, not context.Background() (design §3)"
+      - p: ^context\.TODO$
+        msg: "no context.TODO past the worker boundary (design §3)"
+    analyze-types: true
+
+issues:
+  exclude-rules:
+    # The signal-rooted context is legitimately created in main and tests.
+    - path: 'cmd/splitdnsd/main\.go'
+      linters: [forbidigo]
+    - path: '_test\.go'
+      linters: [forbidigo, bodyclose, noctx]

@@ -1,0 +1,73 @@
+[Unit]
+Description=splitdns split-horizon DNS resolver
+Documentation=man:splitdnsd(8) man:splitdns.conf(5)
+After=network-online.target
+Wants=network-online.target
+# The package enables this unit by default so DNS comes back after a reboot without
+# the admin having to remember to `systemctl enable` it. But a fresh install has no
+# config yet, so gate the unit on the config existing: a failing Condition* makes
+# systemd SKIP the unit (logged once, treated as success) rather than start it — no
+# ExecStartPre failure, no Restart=always loop, no journal spam. Once the admin copies
+# and edits splitdnsd.toml the gate opens; a config that exists but is broken still
+# fails loudly via ExecStartPre below (existence is silent, misconfiguration is not).
+ConditionPathExists=/etc/splitdns/splitdnsd.toml
+# NEVER permanently give up on :53 (design §3 item 10): with the limiter disabled
+# (interval 0) systemd keeps restarting forever, so a transient bad bind or a
+# deterministic config error can't leave the unit stuck in `failed`. RestartSec
+# paces the loop; ExecStartPre below catches bad config before the crash even starts.
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+# Validate config before each (re)start so a bad edit fails fast and loudly via
+# `systemctl status` rather than crash-looping the main binary (D19).
+ExecStartPre=/usr/sbin/splitdnsd -config /etc/splitdns/splitdnsd.toml -check-config
+ExecStart=/usr/sbin/splitdnsd -config /etc/splitdns/splitdnsd.toml
+Restart=always
+RestartSec=2
+# Watchdog: the daemon pings sd_notify only while its in-process liveness probe
+# passes; a wedge → controlled restart (design §3 item 9).
+WatchdogSec=30s
+
+# Dedicated unprivileged service account (NOT the legacy unbound uid).
+User=splitdns
+Group=splitdns
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+# Persistent state (warm cache, mode 0700, owner == service uid).
+StateDirectory=splitdns
+RuntimeDirectory=splitdns
+ReadWritePaths=/var/lib/splitdns
+
+# Sandboxing.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+UMask=0077
+
+# Resource ceilings (design §3 item 11). MemoryMax is the real backstop; size the
+# inbound limiter so steady-state flood RSS sits comfortably below it.
+MemoryMax=512M
+TasksMax=512
+
+[Install]
+WantedBy=multi-user.target

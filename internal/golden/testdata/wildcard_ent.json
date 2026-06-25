@@ -1,0 +1,57 @@
+{
+  "description": "wildcard synthesis for absent names; an empty-non-terminal (sub has a child but no own RRset) suppresses the wildcard and yields NODATA",
+  "config": {
+    "local_zones": [
+      "example.com"
+    ]
+  },
+  "zones": [
+    {
+      "name": "example.com",
+      "id": "z1",
+      "records": [
+        {
+          "type": "A",
+          "name": "*.example.com",
+          "content": "198.51.100.1",
+          "ttl": 300
+        },
+        {
+          "type": "A",
+          "name": "host.sub.example.com",
+          "content": "203.0.113.10",
+          "ttl": 300
+        }
+      ]
+    }
+  ],
+  "queries": [
+    {
+      "name": "absent.example.com",
+      "type": "A",
+      "rcode": "NOERROR",
+      "aa": true,
+      "answer": [
+        "absent.example.com.\t300\tIN\tA\t198.51.100.1"
+      ]
+    },
+    {
+      "name": "host.sub.example.com",
+      "type": "A",
+      "rcode": "NOERROR",
+      "aa": true,
+      "answer": [
+        "host.sub.example.com.\t300\tIN\tA\t203.0.113.10"
+      ]
+    },
+    {
+      "name": "sub.example.com",
+      "type": "A",
+      "rcode": "NOERROR",
+      "aa": true,
+      "authority": [
+        "example.com.\t300\tIN\tSOA\texample.com. hostmaster.example.com. 1 7200 3600 1209600 300"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,195 @@
+.TH SPLITDNS-NOTIFY 8 "2026-06-25" "splitdns" "System Administration"
+.SH NAME
+splitdns\-notify \- announce a public\-IP change to the splitdns resolver
+.SH SYNOPSIS
+.B splitdns\-notify
+.RI [ flags ]
+.I hostname
+.IR addr " ..."
+.br
+.B splitdns\-notify \-\-genkey
+.RI [ name ]
+.SH DESCRIPTION
+.B splitdns\-notify
+sends a one\-shot multicast\-DNS announcement that
+.IR hostname .local.
+now has the given IPv4/IPv6 addresses. The
+.BR splitdnsd (8)
+resolver receives the announcement through its mDNS source and, when dynamic\-DNS
+write\-back is enabled, mirrors the change to the matching non\-proxied Cloudflare
+records for that host (see the
+.B [ddns]
+section of
+.BR splitdns.conf (5)).
+.PP
+This is the supported way to drive dynamic\-DNS updates: a trusted process that
+knows a public address just changed \(em a DHCP\-client hook, a PPP up\-script, a
+router event \(em invokes
+.B splitdns\-notify
+with the new address. The announcement itself is the authorization; only hosts an
+operator chooses to trigger are ever updated.
+.PP
+The
+.I hostname
+may be given bare, or with a
+.RB \(dq .local \(dq
+or
+.RB \(dq .local. \(dq
+suffix; it is normalized to a single\-label
+.RB \(dq .local. \(dq
+name. Addresses may be separate arguments or space\-separated within one argument;
+each must be a valid IP literal or the command fails.
+.PP
+On the resolver host the announcement is delivered first over the authenticated
+local unix socket
+.RB ( \-socket ,
+default
+.IR /run/splitdns/notify.sock ),
+which the daemon authorizes with a peer\-credential check \(em this is the trusted
+path that may trigger write\-back regardless of
+.BR [ddns].trusted_sources .
+It is also sent as an ordinary authoritative mDNS response (no privileged source
+port is needed) by unicast to every configured resolver and, unless
+.B \-no\-multicast
+is given, multicast to the link\-local mDNS groups
+.RB ( 224.0.0.251 " and " ff02::fb )
+on each multicast\-capable interface. Delivery is best\-effort, matching mDNS.
+.SS Authenticating off\-box triggers (TSIG)
+Delivery is fire\-and\-forget UDP, so it can never block on a slow or down resolver, but
+a bare UDP announcement is trusted to TRIGGER write\-back only when its source address is
+listed in
+.BR [ddns].trusted_sources ,
+and a source address can be spoofed. To authenticate a trigger cryptographically without
+a round\-trip, configure a shared TSIG key (RFC 8945): the announcement is then
+HMAC\-signed and
+.BR splitdnsd (8)
+honors it regardless of source IP. Signing is opt\-in \(em with no key configured the
+helper still works (socket, then multicast). Set the key under
+.B [notify]
+in the config file
+.RB ( tsig_key ", " tsig_secret " or " tsig_secret_file ),
+and list the same key under
+.B [ddns].tsig_keys
+on the resolver. Generate a matching pair with
+.BR \-\-genkey .
+.SH FLAGS
+.TP
+.BI \-socket " path"
+Authenticated unix socket on the local resolver, tried before the UDP paths. Overrides
+.B [notify].socket
+in the config file; default
+.I /run/splitdns/notify.sock
+(which matches the resolver's
+.BR [ddns].notify_socket ).
+.TP
+.B \-no\-socket
+Do not attempt the local authenticated unix socket; use UDP only.
+.TP
+.BI \-server " host[:port]"
+Unicast resolver target (default port \fB5353\fR). May be repeated. When given,
+overrides the configuration file. When omitted, targets are read from
+.B [notify]
+.B servers
+in the config file.
+.TP
+.BI \-config " path"
+Configuration file consulted for the
+.B [notify]
+table (resolver
+.BR servers " and the " tsig_* " signing key)."
+When omitted, the helper searches
+.I /etc/splitdns/notify.toml
+then
+.IR /etc/splitdns/splitdnsd.toml .
+A missing or unreadable file is not fatal; the command falls back to flags and its
+socket/multicast defaults.
+.TP
+.BI \-tsig\-key " name"
+Sign announcements with the named TSIG key, overriding the config. The secret is taken
+from the config or
+.BR \-tsig\-secret\-file ;
+it is never accepted on the command line (so it cannot leak via the process list).
+.TP
+.BI \-tsig\-secret\-file " path"
+Read the base64 TSIG secret from
+.IR path ,
+overriding the config secret.
+.TP
+.B \-no\-tsig
+Do not sign even if a TSIG key is configured (send an unsigned announcement).
+.TP
+.BR \-verbose ", " \-v
+Explain what is sent and how: which config file (if any) was used, whether the
+announcement was signed and with which key, the resolved targets, and the per\-path
+result. Diagnostic output goes to standard error.
+.TP
+.BI \-port " n"
+mDNS UDP port for every target. Default \fB5353\fR.
+.TP
+.BI \-ttl " seconds"
+Advertised record TTL. Default \fB120\fR. Raise it (e.g.
+.B \-ttl 86400
+) if a receiver relies on a long cache lifetime.
+.TP
+.B \-cache\-flush
+Set the mDNS cache\-flush bit (RFC 6762) so receivers replace any prior records for
+the name instead of adding to them.
+.TP
+.B \-no\-multicast
+Do not announce to the multicast groups; send only to the unicast targets.
+.TP
+.B \-quiet
+Suppress per\-target progress and soft\-error messages.
+.TP
+.BI \-\-genkey " [name]"
+Generate a fresh random TSIG key (hmac\-sha256) and print copy\-paste configuration for
+both ends \(em the
+.B [notify]
+block for this host and the
+.B [ddns].tsig_keys
+entry for the resolver \(em then exit. The optional
+.I name
+defaults to
+.IR splitdns-notify .
+The secret is printed once and never written to disk, so the operator places it
+deliberately (ideally a mode\-0400 file referenced by
+.BR tsig_secret_file ).
+.SH "EXIT STATUS"
+.TP
+.B 0
+At least one target was transmitted to.
+.TP
+.B 1
+Every target failed at the local socket layer (e.g. address resolution or no
+route). Note that because announcements are fire\-and\-forget UDP, a target whose
+remote port is closed still counts as transmitted.
+.TP
+.B 2
+Usage error: missing arguments or an invalid address.
+.SH EXAMPLES
+.PP
+Announce a new public IPv6 prefix for a host, to a specific resolver:
+.PP
+.RS
+.B splitdns\-notify \-server 192.0.2.53 edge 2001:db8:1234:5600::42
+.RE
+.PP
+From a DHCP exit hook, announce the freshly leased WAN address (resolver taken from
+the config file):
+.PP
+.RS
+.B splitdns\-notify "$interface" "$new_ip_address"
+.RE
+.PP
+Mint a TSIG key, then see exactly what an announcement does (signed or not):
+.PP
+.RS
+.B splitdns\-notify \-\-genkey edge\-router
+.br
+.B splitdns\-notify \-v edge 203.0.113.45
+.RE
+.SH "SEE ALSO"
+.BR splitdnsd (8),
+.BR splitdns.conf (5)
+.SH AUTHORS
+The splitdns authors.
