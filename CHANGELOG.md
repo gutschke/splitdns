@@ -6,70 +6,56 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
-### Added
-- **`splitdnsd-selfbuild`** package: optional unattended security self-rebuild. Because
-  splitdnsd is a static binary, dependency (Go stdlib / vendored) CVE fixes require a
-  rebuild; this package ships the source + an autobuild service that rebuilds against the
-  current apt Go toolchain whenever it changes (apt-hook-triggered + weekly backstop),
-  installs only after `-check-config` + a DNS health check with automatic rollback, and
-  emails the admin on failure via the system MTA (`default-mta | mail-transport-agent`;
-  no MTA hard-coded — `msmtp-mta` works). See `guide/self-rebuild.md`.
-- Version-forwarding is now computed in `scripts/pkg-version.sh` (shared by the builder
-  and the self-build) and keys on the apt `golang-1.NN` package version, so an Ubuntu
-  stdlib backport produces a strictly-greater package version apt offers as an upgrade.
-
-- **Group-based access to the local notify socket** (`[ddns].notify_groups`): members of
-  the named groups may trigger DDNS via `/run/splitdns/notify.sock` with no shared key.
-  The unprivileged daemon stamps a POSIX ACL (multiple groups, no `CAP_CHOWN`, no group
-  membership of its own) and authorizes a peer by membership — so e.g. naming `www-data`
-  lets nginx trigger immediately, no `usermod`. `[ddns].notify_socket_mode` makes the
-  socket permission configurable (default `0660`). A filesystem without ACL support is
-  logged and skipped (DNS unaffected).
-- Optional **TSIG (RFC 8945) authentication** for DDNS triggers. A `splitdns-notify`
-  announcement can be HMAC-signed with a shared key (`[notify].tsig_*`), and the
-  resolver (`[ddns].tsig_keys`) honors a valid signature regardless of source IP —
-  cryptographic auth that defeats UDP source-IP spoofing while keeping delivery
-  fire-and-forget. `[ddns].require_signature` (default off) rejects unsigned triggers.
-  `splitdns-notify --genkey` mints a key and prints both ends' config; `--verbose`
-  reports what was sent, signed or not, and whether it worked. Signing is opt-in:
-  with no key configured the helper still works (socket → multicast).
-- `splitdns-notify` now reads a `[notify]` config file (`/etc/splitdns/notify.toml`,
-  falling back to `splitdnsd.toml`) for its servers, signing key, and resolver socket
-  path (`[notify].socket`, overridden by `-socket`; defaults to — and matches — the
-  resolver's `[ddns].notify_socket`), so options need not be retyped each call. The
-  standalone package ships `notify.example.toml`.
-
-### Changed
-- Packaging is now split into two Debian packages: `splitdnsd` (server) and a
-  standalone `splitdns-notify` (the mDNS-announce helper — one static binary, no
-  service, user, or config). Hosts that only announce themselves can install
-  `splitdns-notify` without ever pulling in the server. `splitdnsd` Recommends
-  `splitdns-notify`, so a normal server install is unchanged.
-
-## [0.1.0] — initial release
+## [0.1.0] — 2026-06-25
 
 First public release: a split-horizon DNS resolver that mirrors Cloudflare-hosted
 zones read-only, flattens tunnel/proxy indirection to direct LAN addresses, serves
 `*.local` (mDNS) and reverse zones, redirects vhost names at an internal reverse
-proxy, and forwards everything else over DoT — all from a zero-I/O hot path.
+proxy, and forwards everything else over DoT — all from a zero-I/O hot path. It ships
+as three Debian packages: the `splitdnsd` server, the standalone `splitdns-notify`
+mDNS helper, and the optional `splitdnsd-selfbuild` unattended security-rebuild package.
 
-### Added
-- Authoritative Cloudflare mirror with SOA-serial polling and a persistent warm
-  cache (fail-static cold start).
+### Resolver
+- Authoritative Cloudflare mirror with SOA-serial polling and a persistent warm cache
+  (fail-static cold start).
 - Tunnel/proxy flattening, vhost redirect with per-zone exclusions, wildcard/ENT
   synthesis, reverse (PTR) zones with optional prefix auto-detection.
 - DoT forwarding with audited cleartext fallback and a per-upstream circuit breaker.
-- DNS-rebinding protection, EDNS0/TC truncation, RFC 8482 minimal-ANY, RFC 2308
-  negative caching.
-- Opt-in dynamic-DNS write-back, double-guarded (disabled + dry-run by default) with
-  authenticated triggers (peer-credential-checked local socket and/or trusted source
-  networks), an eligibility allowlist, rate limits, and a hash-chained audit log.
+- DNS-rebinding protection, EDNS0/TC truncation, RFC 8482 minimal-ANY, RFC 2308 negative
+  caching, and an answer cache with serve-stale.
 - Worker supervisor with panic recovery, stall detection, and an sd_notify watchdog
   gated on an in-process liveness probe.
-- Hardened systemd unit, `splitdns-notify(8)` helper, and man pages.
-- Test suite: race-enabled unit/integration tests, parser fuzzing, a
-  network-namespace e2e harness, an adversarial chaos suite, and a golden-parity
-  harness.
+- Tiered diagnostics console (read-only views always on; dangerous controls password/
+  socket-gated and off by default). Hardened systemd unit and man pages.
+
+### Dynamic-DNS write-back
+- Opt-in, double-guarded (disabled + dry-run by default), update-only on existing A/AAAA
+  records, with an eligibility allowlist, per-host rate limits, and a hash-chained audit
+  log.
+- Authenticated triggers: a peer-credential-checked local socket; **group-authorized**
+  socket access (`[ddns].notify_groups` — POSIX-ACL, multiple groups, no shared key, no
+  `CAP_CHOWN`); **TSIG-signed announcements** (RFC 8945, honored regardless of source IP,
+  defeating UDP spoofing while staying fire-and-forget — `splitdns-notify --genkey` mints
+  a key); and/or trusted source networks. `require_signature` rejects unsigned triggers.
+
+### Packaging
+- Split into `splitdnsd` (server) and a standalone `splitdns-notify` (mDNS-announce
+  helper — one static binary, no service/user/config), so hosts that only announce
+  themselves never pull in the server; `splitdnsd` Recommends it. The helper reads a
+  `[notify]` config file (servers, signing key, resolver socket path).
+- **`splitdnsd-selfbuild`** (optional): rebuilds the static binaries against the current
+  apt Go toolchain when it changes (apt-hook-triggered + weekly backstop), installing only
+  after `-check-config` + a DNS health check with automatic rollback and email-on-failure
+  (`default-mta | mail-transport-agent`; no MTA hard-coded). This is how a static binary
+  picks up Go-stdlib/dependency CVE fixes on `apt dist-upgrade`. Version-forwarding
+  (`scripts/pkg-version.sh`) keys the package version on the apt `golang-1.NN` package
+  version, so an Ubuntu stdlib backport is a strictly-greater version apt offers as an
+  upgrade.
+
+### Testing & CI
+- Race-enabled unit/integration tests, parser fuzzing, a network-namespace e2e harness,
+  an adversarial chaos suite, and a golden-parity harness. CI gates on vet, govulncheck,
+  golangci-lint, race tests, short fuzz, and a pristine/no-attribution scan.
 
 [Unreleased]: https://github.com/gutschke/splitdns/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/gutschke/splitdns/releases/tag/v0.1.0
