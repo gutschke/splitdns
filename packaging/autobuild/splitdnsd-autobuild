@@ -1,0 +1,119 @@
+#!/bin/sh
+# splitdnsd-autobuild — rebuild the static splitdnsd/splitdns-notify binaries against the
+# CURRENT apt Go toolchain when it has changed (e.g. an Ubuntu stdlib security backport),
+# then install with config-validation + a DNS health check and AUTOMATIC ROLLBACK. This
+# is what lets a statically linked resolver pick up Go stdlib fixes on `apt dist-upgrade`
+# the way a dynamically linked program picks up a patched shared library (design §11).
+#
+# Run by the apt hook (after every apt run) and weekly by the timer. It is a fast no-op
+# unless the toolchain actually moved. On ANY failure it exits non-zero so the systemd
+# OnFailure= notifier emails the administrator (the work happens off the apt transaction,
+# so failures are no longer seen synchronously).
+#
+# It must run as root (dpkg/apt + systemctl). DNS is never taken down: a bad build is
+# caught before/after install and rolled back to the previously-installed packages.
+set -eu
+
+LIBDIR=/usr/lib/splitdnsd-selfbuild
+CONF=/etc/splitdns/autobuild.conf
+[ -r "$CONF" ] && . "$CONF"
+: "${ENABLE:=yes}"
+: "${SRC_TARBALL:=/usr/src/splitdnsd/source.tar.gz}"
+: "${BUILD_DIR:=/var/cache/splitdnsd-selfbuild}"
+: "${HEALTH_NAME:=health.splitdnsd.local}"
+: "${HEALTH_ADDR:=127.0.0.1}"
+: "${GOMAXPROCS:=2}"
+export GOMAXPROCS
+
+log() { logger -t splitdnsd-autobuild -- "$*" 2>/dev/null || true; echo "splitdnsd-autobuild: $*"; }
+die() { log "ERROR: $*"; exit 1; }   # non-zero exit => systemd OnFailure= emails the admin
+
+[ "$ENABLE" = yes ] || { log "disabled in $CONF (ENABLE=$ENABLE); skipping"; exit 0; }
+[ -d /run/systemd/system ] || { log "not under systemd; skipping"; exit 0; }
+[ "$(id -u)" = 0 ] || die "must run as root"
+
+ARCH=$(dpkg --print-architecture)
+installed=$(dpkg-query -W -f='${Version}' splitdnsd 2>/dev/null) \
+  || { log "splitdnsd not installed; nothing to rebuild"; exit 0; }
+
+# --- 1. Cheap change-detection: what version WOULD a fresh build stamp? ---------------
+# pkg-version.sh derives it from the current apt golang package version — no compile.
+base=$(cat "$LIBDIR/VERSION" 2>/dev/null || echo "${installed%%+*}")
+want=$(BASE_VERSION="$base" GO="$("$LIBDIR/select-go.sh" | head -1)" "$LIBDIR/pkg-version.sh" version) \
+  || die "could not compute target version (no apt Go toolchain?)"
+
+if dpkg --compare-versions "$want" le "$installed"; then
+  log "up to date (installed $installed, target $want); nothing to do"
+  exit 0
+fi
+log "toolchain/source moved: installed $installed -> target $want; rebuilding"
+
+# --- 2. Rebuild from the shipped source (hermetic, vendored, capped parallelism) ------
+[ -r "$SRC_TARBALL" ] || die "source tarball $SRC_TARBALL missing"
+rm -rf "$BUILD_DIR/src" "$BUILD_DIR/dist"
+mkdir -p "$BUILD_DIR/src"
+tar -C "$BUILD_DIR/src" -xzf "$SRC_TARBALL" || die "could not unpack $SRC_TARBALL"
+( cd "$BUILD_DIR/src" && BASE_VERSION="$base" OUT="$BUILD_DIR/dist" ./scripts/build-deb.sh ) \
+  >"$BUILD_DIR/build.log" 2>&1 || { tail -40 "$BUILD_DIR/build.log" | sed 's/^/  build: /'; die "build failed (see $BUILD_DIR/build.log)"; }
+
+srv="$BUILD_DIR/dist/splitdnsd_${want}_${ARCH}.deb"
+hlp="$BUILD_DIR/dist/splitdns-notify_${want}_${ARCH}.deb"
+[ -r "$srv" ] && [ -r "$hlp" ] || die "expected debs not produced ($srv)"
+
+# --- 3. Validate the new binary against the LIVE config BEFORE committing -------------
+if [ -e /etc/splitdns/splitdnsd.toml ]; then
+  vtmp=$(mktemp -d)
+  dpkg-deb -x "$srv" "$vtmp" || die "could not unpack new deb for validation"
+  "$vtmp/usr/sbin/splitdnsd" -config /etc/splitdns/splitdnsd.toml -check-config \
+    || { rm -rf "$vtmp"; die "new binary fails -check-config against the live config; not installing"; }
+  rm -rf "$vtmp"
+fi
+
+# --- 4. Snapshot the currently-installed packages for rollback ------------------------
+mkdir -p "$BUILD_DIR/rollback"
+rm -f "$BUILD_DIR/rollback"/*.deb
+if command -v dpkg-repack >/dev/null 2>&1; then
+  ( cd "$BUILD_DIR/rollback" && dpkg-repack splitdnsd splitdns-notify ) \
+    || log "WARN: dpkg-repack snapshot failed; rollback will be limited"
+else
+  log "WARN: dpkg-repack not installed; cannot snapshot current packages for rollback"
+fi
+
+# --- 5. Install, then health-gate; roll back on any failure ---------------------------
+rollback() {
+  if ls "$BUILD_DIR"/rollback/*.deb >/dev/null 2>&1; then
+    log "rolling back to $installed"
+    apt-get install -y --allow-downgrades --reinstall "$BUILD_DIR"/rollback/*.deb >/dev/null 2>&1 \
+      || log "WARN: rollback install reported errors"
+  else
+    log "WARN: no rollback snapshot; cannot revert automatically"
+  fi
+}
+
+health_ok() {
+  # Unconfigured resolver: the unit is inactive BY DESIGN (ConditionPathExists), so a
+  # binary swap is harmless and there is nothing to probe.
+  [ -e /etc/splitdns/splitdnsd.toml ] || return 0
+  systemctl is-active --quiet splitdnsd || return 1
+  # Confirm it actually answers DNS. dig exits 0 on any response (even NXDOMAIN), non-zero
+  # only when the server does not reply. If dig is unavailable, the is-active check stands.
+  command -v dig >/dev/null 2>&1 || return 0
+  dig +tries=1 +time=2 "@$HEALTH_ADDR" "$HEALTH_NAME" >/dev/null 2>&1
+}
+
+if ! apt-get install -y --allow-downgrades "$srv" "$hlp" >"$BUILD_DIR/install.log" 2>&1; then
+  tail -20 "$BUILD_DIR/install.log" | sed 's/^/  install: /'
+  rollback
+  die "install of $want failed; rolled back to $installed"
+fi
+
+# Give the (Type=notify) restart a moment to reach readiness, then probe.
+i=0
+while [ $i -lt 10 ]; do health_ok && break; i=$((i+1)); sleep 1; done
+if ! health_ok; then
+  rollback
+  die "new build $want did not pass the health check; rolled back to $installed"
+fi
+
+log "self-build OK: $installed -> $want (healthy)"
+exit 0

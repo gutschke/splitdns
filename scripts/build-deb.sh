@@ -22,30 +22,15 @@ cd "$root"
 
 GO=$("$root/scripts/select-go.sh" | head -1)
 export GOTOOLCHAIN=local CGO_ENABLED=0
-gover=$(GOTOOLCHAIN=local "$GO" version | sed -n 's/.*go\([0-9.]*\).*/\1/p')   # 1.24.4
-gominor=$(echo "$gover" | sed -n 's/^\([0-9]*\.[0-9]*\).*/\1/p')              # 1.24
+gover=$(GOTOOLCHAIN=local "$GO" version | sed -n 's/.*go\([0-9.]*\).*/\1/p')   # 1.24.4 (for -X main.version)
 
-# Version-forwarding (design §11.3): encode the build's toolchain PROVENANCE so a
-# rebuild against a patched toolchain is a strictly-greater version apt offers as an
-# upgrade (the static-binary equivalent of the dynamic linker picking up a new .so).
-# Key on the apt PACKAGE version of golang-1.NN, NOT the "go1.24.x" string: Ubuntu
-# backports stdlib CVE fixes into golang-1.NN (noble-security) while KEEPING the Go
-# version string, bumping only the package's ~24.04.N suffix — so that suffix is what
-# must move the package version. Use '+' (sorts ABOVE the base; '~' sorted BELOW it,
-# so a rebuild would never be offered — the prior bug). Sanitize epoch/'-'/'~' so the
-# whole string is a legal, monotonic Debian version.
 BASE_VERSION=${BASE_VERSION:-0.1.0}
 ARCH=$(dpkg --print-architecture 2>/dev/null || echo amd64)
-aptver=$(dpkg-query -W -f='${Version}' "golang-${gominor}" 2>/dev/null || true)
-if [ -n "$aptver" ]; then
-  aptrev=$(echo "$aptver" | sed 's/^[0-9]*://; s/[-~+]/./g')                  # 1.24.4.1ubuntu1.24.04.2
-  PKGVER="${BASE_VERSION}+go${gominor}+apt${aptrev}"
-  BUILT_USING="golang-${gominor} (= ${aptver})"
-else
-  # Non-apt Go (PATH fallback): no apt provenance, stamp the full Go version.
-  PKGVER="${BASE_VERSION}+go${gover}"
-  BUILT_USING="go (= ${gover})"
-fi
+# Version-forwarding (design §11.3) is computed in scripts/pkg-version.sh so the builder
+# and the self-build autobuild agree byte-for-byte (the autobuild compares this against
+# the installed package version to decide, without compiling, whether the toolchain moved).
+PKGVER=$(BASE_VERSION="$BASE_VERSION" GO="$GO" "$root/scripts/pkg-version.sh" version)
+BUILT_USING=$(BASE_VERSION="$BASE_VERSION" GO="$GO" "$root/scripts/pkg-version.sh" built-using)
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 
@@ -226,10 +211,123 @@ DEB_S="$OUT/splitdnsd_${PKGVER}_${ARCH}.deb"
 dpkg-deb --build --root-owner-group "$S" "$DEB_S"
 echo "build-deb: wrote $DEB_S"
 
+# ----------------------------------------------------------------------------
+# Package 3: splitdnsd-selfbuild — unattended security self-rebuild (design §11).
+# Ships the source + autobuild machinery so the resolver rebuilds splitdnsd against the
+# CURRENT apt Go toolchain when it changes (the static-binary equivalent of the dynamic
+# linker picking up a patched .so on apt dist-upgrade). Architecture: all, version =
+# BASE_VERSION (it carries source, not a toolchain-stamped binary), so a toolchain bump
+# rebuilds the binary packages but never this one.
+# ----------------------------------------------------------------------------
+B="$STAGE/selfbuild"
+# Source payload: exactly what scripts/build-deb.sh needs to rebuild — and nothing
+# private (the repo is pristine by policy, §12). Explicit list, so dist/.git/etc. and the
+# tarball itself are never swept in.
+install -d "$B/usr/src/splitdnsd"
+tar -czf "$B/usr/src/splitdnsd/source.tar.gz" -C "$root" \
+  cmd internal vendor go.mod go.sum man examples packaging scripts Makefile README.md LICENSE THIRD_PARTY_NOTICES.md
+# Autobuild machinery + the version-prediction helpers (cheap, compile-free change-detection).
+install -D -m 0755 packaging/autobuild/splitdnsd-autobuild "$B/usr/lib/splitdnsd-selfbuild/splitdnsd-autobuild"
+install -D -m 0755 packaging/autobuild/autobuild-notify     "$B/usr/lib/splitdnsd-selfbuild/autobuild-notify"
+install -D -m 0755 scripts/pkg-version.sh                   "$B/usr/lib/splitdnsd-selfbuild/pkg-version.sh"
+install -D -m 0755 scripts/select-go.sh                     "$B/usr/lib/splitdnsd-selfbuild/select-go.sh"
+install -D -m 0644 /dev/stdin "$B/usr/lib/splitdnsd-selfbuild/VERSION" <<EOF
+${BASE_VERSION}
+EOF
+# systemd units + apt hook + example config (config is NOT a conffile — operator copies it).
+install -D -m 0644 packaging/autobuild/splitdnsd-autobuild.service         "$B/lib/systemd/system/splitdnsd-autobuild.service"
+install -D -m 0644 packaging/autobuild/splitdnsd-autobuild.timer           "$B/lib/systemd/system/splitdnsd-autobuild.timer"
+install -D -m 0644 packaging/autobuild/splitdnsd-autobuild-notify@.service "$B/lib/systemd/system/splitdnsd-autobuild-notify@.service"
+install -D -m 0644 packaging/autobuild/80splitdnsd-autobuild               "$B/etc/apt/apt.conf.d/80splitdnsd-autobuild"
+install -D -m 0644 packaging/autobuild/autobuild.conf                      "$B/usr/share/doc/splitdnsd-selfbuild/autobuild.conf.example"
+
+mkdir -p "$B/DEBIAN"
+cat > "$B/DEBIAN/control" <<EOF
+Package: splitdnsd-selfbuild
+Version: ${BASE_VERSION}
+Architecture: all
+Maintainer: gutschke <gutschke@users.noreply.github.com>
+Section: net
+Priority: optional
+Depends: splitdnsd (>= ${BASE_VERSION}), golang-1.24 | golang-go (>= 2:1.24~), default-mta | mail-transport-agent
+Recommends: dpkg-repack, bind9-dnsutils | dnsutils, debsecan
+Homepage: https://github.com/gutschke/splitdns
+Description: unattended security self-rebuild for splitdnsd
+ splitdnsd ships as a STATIC Go binary, so its dependencies (the Go standard library and
+ vendored libraries) are baked in at build time and only update on a rebuild — unlike a
+ dynamically linked program, which picks up a patched shared library automatically on apt
+ dist-upgrade. This package closes that gap: it ships the source and rebuilds
+ splitdnsd/splitdns-notify against the current apt Go toolchain whenever it changes (e.g.
+ an Ubuntu stdlib security backport), triggered right after apt runs and weekly as a
+ backstop. The new build installs only after config-validation and a DNS health check,
+ with automatic rollback to the previous binary on any failure, and emails the
+ administrator if an unattended rebuild fails (via the system mail-transport-agent —
+ install e.g. msmtp-mta to relay through a smarthost; no MTA is hard-coded).
+EOF
+
+cat > "$B/DEBIAN/postinst" <<'EOF'
+#!/bin/sh
+set -e
+if [ "$1" = "configure" ]; then
+  if [ ! -e /etc/splitdns/autobuild.conf ]; then
+    echo "splitdnsd-selfbuild: enabled — rebuilds splitdnsd when the apt Go toolchain moves." >&2
+    echo "  To receive failure emails, install a mail-transport-agent (e.g." >&2
+    echo "  'apt install msmtp msmtp-mta bsd-mailx' + a smarthost) and copy" >&2
+    echo "  /usr/share/doc/splitdnsd-selfbuild/autobuild.conf.example to" >&2
+    echo "  /etc/splitdns/autobuild.conf to set ADMIN_EMAIL." >&2
+  fi
+  if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+  fi
+  if command -v deb-systemd-helper >/dev/null 2>&1; then
+    if deb-systemd-helper --quiet was-enabled splitdnsd-autobuild.timer; then
+      deb-systemd-helper enable splitdnsd-autobuild.timer >/dev/null || true
+    else
+      deb-systemd-helper update-state splitdnsd-autobuild.timer >/dev/null || true
+    fi
+  fi
+  if [ -d /run/systemd/system ] && command -v deb-systemd-invoke >/dev/null 2>&1; then
+    deb-systemd-invoke start splitdnsd-autobuild.timer >/dev/null 2>&1 || true
+  fi
+fi
+exit 0
+EOF
+chmod 0755 "$B/DEBIAN/postinst"
+
+cat > "$B/DEBIAN/prerm" <<'EOF'
+#!/bin/sh
+set -e
+if [ "$1" = "remove" ] && [ -d /run/systemd/system ]; then
+  systemctl stop splitdnsd-autobuild.timer splitdnsd-autobuild.service >/dev/null 2>&1 || true
+fi
+exit 0
+EOF
+chmod 0755 "$B/DEBIAN/prerm"
+
+cat > "$B/DEBIAN/postrm" <<'EOF'
+#!/bin/sh
+set -e
+if [ -d /run/systemd/system ]; then
+  systemctl daemon-reload || true
+fi
+if [ "$1" = "purge" ]; then
+  if command -v deb-systemd-helper >/dev/null 2>&1; then
+    deb-systemd-helper purge splitdnsd-autobuild.timer >/dev/null || true
+  fi
+  rm -rf /var/cache/splitdnsd-selfbuild
+fi
+exit 0
+EOF
+chmod 0755 "$B/DEBIAN/postrm"
+
+DEB_B="$OUT/splitdnsd-selfbuild_${BASE_VERSION}_all.deb"
+dpkg-deb --build --root-owner-group "$B" "$DEB_B"
+echo "build-deb: wrote $DEB_B"
+
 # 4. Report.
-for DEB in "$DEB_N" "$DEB_S"; do
+for DEB in "$DEB_N" "$DEB_S" "$DEB_B"; do
   echo "=== $(basename "$DEB") ==="
-  dpkg-deb --info "$DEB" | sed -n '1,14p'
+  dpkg-deb --info "$DEB" | sed -n '1,16p'
   echo "--- contents ---"
   dpkg-deb --contents "$DEB"
 done

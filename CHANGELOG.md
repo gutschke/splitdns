@@ -7,6 +7,17 @@ All notable changes to this project are documented here. The format is based on
 ## [Unreleased]
 
 ### Added
+- **`splitdnsd-selfbuild`** package: optional unattended security self-rebuild. Because
+  splitdnsd is a static binary, dependency (Go stdlib / vendored) CVE fixes require a
+  rebuild; this package ships the source + an autobuild service that rebuilds against the
+  current apt Go toolchain whenever it changes (apt-hook-triggered + weekly backstop),
+  installs only after `-check-config` + a DNS health check with automatic rollback, and
+  emails the admin on failure via the system MTA (`default-mta | mail-transport-agent`;
+  no MTA hard-coded — `msmtp-mta` works). See `guide/self-rebuild.md`.
+- Version-forwarding is now computed in `scripts/pkg-version.sh` (shared by the builder
+  and the self-build) and keys on the apt `golang-1.NN` package version, so an Ubuntu
+  stdlib backport produces a strictly-greater package version apt offers as an upgrade.
+
 - **Group-based access to the local notify socket** (`[ddns].notify_groups`): members of
   the named groups may trigger DDNS via `/run/splitdns/notify.sock` with no shared key.
   The unprivileged daemon stamps a POSIX ACL (multiple groups, no `CAP_CHOWN`, no group
