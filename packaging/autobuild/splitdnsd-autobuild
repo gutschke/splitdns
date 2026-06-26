@@ -36,6 +36,13 @@ for _a in "$@"; do [ "$_a" = --force ] && FORCE=yes; done
 [ -d /run/systemd/system ] || { log "not under systemd; skipping"; exit 0; }
 [ "$(id -u)" = 0 ] || die "must run as root"
 
+# Keep the cache dir from growing: wipe the transient build workspace on exit, retaining
+# only the latest rollback snapshot (rollback/, a few MB) and the logs. The Go build cache
+# in particular is pointless to keep — every rebuild is triggered by a TOOLCHAIN change,
+# which invalidates it, so each build is cold anyway.
+cleanup() { rm -rf "$BUILD_DIR/src" "$BUILD_DIR/dist" "$BUILD_DIR/gocache" "$BUILD_DIR/gopath"; }
+trap cleanup EXIT
+
 ARCH=$(dpkg --print-architecture)
 installed=$(dpkg-query -W -f='${Version}' splitdnsd 2>/dev/null) \
   || { log "splitdnsd not installed; nothing to rebuild"; exit 0; }

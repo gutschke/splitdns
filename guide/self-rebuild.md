@@ -62,11 +62,16 @@ Installing `msmtp-mta` *before* `splitdnsd-selfbuild` satisfies its
 | `GOMAXPROCS` | `2` | build parallelism (keep low on a small resolver) |
 | `BUILD_DIR` | `/var/cache/splitdnsd-selfbuild` | build + rollback workspace |
 
-> **Sizing:** a rebuild peaks around **~340 MB RAM** (GOMAXPROCS=2, ~1–2 min CPU) and
-> runs *outside* the daemon's `MemoryMax` cgroup, so the container needs that headroom
-> above the running resolver — give a self-building container **≥ 512 MB**, or set
+> **RAM:** a rebuild peaks around **~340 MB** (GOMAXPROCS=2, ~1–2 min CPU) and runs
+> *outside* the daemon's `MemoryMax` cgroup, so the container needs that headroom above
+> the running resolver — give a self-building container **≥ 512 MB**, or set
 > `GOMAXPROCS=1` on a tighter box. (The 256 MB minimum applies to a resolver that does
 > **not** self-build.)
+>
+> **Disk:** the build workspace (extracted source + Go build cache, transiently a few
+> hundred MB) is **wiped after every run**; only the latest rollback snapshot (~15 MB) and
+> the small build/install logs persist under `BUILD_DIR`, so the cache directory does not
+> grow over time. (On purge, the package removes `BUILD_DIR` entirely.)
 
 ## Testing it by hand
 
