@@ -22,11 +22,30 @@ cd "$root"
 
 GO=$("$root/scripts/select-go.sh" | head -1)
 export GOTOOLCHAIN=local CGO_ENABLED=0
-gover=$(GOTOOLCHAIN=local "$GO" version | sed -n 's/.*go\([0-9.]*\).*/\1/p')
+gover=$(GOTOOLCHAIN=local "$GO" version | sed -n 's/.*go\([0-9.]*\).*/\1/p')   # 1.24.4
+gominor=$(echo "$gover" | sed -n 's/^\([0-9]*\.[0-9]*\).*/\1/p')              # 1.24
 
+# Version-forwarding (design §11.3): encode the build's toolchain PROVENANCE so a
+# rebuild against a patched toolchain is a strictly-greater version apt offers as an
+# upgrade (the static-binary equivalent of the dynamic linker picking up a new .so).
+# Key on the apt PACKAGE version of golang-1.NN, NOT the "go1.24.x" string: Ubuntu
+# backports stdlib CVE fixes into golang-1.NN (noble-security) while KEEPING the Go
+# version string, bumping only the package's ~24.04.N suffix — so that suffix is what
+# must move the package version. Use '+' (sorts ABOVE the base; '~' sorted BELOW it,
+# so a rebuild would never be offered — the prior bug). Sanitize epoch/'-'/'~' so the
+# whole string is a legal, monotonic Debian version.
 BASE_VERSION=${BASE_VERSION:-0.1.0}
 ARCH=$(dpkg --print-architecture 2>/dev/null || echo amd64)
-PKGVER="${BASE_VERSION}~go${gover}"
+aptver=$(dpkg-query -W -f='${Version}' "golang-${gominor}" 2>/dev/null || true)
+if [ -n "$aptver" ]; then
+  aptrev=$(echo "$aptver" | sed 's/^[0-9]*://; s/[-~+]/./g')                  # 1.24.4.1ubuntu1.24.04.2
+  PKGVER="${BASE_VERSION}+go${gominor}+apt${aptrev}"
+  BUILT_USING="golang-${gominor} (= ${aptver})"
+else
+  # Non-apt Go (PATH fallback): no apt provenance, stamp the full Go version.
+  PKGVER="${BASE_VERSION}+go${gover}"
+  BUILT_USING="go (= ${gover})"
+fi
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 
@@ -59,7 +78,7 @@ Architecture: ${ARCH}
 Maintainer: gutschke <gutschke@users.noreply.github.com>
 Section: net
 Priority: optional
-Built-Using: go (= ${gover})
+Built-Using: ${BUILT_USING}
 Homepage: https://github.com/gutschke/splitdns
 Description: mDNS hostname announcer for splitdnsd
  splitdns-notify sends authoritative multicast-DNS responses to announce a
@@ -100,7 +119,7 @@ Section: net
 Priority: optional
 Depends: adduser, init-system-helpers (>= 1.54~)
 Recommends: splitdns-notify (= ${PKGVER})
-Built-Using: go (= ${gover})
+Built-Using: ${BUILT_USING}
 Homepage: https://github.com/gutschke/splitdns
 Description: split-horizon DNS resolver with Cloudflare mirror
  splitdnsd is a lightweight authoritative + forwarding DNS resolver. It mirrors

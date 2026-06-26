@@ -44,7 +44,10 @@ jobs:
           # directive is <= the pinned toolchain — govulncheck >= 1.5 needs Go 1.25, but
           # GOTOOLCHAIN=local holds us at 1.24.
           env GOFLAGS= GOWORK=off go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
-          "$(go env GOPATH)/bin/govulncheck" ./...
+          # Ship policy: BLOCK on a reachable vuln in a vendored module (fixable here);
+          # WARN (non-blocking) on a reachable Go-stdlib vuln (fixed by the apt toolchain
+          # / self-rebuild, not from this repo). See scripts/govulncheck-gate.sh + design §11.
+          GOVULNCHECK="$(go env GOPATH)/bin/govulncheck" ./scripts/govulncheck-gate.sh ./...
 
   lint:
     runs-on: ubuntu-latest
