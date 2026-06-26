@@ -60,7 +60,11 @@ fi
 # --- 2. Rebuild from the shipped source (hermetic, vendored, capped parallelism) ------
 [ -r "$SRC_TARBALL" ] || die "source tarball $SRC_TARBALL missing"
 rm -rf "$BUILD_DIR/src" "$BUILD_DIR/dist"
-mkdir -p "$BUILD_DIR/src"
+mkdir -p "$BUILD_DIR/src" "$BUILD_DIR/gocache" "$BUILD_DIR/gopath"
+# A systemd service has NO $HOME, so `go build` cannot otherwise locate its build cache
+# ("build cache is required, but could not be located"). Pin the Go caches (and HOME)
+# under our writable cache dir so the build behaves identically from systemd and a shell.
+export GOCACHE="$BUILD_DIR/gocache" GOPATH="$BUILD_DIR/gopath" HOME="$BUILD_DIR"
 tar -C "$BUILD_DIR/src" -xzf "$SRC_TARBALL" || die "could not unpack $SRC_TARBALL"
 ( cd "$BUILD_DIR/src" && BASE_VERSION="$base" OUT="$BUILD_DIR/dist" ./scripts/build-deb.sh ) \
   >"$BUILD_DIR/build.log" 2>&1 || { tail -40 "$BUILD_DIR/build.log" | sed 's/^/  build: /'; die "build failed (see $BUILD_DIR/build.log)"; }
