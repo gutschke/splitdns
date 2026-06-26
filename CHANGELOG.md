@@ -6,15 +6,6 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
-### Changed
-- `splitdnsd-selfbuild` no longer hard-depends on `splitdnsd`/`splitdns-notify` (it
-  Recommends them), so any combination of the three packages is a valid install. If
-  either binary package has been removed, the self-build now rebuilds and **reinstalls**
-  it (rather than doing nothing), with the same validate/health-check/rollback path.
-- `splitdnsd-selfbuild` is now also produced by the canonical `debian/` (dpkg-buildpackage)
-  path, not just the `build-deb.sh` fallback; lintian-clean. The source-tarball payload is
-  factored into `scripts/make-source-tarball.sh`, shared by both build paths.
-
 ## [0.1.0] — 2026-06-25
 
 First public release: a split-horizon DNS resolver that mirrors Cloudflare-hosted
@@ -59,7 +50,10 @@ mDNS helper, and the optional `splitdnsd-selfbuild` unattended security-rebuild 
   picks up Go-stdlib/dependency CVE fixes on `apt dist-upgrade`. Version-forwarding
   (`scripts/pkg-version.sh`) keys the package version on the apt `golang-1.NN` package
   version, so an Ubuntu stdlib backport is a strictly-greater version apt offers as an
-  upgrade.
+  upgrade. It does not hard-depend on the other two packages (it Recommends them), so any
+  combination of the three is a valid install, and it rebuilds + reinstalls either one if
+  it is removed. Produced by both the canonical `debian/` (dpkg-buildpackage) path and the
+  `build-deb.sh` fallback.
 
 ### Testing & CI
 - Race-enabled unit/integration tests, parser fuzzing, a network-namespace e2e harness,
