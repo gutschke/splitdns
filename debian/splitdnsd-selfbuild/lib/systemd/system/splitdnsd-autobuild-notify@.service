@@ -1,7 +1,0 @@
-[Unit]
-Description=Email the administrator that %i failed (splitdnsd unattended self-build)
-Documentation=man:splitdnsd(8)
-
-[Service]
-Type=oneshot
-ExecStart=/usr/lib/splitdnsd-selfbuild/autobuild-notify %i

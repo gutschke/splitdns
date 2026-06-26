@@ -1,7 +1,0 @@
-#!/bin/sh
-set -e
-if [ "$1" = "remove" ] && [ -d /run/systemd/system ] && command -v deb-systemd-invoke >/dev/null 2>&1; then
-  deb-systemd-invoke stop splitdnsd-autobuild.timer splitdnsd-autobuild.service >/dev/null 2>&1 || true
-fi
-
-exit 0

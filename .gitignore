@@ -17,11 +17,18 @@
 /docs/
 /dist/
 
-# Canonical packaging (dpkg-buildpackage) build artifacts.
+# Canonical packaging (dpkg-buildpackage) build artifacts. The per-binary-package staged
+# trees and debhelper's generated bookkeeping are NEVER committed (only debian/<source
+# files> are tracked).
 /debian/.debhelper/
+/debian/tmp/
 /debian/splitdnsd/
+/debian/splitdns-notify/
+/debian/splitdnsd-selfbuild/
 /debian/files
 /debian/*.substvars
+/debian/*.debhelper
+/debian/*.debhelper.log
 /debian/debhelper-build-stamp
 /splitdnsd
 /splitdns-notify
