@@ -191,11 +191,22 @@ These **mutate** running state and are therefore gated. They are **off by defaul
 | Restart daemon | graceful shutdown; systemd (`Restart=always`) brings it back |
 | Disable/enable backend | take an upstream out of / back into rotation (until reset/restart) |
 
-**Password UX:** when a `control_password` is configured, the page shows a normal
-`<input type="password">` (so your **browser/password-manager can autofill and save it**)
-behind an "Unlock" button. The value is kept for the browser **session**
-(`sessionStorage`) and sent as the `X-Diag-Password` header on each action — no re-typing
-per click. A wrong password clears it.
+**Lock/unlock UX:** when a `control_password` is configured, a **`controls: locked`
+chip** sits in the sticky top strip (visible no matter where you've scrolled) and every
+control button is greyed. Enter the password in the `<input type="password">` (your
+**browser/password-manager can autofill and save it**) and click **Unlock**: the page
+makes a single side-effect-free `POST /control/verify` to confirm the password, then
+flips the chip to `controls: unlocked` and enables the buttons. The value is held for the
+browser **session** (`sessionStorage`, cleared when you close the tab) and replayed as the
+`X-Diag-Password` header on each action — no re-typing per click; a **Lock** button clears
+it. Clicking any greyed control (e.g. an upstream **disable** button far down the page)
+scrolls you to the password field and highlights it, so you never click into a dead end.
+
+Every action gives **inline feedback** next to its own button — `working…` while in
+flight (so "slow" is never mistaken for "failed"), then a specific result: `done`,
+`incorrect password — re-enter` (which re-locks and refocuses the field),
+`rate-limited — retry shortly`, the server's reason for a 4xx/5xx, or `request failed`
+for a network error. No modal pop-ups.
 
 ### Enabling and authorizing
 
@@ -214,10 +225,22 @@ Set `[diag] allow_control = true`. Once enabled, every action is:
      loopback IP qualifies (fail-closed).
 4. **Rate-limited** — `refresh-mirror` and `restart` are capped at once per 10s so even
    an authorized client can't restart-loop the daemon or hammer the Cloudflare API.
+   `flush-cache` and the backend enable/disable toggles are **not** interval-limited (the
+   toggle is a deliberate operator action you may want to do back-to-back — disable one
+   upstream, immediately enable another).
+5. **Throttled against guessing** — consecutive **wrong passwords** trip a shared
+   exponential backoff (a short grace, then `1s, 2s, 4s … 30s`) that applies to
+   `/control/verify` **and** every real action alike, so the side-effect-free verify probe
+   can't be used as a friction-free brute-force oracle. A correct password resets it. The
+   backoff is global and exponential (not a hard lockout) so a LAN attacker can slow — but
+   not fully deny — the operator. (The `verify` endpoint exists only where controls do, is
+   gated identically, and returns a 401 body indistinguishable from a failed real action.)
 
 When `allow_control = true` on a **non-loopback** address with **no password**, the
-control route is **not even registered** (and the condition is logged loudly at startup)
-— dangerous actions are never exposed unauthenticated on the LAN.
+control route (and `/control/verify`) is **not even registered** (and the condition is
+logged loudly at startup) — dangerous actions are never exposed unauthenticated on the
+LAN. In **loopback (no-password)** mode there is no lock chip, password field, or verify
+step: the bind itself is the authorization.
 
 > **Plain HTTP caveat:** the endpoint is not TLS. A password defends against casual and
 > CSRF misuse, not a network eavesdropper. For real exposure, keep `addr` on loopback

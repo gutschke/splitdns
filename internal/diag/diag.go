@@ -54,9 +54,17 @@ type Server struct {
 	log            func(string)
 	version        string
 
+	now func() time.Time // injectable clock for rate-limit/backoff tests (default time.Now)
+
 	hs      *http.Server
 	ctlMu   sync.Mutex
 	ctlLast map[string]time.Time // per-action last-run, for rate limiting
+	// Shared failed-password backoff (guarded by ctlMu). Covers BOTH /control/<action>
+	// and /control/verify, so a side-effect-free verify can't be a friction-free
+	// brute-force oracle. Global (not per-IP): a LAN attacker rotates source addresses,
+	// so a single counter is the real backstop.
+	authFails      int
+	authBlockUntil time.Time
 }
 
 // New builds a diagnostics Server. snapshot/view must be non-nil; log may be nil.
@@ -67,7 +75,7 @@ func New(addr string, snapshot func() *model.Snapshot, view func() *model.MDNSVi
 	if addr == "" {
 		addr = "127.0.0.1:8080"
 	}
-	return &Server{addr: addr, snapshot: snapshot, view: view, version: version, log: log, ctlLast: map[string]time.Time{}}
+	return &Server{addr: addr, snapshot: snapshot, view: view, version: version, log: log, ctlLast: map[string]time.Time{}, now: time.Now}
 }
 
 // WithCacheStats wires a provider for the forward-path answer-cache counters. fn
@@ -427,6 +435,12 @@ func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch action {
+	case "verify":
+		// Side-effect-free auth probe so the UI can confirm "unlocked" immediately. It
+		// reached here only after passing controlAuthorized (incl. the failed-auth
+		// backoff), so just acknowledge — no state change, generic body.
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		fmt.Fprintln(w, "ok")
 	case "flush-cache":
 		if s.controls.FlushCache == nil {
 			http.Error(w, "flush-cache unavailable (no cache)", http.StatusNotFound)
@@ -484,13 +498,20 @@ func (s *Server) controlAuthorized(r *http.Request) (int, string) {
 		return http.StatusForbidden, "control actions are disabled (set [diag] allow_control)"
 	}
 	if s.controls.Password != "" {
+		// Failed-attempt backoff first (cheap, reveals nothing about correctness): an
+		// online guesser is slowed whether it targets a real action or /control/verify.
+		if s.authBackoffActive() > 0 {
+			return http.StatusTooManyRequests, "too many failed attempts; retry shortly"
+		}
 		got := r.Header.Get("X-Diag-Password")
 		if got == "" {
 			got = r.PostFormValue("password")
 		}
 		if subtle.ConstantTimeCompare([]byte(got), []byte(s.controls.Password)) != 1 {
+			s.authFailed()
 			return http.StatusUnauthorized, "missing or incorrect control password"
 		}
+		s.authSucceeded()
 		return http.StatusOK, ""
 	}
 	// No password configured: honor only on a loopback bind.
@@ -498,6 +519,52 @@ func (s *Server) controlAuthorized(r *http.Request) (int, string) {
 		return http.StatusForbidden, "control_password required for a non-loopback bind"
 	}
 	return http.StatusOK, ""
+}
+
+// authBackoffActive returns the remaining failed-auth block (>0 => currently throttled).
+func (s *Server) authBackoffActive() time.Duration {
+	s.ctlMu.Lock()
+	defer s.ctlMu.Unlock()
+	if rem := s.authBlockUntil.Sub(s.now()); rem > 0 {
+		return rem
+	}
+	return 0
+}
+
+// authFailed records a wrong password and arms the backoff window.
+func (s *Server) authFailed() {
+	s.ctlMu.Lock()
+	defer s.ctlMu.Unlock()
+	s.authFails++
+	if d := authBackoff(s.authFails); d > 0 {
+		s.authBlockUntil = s.now().Add(d)
+	}
+}
+
+// authSucceeded clears the failed-auth counter on a correct password.
+func (s *Server) authSucceeded() {
+	s.ctlMu.Lock()
+	s.authFails = 0
+	s.authBlockUntil = time.Time{}
+	s.ctlMu.Unlock()
+}
+
+// authBackoff is the delay imposed after n consecutive failed password attempts: a short
+// grace, then exponential growth capped at 30s. Exponential rather than a hard lockout so
+// an unauthenticated LAN attacker can slow — but not fully deny — the operator.
+func authBackoff(n int) time.Duration {
+	const grace = 5
+	if n <= grace {
+		return 0
+	}
+	shift := n - grace - 1
+	if shift > 5 {
+		shift = 5
+	}
+	if d := time.Second << uint(shift); d < 30*time.Second {
+		return d
+	}
+	return 30 * time.Second
 }
 
 // controlRateOK enforces a per-action minimum interval (returns false => 429).
@@ -1029,6 +1096,15 @@ table.sortable thead th{position:sticky;top:calc(var(--topbar-h) + 1.9rem);backg
 .chip{display:inline-flex;gap:.35rem;align-items:center;text-decoration:none;color:#222;border:1px solid #ccc;border-radius:1rem;padding:.05rem .65rem;font-size:.85rem;white-space:nowrap}
 .chip b{font-variant-numeric:tabular-nums} .chip .lbl{color:#777}
 .chip.ok{border-color:#9c9} .chip.flag{border-color:#e88;background:#fdeaea}
+.chip.clickable{cursor:pointer}
+/* control-action feedback + lock affordances (see the control JS) */
+.ctl-msg{font-size:.85rem;margin-left:.4rem;font-variant-numeric:tabular-nums}
+.ctl-msg.ok{color:#161} .ctl-msg.flag{color:#c00} .ctl-msg.muted{color:#777}
+button.ctl[aria-busy="true"]{opacity:.6;cursor:progress}
+body[data-locked="true"] button.ctl{opacity:.55}
+#pwerr{color:#c00;font-size:.85rem;margin-left:.4rem}
+#diagpw.flash{outline:2px solid #e88;outline-offset:1px}
+@media (prefers-reduced-motion:no-preference){#diagpw{transition:outline-color .5s}}
 nav.toc{margin-top:.3rem;font-size:.85rem;line-height:1.9}
 nav.toc a{color:#36c;text-decoration:none} nav.toc a:hover{text-decoration:underline}
 nav.toc a:not(:first-child)::before{content:"·";color:#ccc;margin:0 .45rem}
@@ -1058,6 +1134,7 @@ addr <input name="addr" size="16" placeholder="1.2.3.4 (public)">
 {{with .Cache}}<a class="chip" id="chip-cache" href="#cache"><span class="lbl">cache</span> <b>{{.HitRatio}}</b></a>{{end}}
 {{with .Workers}}<a class="chip" id="chip-workers" href="#workers"><span class="lbl">workers</span> <b>{{len .}}</b></a>{{end}}
 {{with .Queries}}<a class="chip" id="chip-queries" href="#queries"><span class="lbl">queries</span> <b>{{.Total}}</b></a>{{end}}
+{{if .Controls}}{{if .Controls.NeedPassword}}<a class="chip flag clickable" id="chip-controls" href="#controls" aria-label="Controls locked — activate to unlock"><span class="lbl">controls</span> locked</a>{{end}}{{end}}
 </div>
 <nav class="toc">
 {{if .Controls}}<a href="#controls">Controls</a>{{end}}
@@ -1075,9 +1152,11 @@ addr <input name="addr" size="16" placeholder="1.2.3.4 (public)">
 <div id="ctl" data-need-pw="{{.NeedPassword}}">
 {{if .NeedPassword}}<form id="pwform" autocomplete="on" style="margin:.2rem 0">
 <input type="text" name="username" value="diag" autocomplete="username" tabindex="-1" aria-hidden="true" style="position:absolute;left:-9999px">
-<input type="password" id="diagpw" name="password" autocomplete="current-password" placeholder="control password" size="18">
+<span id="pwentry"><input type="password" id="diagpw" name="password" autocomplete="current-password" placeholder="control password" size="18" aria-describedby="pwerr">
 <button type="submit">Unlock</button>
-<span class="muted">— use your password manager; kept for this session</span></form>{{end}}
+<span id="pwerr" role="alert"></span>
+<span class="muted" id="lockhint">— enter the control password to enable the actions below and the upstream enable/disable buttons. Kept for this browser session (cleared when you close the tab).</span></span>
+<span class="muted" id="unlockednote" hidden>controls unlocked for this session — </span><button type="button" id="lockbtn" hidden>Lock</button></form>{{end}}
 {{if .FlushCache}}<button class="ctl" data-action="flush-cache">Flush answer cache</button>{{end}}
 {{if .RefreshMirror}}<button class="ctl" data-action="refresh-mirror">Force mirror refresh</button>{{end}}
 {{if .Restart}}<button class="ctl" data-action="restart" data-confirm="Restart the daemon?">Restart daemon</button>{{end}}
@@ -1250,7 +1329,7 @@ traffic onto another.{{end}}</p>
       if(!b || b.dataset.op !== op){
         cell.textContent = ''; b = document.createElement('button'); b.className = 'ctl';
         b.dataset.action = 'backend'; b.dataset.op = op; b.dataset.addr = x.addr; b.textContent = op;
-        b.addEventListener('click', function(){ doControl(b); }); cell.appendChild(b);
+        cell.appendChild(b); // clicks handled by the delegated listener (reconcile-safe)
       }
     }
   }
@@ -1382,25 +1461,80 @@ traffic onto another.{{end}}</p>
   document.addEventListener('pointerup', function(){ dragging = false; flushDirty(); });
   document.addEventListener('focusout', flushDirty);
 
-  // ---- control actions (password via input + session; seamless refresh, no reload) ----
+  // ---- control actions: lock/unlock + inline per-action feedback (no modal alerts) ----
   var ctl = document.getElementById('ctl'), needPw = ctl && ctl.dataset.needPw === 'true';
   var pwInput = document.getElementById('diagpw'), pwForm = document.getElementById('pwform');
-  if(pwInput){ var saved = sessionStorage.getItem('diagpw'); if(saved) pwInput.value = saved; }
-  if(pwForm){ pwForm.addEventListener('submit', function(e){ e.preventDefault(); if(pwInput.value){ sessionStorage.setItem('diagpw', pwInput.value); pwInput.blur(); } }); }
-  function curpw(){ if(!needPw) return ''; var p = (pwInput && pwInput.value) || sessionStorage.getItem('diagpw') || ''; if(p) sessionStorage.setItem('diagpw', p); return p; }
-  function doControl(btn){
-    if(btn.dataset.confirm && !confirm(btn.dataset.confirm)) return;
-    var q = ''; if(btn.dataset.op){ q = 'op=' + encodeURIComponent(btn.dataset.op); if(btn.dataset.addr) q += '&addr=' + encodeURIComponent(btn.dataset.addr); }
-    var headers = {};
-    if(needPw){ var p = curpw(); if(!p){ if(pwInput) pwInput.focus(); alert('Enter the control password, then Unlock.'); return; } headers['X-Diag-Password'] = p; }
-    fetch('/control/' + btn.dataset.action + (q ? '?' + q : ''), { method: 'POST', headers: headers }).then(function(r){
-      if(r.status === 401){ sessionStorage.removeItem('diagpw'); if(pwInput){ pwInput.value = ''; pwInput.focus(); } alert('Wrong password — try again'); }
-      else if(r.status === 429){ alert('Rate-limited; retry shortly'); }
-      else if(r.ok){ poll(); } // seamless data refresh instead of a full reload
-      else { r.text().then(function(t){ alert('Error: ' + t); }); }
-    }).catch(function(e){ alert('Request failed: ' + e); });
+  var pwErr = document.getElementById('pwerr'), lockBtn = document.getElementById('lockbtn');
+  var pwEntry = document.getElementById('pwentry'), unlockedNote = document.getElementById('unlockednote');
+  var chipLock = document.getElementById('chip-controls');
+  // stagedPw is the SINGLE source of truth for "unlocked". The <input> is read only at
+  // submit time, so typing-without-Unlock can never half-work. Mirrored to sessionStorage
+  // (per-tab; gone on tab close), never localStorage.
+  var stagedPw = needPw ? (sessionStorage.getItem('diagpw') || '') : '';
+
+  function setLock(unlocked){
+    if(!needPw) return; // loopback mode: no password, no lock concept
+    document.body.dataset.locked = unlocked ? 'false' : 'true'; // CSS greys controls when locked
+    // Locked shows the password entry; unlocked shows only the Lock affordance — never both.
+    if(pwEntry) pwEntry.hidden = unlocked;
+    if(unlockedNote) unlockedNote.hidden = !unlocked;
+    if(lockBtn) lockBtn.hidden = !unlocked;
+    if(chipLock){
+      chipLock.className = 'chip clickable ' + (unlocked ? 'ok' : 'flag');
+      chipLock.lastChild.nodeValue = unlocked ? ' unlocked' : ' locked';
+      chipLock.setAttribute('aria-label', unlocked ? 'Controls unlocked' : 'Controls locked — activate to unlock');
+    }
   }
-  document.querySelectorAll('button.ctl').forEach(function(b){ b.addEventListener('click', function(){ doControl(b); }); });
+  function stage(pw){ stagedPw = pw || ''; if(stagedPw) sessionStorage.setItem('diagpw', stagedPw); else sessionStorage.removeItem('diagpw'); setLock(!!stagedPw); }
+  function showPwErr(msg){ if(pwErr) pwErr.textContent = msg || ''; if(pwInput){ if(msg) pwInput.setAttribute('aria-invalid','true'); else pwInput.removeAttribute('aria-invalid'); } }
+  function focusField(){ if(!pwInput) return; var sec = document.getElementById('controls'); if(sec) sec.scrollIntoView({ block: 'nearest' }); pwInput.focus(); pwInput.classList.add('flash'); setTimeout(function(){ pwInput.classList.remove('flash'); }, 700); }
+  // verify against the side-effect-free probe so Unlock confirms immediately; cb(ok, status).
+  function verify(pw, cb){ fetch('/control/verify', { method: 'POST', headers: { 'X-Diag-Password': pw } }).then(function(r){ cb(r.status === 200, r.status); }).catch(function(){ cb(false, 0); }); }
+
+  if(pwForm){ pwForm.addEventListener('submit', function(e){
+    e.preventDefault();
+    var pw = pwInput ? pwInput.value : '';
+    if(!pw){ stage(''); showPwErr(''); return; }
+    showPwErr('checking…');
+    verify(pw, function(ok, status){
+      if(ok){ stage(pw); showPwErr(''); if(pwInput) pwInput.blur(); }
+      else if(status === 429){ showPwErr('too many attempts — retry shortly'); }
+      else if(status === 401){ stage(''); showPwErr('incorrect password'); if(pwInput) pwInput.focus(); }
+      else { showPwErr('could not reach server'); }
+    });
+  }); }
+  if(lockBtn){ lockBtn.addEventListener('click', function(){ stage(''); if(pwInput) pwInput.value = ''; showPwErr(''); }); }
+  if(chipLock){ chipLock.addEventListener('click', function(e){ if(document.body.dataset.locked === 'true'){ e.preventDefault(); focusField(); } }); }
+
+  // Each control button gets its own adjacent status slot (live region). For a backend
+  // button the slot lives in the btn cell and is naturally cleared when the row reconciles.
+  function slotFor(btn){
+    var s = btn.nextElementSibling;
+    if(!s || !s.classList.contains('ctl-msg')){ s = document.createElement('span'); s.className = 'ctl-msg'; s.setAttribute('role', 'status'); s.setAttribute('aria-live', 'polite'); btn.parentNode.insertBefore(s, btn.nextSibling); }
+    return s;
+  }
+  function setSlot(btn, msg, cls){ var s = slotFor(btn); s.textContent = msg || ''; s.className = 'ctl-msg' + (cls ? ' ' + cls : ''); return s; }
+
+  function doControl(btn){
+    if(needPw && !stagedPw){ setSlot(btn, 'unlock first ↑', 'muted'); focusField(); return; } // locked: route to the field
+    if(btn.dataset.confirm && !confirm(btn.dataset.confirm)) return; // a confirmation, not a result alert
+    var q = ''; if(btn.dataset.op){ q = 'op=' + encodeURIComponent(btn.dataset.op); if(btn.dataset.addr) q += '&addr=' + encodeURIComponent(btn.dataset.addr); }
+    var headers = {}; if(needPw) headers['X-Diag-Password'] = stagedPw;
+    btn.disabled = true; btn.setAttribute('aria-busy', 'true'); setSlot(btn, 'working…', 'muted'); // persists until resolved: "slow" is unambiguous
+    var done = function(){ btn.disabled = false; btn.removeAttribute('aria-busy'); };
+    fetch('/control/' + btn.dataset.action + (q ? '?' + q : ''), { method: 'POST', headers: headers }).then(function(r){
+      if(r.ok){ done(); var s = setSlot(btn, 'done', 'ok'); setTimeout(function(){ if(s.textContent === 'done') s.textContent = ''; }, 4000); poll(); return; }
+      if(r.status === 401){ done(); stage(''); setSlot(btn, 'locked — re-enter password', 'flag'); showPwErr('incorrect password'); focusField(); return; }
+      if(r.status === 429){ done(); setSlot(btn, 'rate-limited — retry shortly', 'flag'); return; }
+      if(r.status === 403){ done(); setSlot(btn, 'refused (cross-site or disabled)', 'flag'); return; }
+      r.text().then(function(t){ done(); setSlot(btn, (t && t.trim()) ? t.trim() : ('error ' + r.status), 'flag'); if(r.status === 404) poll(); }); // 404/5xx: show the server's reason
+    }).catch(function(){ done(); setSlot(btn, 'request failed', 'flag'); }); // network, not auth — stay unlocked
+  }
+  // Delegate clicks so reconciled backend buttons need no re-binding.
+  document.addEventListener('click', function(e){ var b = e.target.closest && e.target.closest('button.ctl'); if(b) doControl(b); });
+
+  setLock(!!stagedPw); // reflect any session password in the chip/body state on load
+  if(needPw && stagedPw){ verify(stagedPw, function(ok, status){ if(!ok && status === 401){ stage(''); showPwErr('session expired — re-enter password'); } }); } // silent re-check
 
   // ---- sticky-offset measurement + ratchet seeding ----
   function setTopbarH(){ var tb = document.querySelector('.topbar'); if(tb) document.documentElement.style.setProperty('--topbar-h', tb.offsetHeight + 'px'); }

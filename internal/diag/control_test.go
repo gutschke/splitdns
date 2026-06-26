@@ -2,11 +2,13 @@ package diag
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gutschke/splitdns/internal/model"
 )
@@ -207,5 +209,149 @@ func TestControlUnknownAction(t *testing.T) {
 	defer stop()
 	if code := post(t, base, "/control/nope", nil, nil); code != http.StatusNotFound {
 		t.Errorf("unknown action: status = %d, want 404", code)
+	}
+}
+
+// postBody is like post but returns the response body too (for oracle-hygiene checks).
+func postBody(t *testing.T, base, path string, header map[string]string) (int, string) {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodPost, base+path, strings.NewReader(""))
+	for k, v := range header {
+		req.Header.Set(k, v)
+	}
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("POST %s: %v", path, err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(b)
+}
+
+// /control/verify is a side-effect-free auth probe so the UI can confirm "unlocked"
+// immediately: correct => 200, wrong => 401, and it runs NO action.
+func TestControlVerify(t *testing.T) {
+	base, flushed, stop := ctlServer(t, Controls{AllowControl: true, Password: "s3cret"}, false)
+	defer stop()
+	if code := post(t, base, "/control/verify", nil, map[string]string{"X-Diag-Password": "s3cret"}); code != http.StatusOK {
+		t.Errorf("verify correct: %d, want 200", code)
+	}
+	if code := post(t, base, "/control/verify", nil, map[string]string{"X-Diag-Password": "wrong"}); code != http.StatusUnauthorized {
+		t.Errorf("verify wrong: %d, want 401", code)
+	}
+	if flushed.Load() != 0 {
+		t.Errorf("verify must have NO side effect; flush fired %d", flushed.Load())
+	}
+}
+
+// verify is gated exactly like a real action: allowed on loopback (no password), refused
+// on a non-loopback no-password bind, and absent entirely when controls are disabled.
+func TestControlVerifyGated(t *testing.T) {
+	lb, _, stopLB := ctlServer(t, Controls{AllowControl: true}, true)
+	defer stopLB()
+	if code := post(t, lb, "/control/verify", nil, nil); code != http.StatusOK {
+		t.Errorf("loopback verify: %d, want 200", code)
+	}
+
+	nlb, _, stopNLB := ctlServer(t, Controls{AllowControl: true}, false)
+	defer stopNLB()
+	if code := post(t, nlb, "/control/verify", nil, nil); code != http.StatusForbidden {
+		t.Errorf("non-loopback no-password verify: %d, want 403", code)
+	}
+
+	snap := testSnap()
+	s := New("127.0.0.1:0", func() *model.Snapshot { return snap }, func() *model.MDNSView { return &model.MDNSView{} }, "t", nil)
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer s.Shutdown(context.Background())
+	if code := post(t, "http://"+s.Addr(), "/control/verify", nil, nil); code != http.StatusNotFound {
+		t.Errorf("disabled-controls verify: %d, want 404 (route absent)", code)
+	}
+}
+
+// A wrong verify and a wrong real action must be indistinguishable (no cleaner oracle).
+func TestControlVerifyOracleHygiene(t *testing.T) {
+	base, _, stop := ctlServer(t, Controls{AllowControl: true, Password: "s3cret"}, false)
+	defer stop()
+	vc, vb := postBody(t, base, "/control/verify", map[string]string{"X-Diag-Password": "wrong"})
+	ac, ab := postBody(t, base, "/control/flush-cache", map[string]string{"X-Diag-Password": "wrong"})
+	if vc != ac || vb != ab {
+		t.Errorf("verify-fail (%d %q) must equal action-fail (%d %q)", vc, vb, ac, ab)
+	}
+}
+
+// Failed-password attempts trigger a shared exponential backoff across verify AND real
+// actions, so a side-effect-free probe can't be a friction-free brute-force oracle.
+func TestControlAuthBackoff(t *testing.T) {
+	var flushed atomic.Int32
+	snap := testSnap()
+	s := New("127.0.0.1:0", func() *model.Snapshot { return snap }, func() *model.MDNSView { return &model.MDNSView{} }, "t", nil)
+	s.WithControls(Controls{AllowControl: true, Password: "s3cret", FlushCache: func() { flushed.Add(1) }})
+	var nowNs atomic.Int64
+	nowNs.Store(time.Unix(1_000_000, 0).UnixNano())
+	s.now = func() time.Time { return time.Unix(0, nowNs.Load()) } // race-safe controllable clock
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer s.Shutdown(context.Background())
+	base := "http://" + s.Addr()
+	wrong := map[string]string{"X-Diag-Password": "nope"}
+	right := map[string]string{"X-Diag-Password": "s3cret"}
+
+	// The first 5 failures are within the grace window: each is a plain 401, no block.
+	for i := 0; i < 5; i++ {
+		if code := post(t, base, "/control/verify", nil, wrong); code != http.StatusUnauthorized {
+			t.Fatalf("grace attempt %d: %d, want 401", i+1, code)
+		}
+	}
+	// The 6th failure arms the backoff; the next attempt is 429 — even with the CORRECT
+	// password, and even against a different endpoint (the throttle is shared).
+	if code := post(t, base, "/control/verify", nil, wrong); code != http.StatusUnauthorized {
+		t.Fatalf("6th wrong: %d, want 401", code)
+	}
+	if code := post(t, base, "/control/flush-cache", nil, right); code != http.StatusTooManyRequests {
+		t.Errorf("correct password during backoff: %d, want 429 (shared throttle)", code)
+	}
+	if flushed.Load() != 0 {
+		t.Errorf("nothing should have flushed during backoff")
+	}
+	// After the window elapses, the correct password works and resets the counter.
+	nowNs.Store(time.Unix(1_000_002, 0).UnixNano()) // +2s > the 1s backoff
+	if code := post(t, base, "/control/flush-cache", nil, right); code != http.StatusOK {
+		t.Fatalf("after backoff, correct password: %d, want 200", code)
+	}
+	if flushed.Load() != 1 {
+		t.Errorf("flush fired %d, want 1", flushed.Load())
+	}
+	// Reset means a fresh single failure is a plain 401 again, not immediately blocked.
+	if code := post(t, base, "/control/verify", nil, wrong); code != http.StatusUnauthorized {
+		t.Errorf("post-reset single failure: %d, want 401", code)
+	}
+}
+
+// The lock UI renders only in password mode; loopback mode shows the controls with no
+// password/lock affordances at all.
+func TestControlLockUI(t *testing.T) {
+	base, _, stop := ctlServer(t, Controls{AllowControl: true, Password: "s3cret"}, true)
+	defer stop()
+	_, html := get(t, base+"/")
+	// pwentry (the field+Unlock group) and lockbtn are toggled mutually exclusively by JS,
+	// so the unlocked state never shows both an Unlock and a Lock button.
+	for _, want := range []string{`id="chip-controls"`, `id="pwerr"`, `id="pwentry"`, `id="lockbtn"`, `/control/verify`} {
+		if !strings.Contains(html, want) {
+			t.Errorf("password-mode HTML missing %q", want)
+		}
+	}
+
+	base2, _, stop2 := ctlServer(t, Controls{AllowControl: true}, true)
+	defer stop2()
+	_, html2 := get(t, base2+"/")
+	if !strings.Contains(html2, `id="controls"`) {
+		t.Error("loopback: the controls section should still render")
+	}
+	if strings.Contains(html2, `id="chip-controls"`) || strings.Contains(html2, `id="pwform"`) {
+		t.Error("loopback (no password) must NOT render the lock chip or password form")
 	}
 }
