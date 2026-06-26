@@ -79,14 +79,18 @@ if [ -e /etc/splitdns/splitdnsd.toml ]; then
 fi
 
 # --- 4. Snapshot the currently-installed packages for rollback ------------------------
+# The rollback snapshot is the safety net for unattended operation, so it is MANDATORY:
+# if we cannot capture a way back to the working binary, we refuse to install (and email)
+# rather than risk leaving DNS on a binary we can't revert. dpkg-repack is a hard
+# dependency, so this should only fail in a genuinely broken environment.
 mkdir -p "$BUILD_DIR/rollback"
 rm -f "$BUILD_DIR/rollback"/*.deb
-if command -v dpkg-repack >/dev/null 2>&1; then
-  ( cd "$BUILD_DIR/rollback" && dpkg-repack splitdnsd splitdns-notify ) \
-    || log "WARN: dpkg-repack snapshot failed; rollback will be limited"
-else
-  log "WARN: dpkg-repack not installed; cannot snapshot current packages for rollback"
-fi
+command -v dpkg-repack >/dev/null 2>&1 \
+  || die "dpkg-repack not installed; cannot snapshot a rollback target — refusing to install (apt install dpkg-repack)"
+( cd "$BUILD_DIR/rollback" && dpkg-repack splitdnsd splitdns-notify ) \
+  || die "dpkg-repack could not snapshot the current packages — refusing to install without a rollback target"
+ls "$BUILD_DIR"/rollback/*.deb >/dev/null 2>&1 \
+  || die "rollback snapshot produced no .deb — refusing to install without a rollback target"
 
 # --- 5. Install, then health-gate; roll back on any failure ---------------------------
 rollback() {

@@ -249,8 +249,8 @@ Architecture: all
 Maintainer: gutschke <gutschke@users.noreply.github.com>
 Section: net
 Priority: optional
-Depends: splitdnsd (>= ${BASE_VERSION}), golang-1.24 | golang-go (>= 2:1.24~), default-mta | mail-transport-agent
-Recommends: dpkg-repack, bind9-dnsutils | dnsutils, debsecan
+Depends: splitdnsd (>= ${BASE_VERSION}), golang-1.24 | golang-go (>= 2:1.24~), default-mta | mail-transport-agent, dpkg-repack
+Recommends: bind9-dnsutils | dnsutils, debsecan
 Homepage: https://github.com/gutschke/splitdns
 Description: unattended security self-rebuild for splitdnsd
  splitdnsd ships as a STATIC Go binary, so its dependencies (the Go standard library and
