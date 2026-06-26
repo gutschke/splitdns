@@ -28,6 +28,10 @@ export GOMAXPROCS
 log() { logger -t splitdnsd-autobuild -- "$*" 2>/dev/null || true; echo "splitdnsd-autobuild: $*"; }
 die() { log "ERROR: $*"; exit 1; }   # non-zero exit => systemd OnFailure= emails the admin
 
+# --force rebuilds even when nothing changed (reinstalling the same version), for testing.
+FORCE=no
+for _a in "$@"; do [ "$_a" = --force ] && FORCE=yes; done
+
 [ "$ENABLE" = yes ] || { log "disabled in $CONF (ENABLE=$ENABLE); skipping"; exit 0; }
 [ -d /run/systemd/system ] || { log "not under systemd; skipping"; exit 0; }
 [ "$(id -u)" = 0 ] || die "must run as root"
@@ -43,10 +47,15 @@ want=$(BASE_VERSION="$base" GO="$("$LIBDIR/select-go.sh" | head -1)" "$LIBDIR/pk
   || die "could not compute target version (no apt Go toolchain?)"
 
 if dpkg --compare-versions "$want" le "$installed"; then
-  log "up to date (installed $installed, target $want); nothing to do"
-  exit 0
+  if [ "$FORCE" = yes ]; then
+    log "--force: rebuilding $installed (target $want) and reinstalling, though nothing changed"
+  else
+    log "up to date (installed $installed, target $want); nothing to do"
+    exit 0
+  fi
+else
+  log "toolchain/source moved: installed $installed -> target $want; rebuilding"
 fi
-log "toolchain/source moved: installed $installed -> target $want; rebuilding"
 
 # --- 2. Rebuild from the shipped source (hermetic, vendored, capped parallelism) ------
 [ -r "$SRC_TARBALL" ] || die "source tarball $SRC_TARBALL missing"
@@ -101,7 +110,10 @@ health_ok() {
   dig +tries=1 +time=2 "@$HEALTH_ADDR" "$HEALTH_NAME" >/dev/null 2>&1
 }
 
-if ! apt-get install -y --allow-downgrades "$srv" "$hlp" >"$BUILD_DIR/install.log" 2>&1; then
+# When --force rebuilt the same (or older) version, install needs --reinstall.
+reinstall=""
+dpkg --compare-versions "$want" le "$installed" && reinstall="--reinstall"
+if ! apt-get install -y --allow-downgrades $reinstall "$srv" "$hlp" >"$BUILD_DIR/install.log" 2>&1; then
   tail -20 "$BUILD_DIR/install.log" | sed 's/^/  install: /'
   rollback
   die "install of $want failed; rolled back to $installed"
