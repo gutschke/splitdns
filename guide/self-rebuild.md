@@ -28,6 +28,11 @@ sudoedit /etc/splitdns/autobuild.conf           # set ADMIN_EMAIL
 Installing `msmtp-mta` *before* `splitdnsd-selfbuild` satisfies its
 `default-mta | mail-transport-agent` dependency, so apt will **not** pull in postfix.
 
+`splitdnsd-selfbuild` does **not** hard-depend on `splitdnsd`/`splitdns-notify` (it
+Recommends them), so any combination of the three packages is a valid install. If either
+binary package is later removed, the self-build rebuilds and **reinstalls** it on its next
+run — to truly remove the resolver, remove `splitdnsd-selfbuild` as well.
+
 ## How it works
 
 - **Trigger.** An apt hook (`/etc/apt/apt.conf.d/80splitdnsd-autobuild`) fires the

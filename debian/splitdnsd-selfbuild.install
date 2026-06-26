@@ -1,0 +1,8 @@
+packaging/autobuild/splitdnsd-autobuild               usr/lib/splitdnsd-selfbuild/
+packaging/autobuild/autobuild-notify                  usr/lib/splitdnsd-selfbuild/
+scripts/pkg-version.sh                                usr/lib/splitdnsd-selfbuild/
+scripts/select-go.sh                                  usr/lib/splitdnsd-selfbuild/
+packaging/autobuild/splitdnsd-autobuild.service           lib/systemd/system/
+packaging/autobuild/splitdnsd-autobuild.timer             lib/systemd/system/
+packaging/autobuild/splitdnsd-autobuild-notify@.service   lib/systemd/system/
+packaging/autobuild/80splitdnsd-autobuild             etc/apt/apt.conf.d/

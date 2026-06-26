@@ -3,7 +3,7 @@ Source: splitdnsd
 Version: 0.1.0
 Architecture: amd64
 Maintainer: gutschke <gutschke@users.noreply.github.com>
-Installed-Size: 3663
+Installed-Size: 3664
 Section: net
 Priority: optional
 Homepage: https://github.com/gutschke/splitdns

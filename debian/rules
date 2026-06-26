@@ -18,6 +18,24 @@ override_dh_auto_test:
 override_dh_auto_clean:
 	rm -f splitdnsd splitdns-notify
 
+# splitdnsd-selfbuild ships a generated source tarball (identical to the build-deb.sh
+# payload) plus a base-version marker and the example config; its static autobuild files
+# come from debian/splitdnsd-selfbuild.install.
+override_dh_install:
+	dh_install
+	install -d debian/splitdnsd-selfbuild/usr/src/splitdnsd
+	./scripts/make-source-tarball.sh debian/splitdnsd-selfbuild/usr/src/splitdnsd/source.tar.gz
+	install -d debian/splitdnsd-selfbuild/usr/lib/splitdnsd-selfbuild
+	printf '%s\n' '$(DEB_VERSION)' > debian/splitdnsd-selfbuild/usr/lib/splitdnsd-selfbuild/VERSION
+	install -D -m0644 packaging/autobuild/autobuild.conf \
+		debian/splitdnsd-selfbuild/usr/share/doc/splitdnsd-selfbuild/autobuild.conf.example
+
+# Enable only the self-build TIMER (its maintainer scripts handle that). Skip
+# dh_installsystemd for the package so it does not enable the oneshot service or the
+# OnFailure notify template.
+override_dh_installsystemd:
+	dh_installsystemd -Nsplitdnsd-selfbuild
+
 # The example config is meant to be copied verbatim — do not gzip it.
 override_dh_compress:
 	dh_compress -X.toml

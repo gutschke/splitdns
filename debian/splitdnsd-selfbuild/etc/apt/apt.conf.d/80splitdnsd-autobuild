@@ -1,0 +1,10 @@
+// splitdnsd self-build trigger. After any dpkg operation (e.g. `apt dist-upgrade`
+// installing a new golang-1.NN), asynchronously check whether splitdnsd needs rebuilding
+// against the new toolchain. `--no-block` keeps the build OUT of the apt transaction: a
+// build failure can never delay or break apt, and DNS is never touched synchronously.
+// The service's own cheap change-detection makes this a fast no-op unless the toolchain
+// actually moved; it is a oneshot, so re-firing while it already runs (including during
+// its own dpkg install) is an idempotent no-op.
+DPkg::Post-Invoke {
+    "if [ -d /run/systemd/system ] && [ -x /usr/lib/splitdnsd-selfbuild/splitdnsd-autobuild ]; then systemctl start --no-block splitdnsd-autobuild.service >/dev/null 2>&1 || true; fi";
+};

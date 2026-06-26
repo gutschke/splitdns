@@ -1,6 +1,6 @@
-f446e3244906506aea42b154a21cf099  usr/bin/splitdns-notify
+9ebcd50eb1528528a4d3af876c1f1932  usr/bin/splitdns-notify
 34d310852d2a0799865cee7b5ba979fd  usr/share/doc/splitdns-notify/changelog.gz
 45edd6a5c6f4a4bc97aa956cacd06497  usr/share/doc/splitdns-notify/copyright
-e3b2abb9108b2aa6f5f6abfbfc62804b  usr/share/doc/splitdns-notify/notify.example.toml
+4088c3719fd7edda11366651bc5d7372  usr/share/doc/splitdns-notify/notify.example.toml
 afe8d1cd4e4cef4c20bfb3e4402fa174  usr/share/lintian/overrides/splitdns-notify
-aced01d6ff845254689f3b9e6d3c5560  usr/share/man/man8/splitdns-notify.8.gz
+1e8e773ef62c6b895a1c2ce54d277d55  usr/share/man/man8/splitdns-notify.8.gz

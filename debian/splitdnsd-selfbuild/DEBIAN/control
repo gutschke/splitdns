@@ -1,0 +1,26 @@
+Package: splitdnsd-selfbuild
+Source: splitdnsd
+Version: 0.1.0
+Architecture: all
+Maintainer: gutschke <gutschke@users.noreply.github.com>
+Installed-Size: 2260
+Depends: init-system-helpers (>= 1.54~), golang-1.24 | golang-go (>= 2:1.24~), default-mta | mail-transport-agent, dpkg-repack
+Recommends: splitdnsd, splitdns-notify, bind9-dnsutils | dnsutils, debsecan
+Section: net
+Priority: optional
+Homepage: https://github.com/gutschke/splitdns
+Description: unattended security self-rebuild for splitdnsd
+ splitdnsd ships as a static Go binary, so its dependencies (the Go
+ standard library and vendored libraries) are baked in at build time and
+ update only on a rebuild — unlike a dynamically linked program, which
+ picks up a patched shared library automatically on apt dist-upgrade.
+ This package closes that gap: it ships the source and rebuilds
+ splitdnsd/splitdns-notify against the current apt Go toolchain whenever
+ it changes (after apt runs, and weekly as a backstop), installing only
+ after config-validation and a DNS health check, with automatic rollback
+ and email-on-failure (via the system mail-transport-agent; install e.g.
+ msmtp-mta, no MTA is hard-coded).
+ .
+ It does NOT hard-depend on splitdnsd/splitdns-notify, so any combination
+ of the three packages is a valid install; if either has been removed,
+ the self-build reinstalls it.

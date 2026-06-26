@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+if [ -d /run/systemd/system ]; then
+  systemctl daemon-reload || true
+fi
+if [ "$1" = "purge" ]; then
+  if command -v deb-systemd-helper >/dev/null 2>&1; then
+    deb-systemd-helper purge splitdnsd-autobuild.timer >/dev/null || true
+  fi
+  rm -rf /var/cache/splitdnsd-selfbuild
+fi
+
+exit 0

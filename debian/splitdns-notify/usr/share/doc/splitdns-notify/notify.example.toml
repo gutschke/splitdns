@@ -9,10 +9,21 @@
 # runs the server can keep everything in splitdnsd.toml instead.
 
 [notify]
-# Unicast resolver target(s) used when the helper is run with no -server flag (host or
-# host:port; default port 5353). Point this at a stable name/VIP that follows the
-# resolver across fail-over to backup hardware. Empty/omitted => multicast only.
+# Delivery uses up to three best-effort channels, all attempted: the local unix socket
+# (tried first), the unicast servers below, and multicast (unless -no-multicast).
+
+# Additional unicast resolver target(s) used when the helper is run with no -server flag
+# (host or host:port; default port 5353). Point these at a stable name/VIP that follows
+# the resolver across fail-over to backup hardware. Empty/omitted does NOT mean "no
+# delivery" — the socket and multicast are still used; set this for resolvers on subnets
+# that multicast does not reach.
 # servers = ["resolver.lan"]
+
+# Resolver unix-socket path (the trusted local DDNS-trigger channel). Default
+# /run/splitdns/notify.sock, matching the resolver's [ddns].notify_socket — so leave it
+# unless you changed that on the resolver. The -socket flag overrides this; -no-socket
+# skips the socket. (Only meaningful when this host IS the resolver; off-box it's absent.)
+# socket = "/run/splitdns/notify.sock"
 
 # --- TSIG signing (optional, recommended for off-box notifiers) ---
 # When a key is set, the announcement is HMAC-signed (RFC 8945) so the resolver can

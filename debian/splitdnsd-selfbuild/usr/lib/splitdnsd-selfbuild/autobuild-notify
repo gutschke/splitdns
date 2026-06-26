@@ -1,0 +1,50 @@
+#!/bin/sh
+# autobuild-notify — invoked by systemd OnFailure= when splitdnsd-autobuild fails. Emails
+# the administrator the recent journal so an UNATTENDED rebuild failure is not silent
+# (the build runs off the apt transaction, so apt itself never reports it).
+#
+# It sends via the system MTA's sendmail interface (so ANY mail-transport-agent works —
+# msmtp-mta, postfix, exim, …; nothing here hard-codes a particular MTA), falling back to
+# the mail(1) command, then to a logged warning if no mailer is present.
+set -eu
+
+CONF=/etc/splitdns/autobuild.conf
+[ -r "$CONF" ] && . "$CONF"
+: "${ADMIN_EMAIL:=root}"
+
+unit=${1:-splitdnsd-autobuild.service}
+host=$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo localhost)
+journal=$(journalctl -u splitdnsd-autobuild.service -n 80 --no-pager 2>/dev/null || echo "(journal unavailable)")
+subject="[splitdnsd] unattended self-build FAILED on ${host}"
+
+body=$(cat <<EOF
+The splitdnsd security self-build (${unit}) FAILED on ${host} at $(date 2>/dev/null).
+
+splitdnsd is a static binary, so it is rebuilt against the apt Go toolchain to pick up
+stdlib security fixes. This rebuild did not complete. If a rollback was possible the
+resolver is still serving its previous, working binary; otherwise check it manually.
+
+Recent log (journalctl -u splitdnsd-autobuild):
+
+${journal}
+EOF
+)
+
+# Prefer the sendmail interface (-t reads recipients from the headers), then mail(1).
+sm=""
+for c in /usr/sbin/sendmail /usr/lib/sendmail sendmail; do
+  command -v "$c" >/dev/null 2>&1 && { sm=$c; break; }
+done
+
+if [ -n "$sm" ]; then
+  printf 'To: %s\nSubject: %s\nFrom: splitdnsd-autobuild <root@%s>\n\n%s\n' \
+    "$ADMIN_EMAIL" "$subject" "$host" "$body" | "$sm" -t \
+    && exit 0
+fi
+if command -v mail >/dev/null 2>&1; then
+  printf '%s\n' "$body" | mail -s "$subject" "$ADMIN_EMAIL" && exit 0
+fi
+
+logger -t splitdnsd-autobuild -- "no MTA (sendmail/mail) available; could not email failure to ${ADMIN_EMAIL}. Install msmtp-mta (or any mail-transport-agent)." 2>/dev/null || true
+echo "splitdnsd-autobuild: no MTA available; failure not emailed to ${ADMIN_EMAIL}" >&2
+exit 0

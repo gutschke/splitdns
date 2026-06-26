@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+- `splitdnsd-selfbuild` no longer hard-depends on `splitdnsd`/`splitdns-notify` (it
+  Recommends them), so any combination of the three packages is a valid install. If
+  either binary package has been removed, the self-build now rebuilds and **reinstalls**
+  it (rather than doing nothing), with the same validate/health-check/rollback path.
+- `splitdnsd-selfbuild` is now also produced by the canonical `debian/` (dpkg-buildpackage)
+  path, not just the `build-deb.sh` fallback; lintian-clean. The source-tarball payload is
+  factored into `scripts/make-source-tarball.sh`, shared by both build paths.
+
 ## [0.1.0] — 2026-06-25
 
 First public release: a split-horizon DNS resolver that mirrors Cloudflare-hosted

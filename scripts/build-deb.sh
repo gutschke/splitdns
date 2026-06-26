@@ -224,8 +224,7 @@ B="$STAGE/selfbuild"
 # private (the repo is pristine by policy, §12). Explicit list, so dist/.git/etc. and the
 # tarball itself are never swept in.
 install -d "$B/usr/src/splitdnsd"
-tar -czf "$B/usr/src/splitdnsd/source.tar.gz" -C "$root" \
-  cmd internal vendor go.mod go.sum man examples packaging scripts Makefile README.md LICENSE THIRD_PARTY_NOTICES.md
+"$root/scripts/make-source-tarball.sh" "$B/usr/src/splitdnsd/source.tar.gz"
 # Autobuild machinery + the version-prediction helpers (cheap, compile-free change-detection).
 install -D -m 0755 packaging/autobuild/splitdnsd-autobuild "$B/usr/lib/splitdnsd-selfbuild/splitdnsd-autobuild"
 install -D -m 0755 packaging/autobuild/autobuild-notify     "$B/usr/lib/splitdnsd-selfbuild/autobuild-notify"
@@ -249,8 +248,8 @@ Architecture: all
 Maintainer: gutschke <gutschke@users.noreply.github.com>
 Section: net
 Priority: optional
-Depends: splitdnsd (>= ${BASE_VERSION}), golang-1.24 | golang-go (>= 2:1.24~), default-mta | mail-transport-agent, dpkg-repack
-Recommends: bind9-dnsutils | dnsutils, debsecan
+Depends: init-system-helpers (>= 1.54~), golang-1.24 | golang-go (>= 2:1.24~), default-mta | mail-transport-agent, dpkg-repack
+Recommends: splitdnsd, splitdns-notify, bind9-dnsutils | dnsutils, debsecan
 Homepage: https://github.com/gutschke/splitdns
 Description: unattended security self-rebuild for splitdnsd
  splitdnsd ships as a STATIC Go binary, so its dependencies (the Go standard library and
