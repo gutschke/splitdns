@@ -94,4 +94,11 @@ func TestLiveUpdateMarkup(t *testing.T) {
 			t.Errorf("live-update markup missing %q", want)
 		}
 	}
+	// Reorganized layout: sticky health strip + in-page nav, sectioned bands, and a
+	// collapsed reference band. These guard the restructure against silent flattening.
+	for _, want := range []string{`class="topbar"`, `id="health"`, `id="chip-mirror"`, `<nav class="toc">`, `<section id="cache">`, `<section id="reference">`, `<details>`} {
+		if !strings.Contains(html, want) {
+			t.Errorf("reorganized layout missing %q", want)
+		}
+	}
 }

@@ -13,6 +13,8 @@ package anscache
 
 import (
 	"container/list"
+	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -272,6 +274,62 @@ func (c *Cache) Stats() Stats {
 	s.Entries = c.ll.Len()
 	s.Capacity = c.cfg.MaxEntries
 	return s
+}
+
+// EntryStat describes one live cache entry for read-only diagnostics — what is actually
+// cached (and how hot it is), beyond the cumulative counters.
+type EntryStat struct {
+	Name string        // lower-cased FQDN
+	Type string        // RR type string (A, AAAA, PTR, …)
+	Kind string        // "positive", "negative", or "fail"
+	DO   bool          // DNSSEC-OK keyed entry
+	Hits uint64        // times this entry has been served
+	Age  time.Duration // since insertion
+	TTL  time.Duration // cached TTL (after floor/cap)
+	Live bool          // within TTL (vs. expired-but-serve-stale-eligible)
+}
+
+// Entries returns up to n live entries, hottest first (ties broken by youngest, then
+// name). It neither records stats nor reorders the LRU, so it is safe to poll. n<=0
+// returns every entry.
+func (c *Cache) Entries(n int) []EntryStat {
+	now := c.now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]EntryStat, 0, len(c.m))
+	for k, el := range c.m {
+		e := el.Value.(*entry)
+		age := now.Sub(e.insertedAt)
+		es := EntryStat{
+			Name: k.Name, Type: dns.TypeToString[k.Qtype], DO: k.DO,
+			Hits: e.hits, Age: age, TTL: e.ttl, Live: age < e.ttl,
+		}
+		if es.Type == "" {
+			es.Type = fmt.Sprintf("TYPE%d", k.Qtype)
+		}
+		switch e.kind {
+		case kindNegative:
+			es.Kind = "negative"
+		case kindFail:
+			es.Kind = "fail"
+		default:
+			es.Kind = "positive"
+		}
+		out = append(out, es)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Hits != out[j].Hits {
+			return out[i].Hits > out[j].Hits
+		}
+		if out[i].Age != out[j].Age {
+			return out[i].Age < out[j].Age
+		}
+		return out[i].Name < out[j].Name
+	})
+	if n > 0 && n < len(out) {
+		out = out[:n]
+	}
+	return out
 }
 
 // cacheable decides whether resp may be cached and with what TTL/kind. Rules per the

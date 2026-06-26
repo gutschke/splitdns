@@ -50,9 +50,20 @@ type Forwarder struct {
 	now            func() time.Time
 
 	mu       sync.Mutex
-	clients  map[string]*dns.Client // keyed by net+serverName
-	breakers map[string]*breaker    // per-upstream, keyed by net+addr
-	disabled map[string]bool        // manually disabled upstreams (by addr), for debugging
+	clients  map[string]*dns.Client  // keyed by net+serverName
+	breakers map[string]*breaker     // per-upstream, keyed by net+addr
+	disabled map[string]bool         // manually disabled upstreams (by addr), for debugging
+	bstats   map[string]*backendStat // per-upstream lifetime counters, keyed by net+addr
+}
+
+// backendStat accumulates lifetime per-upstream telemetry for the diagnostics page.
+// Unlike the breaker's rolling window (which resets on recovery), these never reset, so
+// they answer "how much traffic has this upstream carried, and how fast/reliably".
+type backendStat struct {
+	queries   uint64
+	failures  uint64
+	okLatency time.Duration // summed over successful exchanges only (avg = / successes)
+	lastOK    time.Duration // latency of the most recent successful exchange
 }
 
 // Option customizes a Forwarder at construction (used mainly for the breaker and by
@@ -77,6 +88,7 @@ func newForwarder(cleartext bool, audit func(string), opts []Option) *Forwarder 
 		cleartext: cleartext, perTry: 1500 * time.Millisecond, overall: 4 * time.Second,
 		audit: audit, clients: map[string]*dns.Client{}, breakers: map[string]*breaker{},
 		disabled:       map[string]bool{},
+		bstats:         map[string]*backendStat{},
 		breakerEnabled: true, policy: DefaultPolicy(), now: time.Now,
 	}
 	for _, o := range opts {
@@ -185,7 +197,9 @@ func (f *Forwarder) tryAll(ctx context.Context, req *dns.Msg, ups []Upstream, re
 			continue
 		}
 		allowedAny = true
+		start := f.now()
 		resp, err := f.attempt(ctx, u, req)
+		f.noteAttempt(u, err == nil, f.now().Sub(start))
 		if br != nil {
 			br.record(err == nil)
 		}
@@ -202,7 +216,9 @@ func (f *Forwarder) tryAll(ctx context.Context, req *dns.Msg, ups []Upstream, re
 			if f.isDisabled(u.Addr) {
 				continue // a manual disable is absolute, even under fail-open
 			}
+			start := f.now()
 			resp, err := f.attempt(ctx, u, req)
+			f.noteAttempt(u, err == nil, f.now().Sub(start))
 			if br := f.breakerFor(u); br != nil {
 				br.record(err == nil)
 			}
@@ -242,6 +258,46 @@ type BackendStatus struct {
 	FailRatio float64       `json:"fail_ratio"`
 	OpenFor   time.Duration `json:"open_for"`
 	Cooldown  time.Duration `json:"cooldown_remaining"`
+
+	// Lifetime telemetry (never reset; survives breaker recovery).
+	Queries  uint64        `json:"queries"`  // exchanges attempted against this upstream
+	Failures uint64        `json:"failures"` // of which errored (timeout/refused/etc.)
+	AvgRTT   time.Duration `json:"-"`        // mean latency over successful exchanges
+	LastRTT  time.Duration `json:"-"`        // latency of the most recent success
+}
+
+// noteAttempt records the outcome and latency of one exchange against u (lifetime
+// counters, independent of the breaker's rolling window). Concurrency-safe.
+func (f *Forwarder) noteAttempt(u Upstream, ok bool, d time.Duration) {
+	key := u.Net + "|" + u.Addr
+	f.mu.Lock()
+	bs := f.bstats[key]
+	if bs == nil {
+		bs = &backendStat{}
+		f.bstats[key] = bs
+	}
+	bs.queries++
+	if ok {
+		bs.okLatency += d
+		bs.lastOK = d
+	} else {
+		bs.failures++
+	}
+	f.mu.Unlock()
+}
+
+// statSnapshot returns the lifetime counters for u (zeroes if none recorded yet).
+func (f *Forwarder) statSnapshot(u Upstream) (queries, failures uint64, avgRTT, lastRTT time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	bs := f.bstats[u.Net+"|"+u.Addr]
+	if bs == nil {
+		return 0, 0, 0, 0
+	}
+	if ok := bs.queries - bs.failures; ok > 0 {
+		avgRTT = bs.okLatency / time.Duration(ok)
+	}
+	return bs.queries, bs.failures, avgRTT, bs.lastOK
 }
 
 // Backends returns the health of every configured upstream (DoT primaries, plus the
@@ -251,6 +307,7 @@ func (f *Forwarder) Backends() []BackendStatus {
 	var out []BackendStatus
 	add := func(u Upstream, role string) {
 		bs := BackendStatus{Addr: u.Addr, Net: u.Net, Role: role, State: "n/a", Healthy: true}
+		bs.Queries, bs.Failures, bs.AvgRTT, bs.LastRTT = f.statSnapshot(u)
 		if f.isDisabled(u.Addr) {
 			bs.State, bs.Disabled, bs.Healthy = "disabled", true, false
 			out = append(out, bs)

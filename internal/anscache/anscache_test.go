@@ -354,3 +354,51 @@ func TestFlush(t *testing.T) {
 		t.Errorf("after Flush stats should be reset, got %+v", s)
 	}
 }
+
+// Entries lists what's actually cached, hottest first, with kind/liveness — and it
+// neither records stats nor reorders the LRU (so polling it is side-effect-free).
+func TestEntriesHotListing(t *testing.T) {
+	c, clk := newTestCache(Defaults())
+	kA := keyFor(t, "hot.example.", dns.TypeA)
+	kB := keyFor(t, "cold.example.", dns.TypeA)
+	c.Store(kA, reply("hot.example.", dns.TypeA, dns.RcodeSuccess, []dns.RR{aRecord("hot.example.", 300, "1.2.3.4")}, nil))
+	c.Store(kB, reply("cold.example.", dns.TypeA, dns.RcodeSuccess, []dns.RR{aRecord("cold.example.", 300, "5.6.7.8")}, nil))
+	// Make A hot: three hits vs none for B.
+	for i := 0; i < 3; i++ {
+		if _, res := c.Lookup(kA); res != Fresh {
+			t.Fatalf("lookup A: res = %v, want Fresh", res)
+		}
+	}
+	statsBefore := c.Stats()
+
+	es := c.Entries(0)
+	if len(es) != 2 {
+		t.Fatalf("Entries returned %d, want 2", len(es))
+	}
+	if es[0].Name != "hot.example." || es[0].Hits != 3 {
+		t.Errorf("hottest = %+v, want hot.example. with 3 hits", es[0])
+	}
+	if es[0].Type != "A" || es[0].Kind != "positive" || !es[0].Live {
+		t.Errorf("entry classification wrong: %+v", es[0])
+	}
+	if es[1].Name != "cold.example." || es[1].Hits != 0 {
+		t.Errorf("second = %+v, want cold.example. with 0 hits", es[1])
+	}
+	// Read-only: listing must not have moved the hit counters.
+	if after := c.Stats(); after.Hits != statsBefore.Hits || after.Misses != statsBefore.Misses {
+		t.Errorf("Entries mutated stats: before %+v after %+v", statsBefore, after)
+	}
+
+	// n caps the result.
+	if got := c.Entries(1); len(got) != 1 || got[0].Name != "hot.example." {
+		t.Errorf("Entries(1) = %+v, want just the hottest", got)
+	}
+
+	// An expired-but-stale-eligible entry reports Live=false.
+	clk.add(400 * time.Second)
+	for _, e := range c.Entries(0) {
+		if e.Live {
+			t.Errorf("entry %s should be expired (Live=false) after TTL elapsed", e.Name)
+		}
+	}
+}

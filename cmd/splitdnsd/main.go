@@ -346,6 +346,9 @@ func main() {
 		}
 		return ansCache.Stats(), true
 	})
+	if ansCache != nil {
+		diagSrv.WithCacheEntries(ansCache.Entries)
+	}
 	diagSrv.WithQueryLog(queryLog)
 	diagSrv.WithBackends(fwd.Backends)
 	diagSrv.WithWorkers(sup.Stats)

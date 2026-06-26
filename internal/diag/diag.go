@@ -38,8 +38,9 @@ type Server struct {
 	addr           string
 	snapshot       func() *model.Snapshot
 	view           func() *model.MDNSView
-	cacheStats     func() (anscache.Stats, bool) // nil or (_, false) => cache disabled
-	qlog           *qlog.Log                     // query telemetry; nil => section omitted
+	cacheStats     func() (anscache.Stats, bool)    // nil or (_, false) => cache disabled
+	cacheEntries   func(n int) []anscache.EntryStat // nil => hottest-entries table omitted
+	qlog           *qlog.Log                        // query telemetry; nil => section omitted
 	backends       func() []forwarder.BackendStatus
 	workers        func() map[string]supervisor.WorkerStats
 	selftest       func(context.Context) []TestResult
@@ -73,6 +74,13 @@ func New(addr string, snapshot func() *model.Snapshot, view func() *model.MDNSVi
 // returns (stats, true) when the cache is enabled and (zero, false) when it is off.
 func (s *Server) WithCacheStats(fn func() (anscache.Stats, bool)) *Server {
 	s.cacheStats = fn
+	return s
+}
+
+// WithCacheEntries wires a provider listing the hottest live cache entries (read-only;
+// it neither records stats nor touches LRU order). nil omits the per-entry table.
+func (s *Server) WithCacheEntries(fn func(n int) []anscache.EntryStat) *Server {
+	s.cacheEntries = fn
 	return s
 }
 
@@ -593,7 +601,19 @@ type controlsView struct {
 // cacheView is the forward-path answer-cache summary (RFC 2308/8767/9520 caching).
 type cacheView struct {
 	anscache.Stats
-	HitRatio string `json:"hit_ratio"` // "NN.N%" over hits+misses, for at-a-glance reading
+	HitRatio string           `json:"hit_ratio"`             // "NN.N%" over hits+misses, for at-a-glance reading
+	Hot      []cacheEntryView `json:"hot_entries,omitempty"` // hottest live entries (what is actually cached)
+}
+
+// cacheEntryView is one live cache entry: what is cached, its class, and how hot it is.
+type cacheEntryView struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+	Kind string `json:"kind"` // positive / negative / fail
+	Hits uint64 `json:"hits"`
+	Live bool   `json:"live"` // within TTL (vs. serve-stale-eligible)
+	TTL  string `json:"ttl"`  // pre-rendered remaining/total
+	Age  string `json:"age"`  // pre-rendered time since insertion
 }
 
 // queryStats is the query-telemetry rollup plus the recent ring and busiest clients.
@@ -618,10 +638,16 @@ type queryView struct {
 }
 
 type clientView struct {
-	Client   string `json:"client"`
-	Name     string `json:"name,omitempty"`
-	Count    uint64 `json:"count"`
-	LastSeen string `json:"last_seen"`
+	Client   string          `json:"client"`
+	Name     string          `json:"name,omitempty"`
+	Count    uint64          `json:"count"`
+	LastSeen string          `json:"last_seen"`
+	TopNames []nameCountView `json:"top_names,omitempty"` // this client's most-asked names
+}
+
+type nameCountView struct {
+	Name  string `json:"name"`
+	Count uint64 `json:"count"`
 }
 
 type backendView struct {
@@ -636,6 +662,11 @@ type backendView struct {
 	FailPct   string  `json:"-"` // pre-rendered "NN%" for the HTML view
 	OpenFor   string  `json:"open_for,omitempty"`
 	Cooldown  string  `json:"cooldown_remaining,omitempty"`
+
+	Queries  uint64 `json:"queries"`           // lifetime exchanges against this upstream
+	Failures uint64 `json:"failures"`          // of which errored
+	AvgRTT   string `json:"avg_rtt,omitempty"` // mean latency over successes, pre-rendered
+	LastRTT  string `json:"-"`                 // most-recent success latency (HTML title)
 }
 
 type workerView struct {
@@ -726,6 +757,9 @@ func (s *Server) build() page {
 	if s.cacheStats != nil {
 		if st, on := s.cacheStats(); on {
 			p.Cache = &cacheView{Stats: st, HitRatio: hitRatio(st.Hits, st.Misses)}
+			if s.cacheEntries != nil {
+				p.Cache.Hot = buildCacheEntries(s.cacheEntries(cacheEntryLimit))
+			}
 		}
 	}
 	if s.qlog != nil {
@@ -789,14 +823,42 @@ func buildQueryStats(l *qlog.Log, nameFor func(netip.Addr) string) *queryStats {
 		})
 	}
 	for _, c := range l.TopClients(20) {
-		qs.Top = append(qs.Top, clientView{
+		cv := clientView{
 			Client:   addrStr(c.Client),
 			Name:     name(c.Client),
 			Count:    c.Count,
 			LastSeen: c.LastSeen.Format("15:04:05"),
-		})
+		}
+		for _, nc := range c.TopNames {
+			cv.TopNames = append(cv.TopNames, nameCountView{Name: nc.Name, Count: nc.Count})
+		}
+		qs.Top = append(qs.Top, cv)
 	}
 	return qs
+}
+
+// cacheEntryLimit caps how many hot cache entries the page lists (the cache may hold
+// thousands; the table only surfaces the busiest).
+const cacheEntryLimit = 50
+
+func buildCacheEntries(es []anscache.EntryStat) []cacheEntryView {
+	out := make([]cacheEntryView, 0, len(es))
+	for _, e := range es {
+		ttl := e.TTL.Round(time.Second).String()
+		if e.Live {
+			// Remaining vs. configured TTL, so an operator sees how fresh it is.
+			if rem := (e.TTL - e.Age).Round(time.Second); rem > 0 {
+				ttl = rem.String() + " / " + ttl
+			}
+		} else {
+			ttl = "expired (stale-ok)"
+		}
+		out = append(out, cacheEntryView{
+			Name: e.Name, Type: e.Type, Kind: e.Kind, Hits: e.Hits, Live: e.Live,
+			TTL: ttl, Age: e.Age.Round(time.Second).String(),
+		})
+	}
+	return out
 }
 
 func buildBackends(bs []forwarder.BackendStatus) []backendView {
@@ -806,12 +868,19 @@ func buildBackends(bs []forwarder.BackendStatus) []backendView {
 			Addr: b.Addr, Net: b.Net, Role: b.Role, State: b.State, Healthy: b.Healthy,
 			Disabled: b.Disabled, Consec: b.Consec, FailRatio: b.FailRatio,
 			FailPct: fmt.Sprintf("%.0f%%", b.FailRatio*100),
+			Queries: b.Queries, Failures: b.Failures,
 		}
 		if b.OpenFor > 0 {
 			bv.OpenFor = b.OpenFor.Round(time.Second).String()
 		}
 		if b.Cooldown > 0 {
 			bv.Cooldown = b.Cooldown.Round(time.Second).String()
+		}
+		if b.AvgRTT > 0 {
+			bv.AvgRTT = fmt.Sprintf("%.1f ms", float64(b.AvgRTT.Microseconds())/1000)
+		}
+		if b.LastRTT > 0 {
+			bv.LastRTT = fmt.Sprintf("%.1f ms", float64(b.LastRTT.Microseconds())/1000)
 		}
 		out = append(out, bv)
 	}
@@ -940,13 +1009,37 @@ func sortRR(rr []rrView) {
 var pageTmpl = template.Must(template.New("diag").Parse(`<!doctype html>
 <html><head><meta charset="utf-8"><title>splitdnsd diagnostics</title>
 <style>
+:root{--topbar-h:0px}
 body{font:14px/1.4 system-ui,sans-serif;margin:1.5rem;color:#222}
-h1{font-size:1.3rem} h2{font-size:1.05rem;margin-top:1.5rem;border-bottom:1px solid #ddd}
-table{border-collapse:collapse;margin:.3rem 0} td,th{padding:.15rem .6rem;text-align:left}
+h1{font-size:1.3rem;margin:0 0 .3rem}
+h2{font-size:1.05rem;margin:1.4rem 0 0;border-bottom:1px solid #ddd;position:sticky;top:var(--topbar-h);background:#fff;z-index:2;padding:.15rem 0}
+h3{font-size:.95rem;margin:.8rem 0 .2rem}
+section{scroll-margin-top:calc(var(--topbar-h) + .5rem)}
+table{border-collapse:collapse;margin:.3rem 0} td,th{padding:.15rem .6rem;text-align:left;vertical-align:top}
 td{font-variant-numeric:tabular-nums} /* stop counters jittering column width on update */
+[data-live] td,[data-live] th{box-sizing:border-box;white-space:nowrap} /* stable, never-shrink columns */
 tr:nth-child(even){background:#f6f6f6} .flag{color:#b00;font-weight:600}
 .ok{color:#080} .muted{color:#777} table.sortable th{cursor:pointer}
+/* sticky header for long tables (e.g. recent queries); box-shadow stands in for the
+   collapsed bottom border, which a sticky cell otherwise drops. */
+table.sortable thead th{position:sticky;top:calc(var(--topbar-h) + 1.9rem);background:#fff;z-index:1;box-shadow:inset 0 -1px 0 #ccc}
+/* sticky top chrome: at-a-glance health strip + in-page section nav */
+.topbar{position:sticky;top:0;z-index:5;background:#fff;border-bottom:1px solid #ddd;margin:.2rem -1.5rem .3rem;padding:.35rem 1.5rem}
+.health{display:flex;flex-wrap:wrap;gap:.4rem;align-items:center}
+.chip{display:inline-flex;gap:.35rem;align-items:center;text-decoration:none;color:#222;border:1px solid #ccc;border-radius:1rem;padding:.05rem .65rem;font-size:.85rem;white-space:nowrap}
+.chip b{font-variant-numeric:tabular-nums} .chip .lbl{color:#777}
+.chip.ok{border-color:#9c9} .chip.flag{border-color:#e88;background:#fdeaea}
+nav.toc{margin-top:.3rem;font-size:.85rem;line-height:1.9}
+nav.toc a{color:#36c;text-decoration:none} nav.toc a:hover{text-decoration:underline}
+nav.toc a:not(:first-child)::before{content:"·";color:#ccc;margin:0 .45rem}
+details>summary{cursor:pointer;color:#36c} details>summary::marker{color:#999}
+details.zone{margin:.3rem 0} details.zone>summary{font-weight:600;color:#222}
+@media print{
+  .topbar{display:none} h2,table.sortable thead th{position:static;box-shadow:none}
+  details{display:block} details>summary{display:none} details>*{display:block!important}
+}
 </style></head><body>
+<header id="status">
 <h1>splitdnsd diagnostics <span class="muted">{{.Version}}</span></h1>
 <p>Built {{.BuiltAt}} — Cloudflare mirror:
 {{if .CFHealthy}}<span class="ok">healthy</span>{{else}}<span class="flag">degraded (serving stale)</span>{{end}}</p>
@@ -956,8 +1049,28 @@ tr:nth-child(even){background:#f6f6f6} .flag{color:#b00;font-weight:600}
 addr <input name="addr" size="16" placeholder="1.2.3.4 (public)">
 <button name="explore" value="" title="exactly what write-back does with your current config">As configured &rarr;</button>
 <button name="explore" value="1" title="ignore the eligibility allowlist — explore what enabling this host would do">Explore: ignore allowlist &rarr;</button></form>{{end}}
+</header>
+
+<div class="topbar">
+<div class="health" id="health">
+<a class="chip {{if .CFHealthy}}ok{{else}}flag{{end}}" id="chip-mirror" href="#status"><span class="lbl">mirror</span> {{if .CFHealthy}}OK{{else}}stale{{end}}</a>
+{{if .Backends}}<a class="chip" id="chip-upstreams" href="#upstreams"><span class="lbl">upstreams</span> <b>{{len .Backends}}</b></a>{{end}}
+{{with .Cache}}<a class="chip" id="chip-cache" href="#cache"><span class="lbl">cache</span> <b>{{.HitRatio}}</b></a>{{end}}
+{{with .Workers}}<a class="chip" id="chip-workers" href="#workers"><span class="lbl">workers</span> <b>{{len .}}</b></a>{{end}}
+{{with .Queries}}<a class="chip" id="chip-queries" href="#queries"><span class="lbl">queries</span> <b>{{.Total}}</b></a>{{end}}
+</div>
+<nav class="toc">
+{{if .Controls}}<a href="#controls">Controls</a>{{end}}
+{{if .Backends}}<a href="#upstreams">Upstreams</a>{{end}}
+{{if .Cache}}<a href="#cache">Cache</a>{{end}}
+{{if .Workers}}<a href="#workers">Workers</a>{{end}}
+{{if .Queries}}<a href="#queries">Queries</a>{{end}}
+<a href="#reference">Reference</a>
+</nav>
+</div>
 
 {{with .Controls}}
+<section id="controls">
 <h2>Controls <span class="flag">danger</span></h2>
 <div id="ctl" data-need-pw="{{.NeedPassword}}">
 {{if .NeedPassword}}<form id="pwform" autocomplete="on" style="margin:.2rem 0">
@@ -969,19 +1082,11 @@ addr <input name="addr" size="16" placeholder="1.2.3.4 (public)">
 {{if .RefreshMirror}}<button class="ctl" data-action="refresh-mirror">Force mirror refresh</button>{{end}}
 {{if .Restart}}<button class="ctl" data-action="restart" data-confirm="Restart the daemon?">Restart daemon</button>{{end}}
 </div>
-{{end}}
-
-{{with .Cache}}
-<h2>Answer cache <span class="muted">forward path</span></h2>
-<div data-live="answer_cache"><table>
-<tr><th>hit ratio</th><td data-f="hit_ratio">{{.HitRatio}}</td><th>entries</th><td data-f="entries">{{.Entries}} / {{.Capacity}}</td></tr>
-<tr><th>hits</th><td data-f="hits">{{.Hits}}</td><th>misses</th><td data-f="misses">{{.Misses}}</td></tr>
-<tr><th>stale serves</th><td data-f="stale_serves">{{.StaleServes}}</td><th>servfail hits</th><td data-f="fail_hits">{{.FailHits}}</td></tr>
-<tr><th>inserts</th><td data-f="inserts">{{.Inserts}}</td><th>evictions</th><td data-f="evictions">{{.Evictions}}</td></tr>
-</table></div>
+</section>
 {{end}}
 
 {{if .Backends}}
+<section id="upstreams">
 <h2>Upstreams <span class="muted">circuit breaker</span></h2>
 <p class="muted">Selection is <b>sequential failover</b>: queries go to the first healthy
 upstream in this order; if it fails or its breaker is open, the next is tried, and so on.
@@ -989,18 +1094,38 @@ It is NOT round-robin or query-all-take-first. (If every upstream is tripped the
 fails open and tries them anyway.){{if and $.Controls $.Controls.Backend}} Use the
 buttons to disable/enable an upstream on the fly (until re-enabled or restart) to force
 traffic onto another.{{end}}</p>
-<div data-live="backends"><table><thead><tr><th>backend</th><th>net</th><th>role</th><th>state</th><th>consec fails</th><th>fail ratio</th><th>tripped for</th><th>cooldown</th>{{if and $.Controls $.Controls.Backend}}<th></th>{{end}}</tr></thead><tbody>
+<div data-live="backends"><table><thead><tr><th>backend</th><th>net</th><th>role</th><th>state</th><th>consec fails</th><th>fail ratio</th><th>tripped for</th><th>cooldown</th><th>queries</th><th>fails</th><th>avg rtt</th>{{if and $.Controls $.Controls.Backend}}<th></th>{{end}}</tr></thead><tbody>
 {{range .Backends}}<tr data-key="{{.Addr}}">
 <td data-f="addr">{{.Addr}}</td><td data-f="net">{{.Net}}</td><td data-f="role">{{.Role}}</td>
 <td data-f="state" class="{{if .Healthy}}ok{{else}}flag{{end}}">{{.State}}</td>
 <td data-f="consecutive_failures">{{.Consec}}</td><td data-f="fail_ratio">{{.FailPct}}</td>
 <td data-f="open_for" class="muted">{{.OpenFor}}</td><td data-f="cooldown_remaining" class="muted">{{.Cooldown}}</td>
+<td data-f="queries">{{.Queries}}</td><td data-f="failures"{{if .Failures}} class="flag"{{end}}>{{.Failures}}</td><td data-f="avg_rtt" class="muted"{{if .LastRTT}} title="last {{.LastRTT}}"{{end}}>{{.AvgRTT}}</td>
 {{if and $.Controls $.Controls.Backend}}<td data-f="btn">{{if .Disabled}}<button class="ctl" data-action="backend" data-op="enable" data-addr="{{.Addr}}">enable</button>{{else}}<button class="ctl" data-action="backend" data-op="disable" data-addr="{{.Addr}}">disable</button>{{end}}</td>{{end}}</tr>
 {{end}}</tbody></table></div>
 {{if and $.Controls $.Controls.Backend}}<button class="ctl" data-action="backend" data-op="reset">Reset backend overrides</button>{{end}}
+</section>
+{{end}}
+
+{{with .Cache}}
+<section id="cache">
+<h2>Answer cache <span class="muted">forward path</span></h2>
+<div data-live="answer_cache"><table>
+<tr><th>hit ratio</th><td data-f="hit_ratio">{{.HitRatio}}</td><th>entries</th><td data-f="entries">{{.Entries}} / {{.Capacity}}</td></tr>
+<tr><th>hits</th><td data-f="hits">{{.Hits}}</td><th>misses</th><td data-f="misses">{{.Misses}}</td></tr>
+<tr><th>stale serves</th><td data-f="stale_serves">{{.StaleServes}}</td><th>servfail hits</th><td data-f="fail_hits">{{.FailHits}}</td></tr>
+<tr><th>inserts</th><td data-f="inserts">{{.Inserts}}</td><th>evictions</th><td data-f="evictions">{{.Evictions}}</td></tr>
+</table>
+{{if .Hot}}<details><summary>Hottest entries <span class="muted">(what's cached, by hit count — click a header to sort)</span></summary>
+<table class="sortable" data-rows="hot_entries" data-defsort="3:num:desc"><thead><tr><th>name</th><th>type</th><th>kind</th><th>hits</th><th>ttl left / total</th><th>age</th></tr></thead><tbody>
+{{range .Hot}}<tr data-key="{{.Name}}|{{.Type}}"><td data-f="name">{{.Name}}</td><td data-f="type">{{.Type}}</td><td data-f="kind"{{if ne .Kind "positive"}} class="flag"{{end}}>{{.Kind}}</td><td data-f="hits">{{.Hits}}</td><td data-f="ttl" class="muted">{{.TTL}}</td><td data-f="age" class="muted">{{.Age}}</td></tr>{{end}}</tbody></table>
+</details>{{end}}
+</div>
+</section>
 {{end}}
 
 {{with .Workers}}
+<section id="workers">
 <h2>Workers <span class="muted">supervisor</span></h2>
 <div data-live="workers"><table><thead><tr><th>worker</th><th>restarts</th><th>stalls</th><th>panics</th><th>last progress</th></tr></thead><tbody>
 {{range .}}<tr data-key="{{.Name}}"><td data-f="name">{{.Name}}</td>
@@ -1009,43 +1134,47 @@ traffic onto another.{{end}}</p>
 <td data-f="panics"{{if .Panics}} class="flag"{{end}}>{{.Panics}}</td>
 <td data-f="progress_age" class="muted">{{.ProgressAge}} ago</td></tr>
 {{end}}</tbody></table></div>
+</section>
 {{end}}
 
 {{with .Queries}}
+<section id="queries">
 <h2>Queries</h2>
 <div data-live="queries">
 <p><b data-f="total">{{.Total}}</b> total, <b data-f="clients">{{.Clients}}</b> clients</p>
 <p class="muted" data-f="by_decision">{{range $d, $n := .ByDecision}}{{$d}}={{$n}} {{end}}</p>
-<h3>Busiest clients <span class="muted">(click a header to sort)</span></h3>
-<table class="sortable" data-rows="top_clients" data-defsort="2:num:desc"><thead><tr><th>client</th><th>name</th><th>queries</th><th>last seen</th></tr></thead><tbody>
-{{range .Top}}<tr data-key="{{.Client}}"><td data-f="client">{{.Client}}</td><td data-f="name" class="muted">{{.Name}}</td><td data-f="count">{{.Count}}</td><td data-f="last_seen" class="muted">{{.LastSeen}}</td></tr>{{end}}</tbody></table>
+<h3>Busiest clients <span class="muted">(recent activity — counts decay ~10&nbsp;min half-life; click a header to sort)</span></h3>
+<table class="sortable" data-rows="top_clients" data-defsort="2:num:desc"><thead><tr><th>client</th><th>name</th><th>queries</th><th>last seen</th><th>top names</th></tr></thead><tbody>
+{{range .Top}}<tr data-key="{{.Client}}"><td data-f="client">{{.Client}}</td><td data-f="name" class="muted">{{.Name}}</td><td data-f="count">{{.Count}}</td><td data-f="last_seen" class="muted">{{.LastSeen}}</td><td data-f="top_names" class="muted">{{range .TopNames}}{{.Name}} ({{.Count}}) {{end}}</td></tr>{{end}}</tbody></table>
 <h3>Recent queries <span class="muted">(click a header to sort)</span></h3>
 <table class="sortable" data-rows="recent" data-defsort="key:num:desc"><thead><tr><th>time</th><th>client</th><th>name</th><th>type</th><th>decision</th><th>rcode</th><th>ms</th></tr></thead><tbody>
 {{range .Recent}}<tr data-key="{{.Seq}}"><td data-f="time" class="muted">{{.Time}}</td><td data-f="client">{{.Client}}{{if .ClientName}} <span data-f="cname" class="muted">{{.ClientName}}</span>{{end}}</td><td data-f="name">{{.Name}}</td><td data-f="type">{{.Type}}</td>
 <td data-f="decision">{{.Decision}}</td><td data-f="rcode">{{.Rcode}}</td><td data-f="ms">{{printf "%.1f" .LatencyMS}}</td></tr>{{end}}</tbody></table>
 </div>
+</section>
 {{end}}
 
+<section id="reference">
+<h2>Reference <span class="muted">zones &amp; static maps — click to expand</span></h2>
 {{range .Zones}}
-<h2>{{.Apex}} <span class="muted">serial {{.Serial}}</span>
-{{if .Stale}}<span class="flag">STALE</span>{{end}}
-{{if .SyntheticStale}}<span class="flag">SYNTHETIC-STALE</span>{{end}}</h2>
+<details class="zone"><summary>{{.Apex}} <span class="muted">serial {{.Serial}}</span>{{if .Stale}} <span class="flag">STALE</span>{{end}}{{if .SyntheticStale}} <span class="flag">SYNTHETIC-STALE</span>{{end}}</summary>
 <table><tr><th>owner</th><th>type</th><th>ttl</th><th>rdata</th><th></th></tr>
 {{range .Records}}<tr><td>{{.Owner}}</td><td>{{.Type}}</td><td>{{.TTL}}</td><td>{{.RDATA}}</td>
 <td class="muted">{{if .Synthetic}}synthetic {{end}}{{if .Proxied}}proxied{{end}}</td></tr>
 {{end}}</table>
+</details>
 {{end}}
-
-<h2>Reverse zones</h2><table>{{range .Reverse}}<tr><td>{{.}}</td></tr>{{end}}</table>
-<h2>Stub zones</h2><table>{{range .Stub}}<tr><td>{{.Apex}}</td><td>{{range .Targets}}{{.}} {{end}}</td></tr>{{end}}</table>
-<h2>VHosts</h2><p>reverse proxy {{.VHostV4}} {{.VHostV6}}</p>
-<table>{{range .VHosts}}<tr><td>{{.}}</td></tr>{{end}}</table>
-<h2>mDNS forward</h2><div data-live="mdns_forward"><table><tbody>
+<details><summary>Reverse zones</summary><table>{{range .Reverse}}<tr><td>{{.}}</td></tr>{{end}}</table></details>
+<details><summary>Stub zones</summary><table>{{range .Stub}}<tr><td>{{.Apex}}</td><td>{{range .Targets}}{{.}} {{end}}</td></tr>{{end}}</table></details>
+<details><summary>VHosts</summary><p>reverse proxy {{.VHostV4}} {{.VHostV6}}</p>
+<table>{{range .VHosts}}<tr><td>{{.}}</td></tr>{{end}}</table></details>
+<details><summary>mDNS forward</summary><div data-live="mdns_forward"><table><tbody>
 {{range .MDNSFwd}}<tr data-key="{{.Name}}"><td data-f="name">{{.Name}}</td><td data-f="records">{{range .Records}}{{.}}; {{end}}</td></tr>{{end}}
-</tbody></table></div>
-<h2>mDNS reverse</h2><div data-live="mdns_reverse"><table><tbody>
+</tbody></table></div></details>
+<details><summary>mDNS reverse</summary><div data-live="mdns_reverse"><table><tbody>
 {{range .MDNSRev}}<tr data-key="{{.Name}}"><td data-f="name">{{.Name}}</td><td data-f="records">{{range .Records}}{{.}}; {{end}}</td></tr>{{end}}
-</tbody></table></div>
+</tbody></table></div></details>
+</section>
 <script>
 (function(){
   'use strict';
@@ -1112,6 +1241,9 @@ traffic onto another.{{end}}</p>
     patchText(fcell(tr, 'consecutive_failures'), x.consecutive_failures);
     patchText(fcell(tr, 'fail_ratio'), Math.round((x.fail_ratio || 0) * 100) + '%');
     patchText(fcell(tr, 'open_for'), x.open_for || ''); patchText(fcell(tr, 'cooldown_remaining'), x.cooldown_remaining || '');
+    patchText(fcell(tr, 'queries'), x.queries || 0);
+    var fa = fcell(tr, 'failures'); patchText(fa, x.failures || 0); var fcls = x.failures ? 'flag' : ''; if(fa.className !== fcls) fa.className = fcls;
+    patchText(fcell(tr, 'avg_rtt'), x.avg_rtt || '');
     var cell = fcell(tr, 'btn');
     if(cell){
       var op = x.disabled ? 'enable' : 'disable', b = cell.querySelector('button');
@@ -1123,7 +1255,7 @@ traffic onto another.{{end}}</p>
     }
   }
   function makeBackend(x){ var tr = document.createElement('tr');
-    tr.innerHTML = '<td data-f="addr"></td><td data-f="net"></td><td data-f="role"></td><td data-f="state"></td><td data-f="consecutive_failures"></td><td data-f="fail_ratio"></td><td data-f="open_for" class="muted"></td><td data-f="cooldown_remaining" class="muted"></td>';
+    tr.innerHTML = '<td data-f="addr"></td><td data-f="net"></td><td data-f="role"></td><td data-f="state"></td><td data-f="consecutive_failures"></td><td data-f="fail_ratio"></td><td data-f="open_for" class="muted"></td><td data-f="cooldown_remaining" class="muted"></td><td data-f="queries"></td><td data-f="failures"></td><td data-f="avg_rtt" class="muted"></td>';
     if(document.querySelector('[data-live="backends"] [data-f="btn"]')) tr.appendChild(td('', null)).setAttribute('data-f', 'btn');
     fillBackend(tr, x); return tr; }
 
@@ -1156,6 +1288,13 @@ traffic onto another.{{end}}</p>
     answer_cache: function(root, d){
       ['hits','misses','stale_serves','fail_hits','inserts','evictions','hit_ratio'].forEach(function(n){ patchText(fcell(root, n), d[n]); });
       patchText(fcell(root, 'entries'), d.entries + ' / ' + d.capacity);
+      var hot = root.querySelector('table[data-rows="hot_entries"]'); // present only when entries are wired
+      if(hot){
+        reconcile(hot.tBodies[0], d.hot_entries || [], function(x){ return x.name + '|' + x.type; },
+          function(x){ var tr = document.createElement('tr'); tr.innerHTML = '<td data-f="name"></td><td data-f="type"></td><td data-f="kind"></td><td data-f="hits"></td><td data-f="ttl" class="muted"></td><td data-f="age" class="muted"></td>'; fcell(tr,'name').textContent = x.name; fcell(tr,'type').textContent = x.type; return tr; },
+          function(tr, x){ var k = fcell(tr,'kind'); patchText(k, x.kind); var kc = (x.kind === 'positive') ? '' : 'flag'; if(k.className !== kc) k.className = kc; patchText(fcell(tr,'hits'), x.hits); patchText(fcell(tr,'ttl'), x.ttl || ''); patchText(fcell(tr,'age'), x.age || ''); });
+        applySort(hot);
+      }
     },
     workers: function(root, d){
       reconcile(root.querySelector('tbody'), d, function(x){ return x.name; },
@@ -1173,8 +1312,8 @@ traffic onto another.{{end}}</p>
       patchText(fcell(root, 'by_decision'), bd);
       var top = root.querySelector('table[data-rows="top_clients"]');
       reconcile(top.tBodies[0], d.top_clients || [], function(x){ return x.client; },
-        function(x){ var tr = document.createElement('tr'); tr.innerHTML = '<td data-f="client"></td><td data-f="name" class="muted"></td><td data-f="count"></td><td data-f="last_seen" class="muted"></td>'; fcell(tr,'client').textContent = x.client; return tr; },
-        function(tr, x){ patchText(fcell(tr,'name'), x.name || ''); patchText(fcell(tr,'count'), x.count); patchText(fcell(tr,'last_seen'), x.last_seen || ''); });
+        function(x){ var tr = document.createElement('tr'); tr.innerHTML = '<td data-f="client"></td><td data-f="name" class="muted"></td><td data-f="count"></td><td data-f="last_seen" class="muted"></td><td data-f="top_names" class="muted"></td>'; fcell(tr,'client').textContent = x.client; return tr; },
+        function(tr, x){ patchText(fcell(tr,'name'), x.name || ''); patchText(fcell(tr,'count'), x.count); patchText(fcell(tr,'last_seen'), x.last_seen || ''); patchText(fcell(tr,'top_names'), (x.top_names || []).map(function(n){ return n.name + ' (' + n.count + ')'; }).join(' ')); });
       applySort(top);
       var rec = root.querySelector('table[data-rows="recent"]');
       reconcile(rec.tBodies[0], d.recent || [], function(x){ return x.seq; }, makeRecent, fillRecent); // only the client name can change
@@ -1184,13 +1323,47 @@ traffic onto another.{{end}}</p>
     mdns_reverse: mdnsPatch
   };
 
+  // ---- column-width ratchet: columns only ever WIDEN on live update; reset on reload ----
+  // Measure natural widths in auto-layout, then pin them in fixed-layout on the reference
+  // row (thead row if present, else first body row). State (max-seen widths) lives on the
+  // <table> node, so it dies with the DOM and resets on a full reload.
+  function measureRow(tr, nat){ if(!tr) return; for(var c=0;c<tr.cells.length && c<nat.length;c++){ var w=tr.cells[c].getBoundingClientRect().width; if(w>nat[c]) nat[c]=w; } }
+  function ratchet(table){
+    if(!table || !table.tBodies[0] || table.offsetParent===null) return; // skip hidden (closed <details>)
+    var body=table.tBodies[0], ref=(table.tHead && table.tHead.rows[0]) || body.rows[0];
+    if(!ref || !ref.cells.length) return;
+    var n=ref.cells.length, max=table._cw||(table._cw=[]); while(max.length<n) max.push(0);
+    table.style.tableLayout='auto';                                  // measure unhindered by our pins
+    for(var c=0;c<n;c++){ if(ref.cells[c]) ref.cells[c].style.width=''; }
+    var nat=new Array(n).fill(0); measureRow(ref,nat);
+    var rows=body.rows, len=rows.length, cap=200, step=len<=cap?1:Math.ceil(len/cap);
+    for(var i=0;i<len;i+=step) measureRow(rows[i],nat);
+    for(var k=0;k<n;k++){ if(nat[k]>max[k]) max[k]=nat[k]; }          // ratchet up only
+    table.style.tableLayout='fixed';                                 // pin in same synchronous task (no flicker)
+    for(var m=0;m<n;m++){ if(ref.cells[m]) ref.cells[m].style.width=max[m]+'px'; }
+  }
+  function ratchetIn(root){ root.querySelectorAll('table').forEach(ratchet); }
+
+  // ---- at-a-glance health strip: derived client-side from the full /diag.json ----
+  function chip(id, ok, html){ var c=document.getElementById('chip-'+id); if(!c) return; c.className='chip '+(ok?'ok':'flag'); c.innerHTML=html; }
+  function updateHealth(d){
+    if(!document.getElementById('health')) return;
+    if('cf_healthy' in d) chip('mirror', d.cf_healthy, '<span class="lbl">mirror</span> '+(d.cf_healthy?'OK':'stale'));
+    if(d.backends){ var up=0; d.backends.forEach(function(b){ if(b.healthy) up++; }); chip('upstreams', up===d.backends.length, '<span class="lbl">upstreams</span> <b>'+up+'/'+d.backends.length+'</b>'); }
+    if(d.answer_cache) chip('cache', true, '<span class="lbl">cache</span> <b>'+d.answer_cache.hit_ratio+'</b>');
+    if(d.workers){ var bad=0; d.workers.forEach(function(w){ bad+=(w.restarts||0)+(w.stalls||0)+(w.panics||0); }); chip('workers', bad===0, '<span class="lbl">workers</span> '+(bad?bad+' events':'OK')); }
+    if(d.queries) chip('queries', true, '<span class="lbl">queries</span> <b>'+d.queries.total+'</b>');
+  }
+
   function patchSection(root, data){
     if(locked(root)){ root._dirty = data; return; } // defer while the user is selecting/typing here
     root._dirty = null;
     var fn = patchers[root.dataset.live]; if(fn) fn(root, data);
+    ratchetIn(root); // after reconcile + applySort: widen-only column widths
   }
   function patchAll(data){
     document.querySelectorAll('[data-live]').forEach(function(root){ var k = root.dataset.live; if(data[k] !== undefined) patchSection(root, data[k]); });
+    updateHealth(data);
   }
   function flushDirty(){ document.querySelectorAll('[data-live]').forEach(function(root){ if(root._dirty && !locked(root)) patchSection(root, root._dirty); }); }
 
@@ -1228,6 +1401,14 @@ traffic onto another.{{end}}</p>
     }).catch(function(e){ alert('Request failed: ' + e); });
   }
   document.querySelectorAll('button.ctl').forEach(function(b){ b.addEventListener('click', function(){ doControl(b); }); });
+
+  // ---- sticky-offset measurement + ratchet seeding ----
+  function setTopbarH(){ var tb = document.querySelector('.topbar'); if(tb) document.documentElement.style.setProperty('--topbar-h', tb.offsetHeight + 'px'); }
+  setTopbarH(); window.addEventListener('resize', setTopbarH);
+  // Re-ratchet tables when a <details> opens (they have no layout while closed).
+  document.addEventListener('toggle', function(e){ if(e.target.tagName === 'DETAILS' && e.target.open) ratchetIn(e.target); }, true);
+  document.querySelectorAll('[data-live] table').forEach(ratchet); // seed widths from server-rendered content
+  setTopbarH();
 
   poll(); // kick off live updates
 })();

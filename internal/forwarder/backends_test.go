@@ -102,3 +102,33 @@ func TestBackendsFallbackVisibility(t *testing.T) {
 		t.Errorf("cleartext on: %d backends, want 2 (primary + fallback)", got)
 	}
 }
+
+// Backends() carries lifetime per-upstream telemetry (queries/failures/avg RTT) that
+// survives breaker recovery — answering "how much traffic, how fast, how reliable".
+func TestBackendsLifetimeStats(t *testing.T) {
+	u := Upstream{Addr: "192.0.2.1:853", Net: "tcp-tls", ServerName: "r.example"}
+	f := NewWithUpstreams([]Upstream{u}, nil, false, nil)
+
+	// Two successes (10ms, 30ms) and one failure.
+	f.noteAttempt(u, true, 10*time.Millisecond)
+	f.noteAttempt(u, true, 30*time.Millisecond)
+	f.noteAttempt(u, false, 2*time.Second)
+
+	bs := f.Backends()[0]
+	if bs.Queries != 3 || bs.Failures != 1 {
+		t.Errorf("queries/failures = %d/%d, want 3/1", bs.Queries, bs.Failures)
+	}
+	// Avg is over successes only (failures must not pollute it): (10+30)/2 = 20ms.
+	if bs.AvgRTT != 20*time.Millisecond {
+		t.Errorf("avg RTT = %v, want 20ms (successes only)", bs.AvgRTT)
+	}
+	if bs.LastRTT != 30*time.Millisecond {
+		t.Errorf("last RTT = %v, want 30ms (most recent success)", bs.LastRTT)
+	}
+
+	// An upstream with no traffic reports zeroes (no division by zero).
+	f2 := NewWithUpstreams([]Upstream{u}, nil, false, nil)
+	if z := f2.Backends()[0]; z.Queries != 0 || z.AvgRTT != 0 {
+		t.Errorf("untouched upstream = %+v, want zero stats", z)
+	}
+}
