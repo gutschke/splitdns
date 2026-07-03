@@ -176,11 +176,16 @@ func BaseSnapshot(cfg config.Config, revZones []string) *model.Snapshot {
 				TTL: 60, Content: "127.0.0.1",
 			}},
 		},
-		Excluded: map[string]bool{},
-		BuiltAt:  time.Now(),
+		Excluded:     map[string]bool{},
+		DDNSEligible: map[string]bool{},
+		BuiltAt:      time.Now(),
 	}
 	for _, z := range cfg.VHost.ExcludeZones {
 		snap.Excluded[dns.Fqdn(strings.ToLower(z))] = true
+	}
+	// Managed (DDNS-writable) names: the mDNS overlay must not shadow these (see resolver).
+	for _, e := range cfg.DDNS.Eligible {
+		snap.DDNSEligible[dns.Fqdn(strings.ToLower(strings.TrimSpace(e)))] = true
 	}
 	var allow []string
 	for _, z := range revZones {

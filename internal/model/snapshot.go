@@ -9,15 +9,20 @@ import (
 // single atomic.Pointer load (§2.1, §2.3). Build a new one and Store it; never
 // mutate a published Snapshot.
 type Snapshot struct {
-	Zones       map[string]*Zone     // canonical apex FQDN (trailing dot) -> zone
-	StubZones   map[string]*StubZone // FQDN -> forward target (sub.example.com.)
-	ReverseZ    map[string]*RevZone  // configured PTR zones (e.g. 2.0.192.in-addr.arpa.)
-	VHosts      map[string]bool      // redirect set from :818 (relative labels)
-	Excluded    map[string]bool      // apex FQDNs NOT subject to vhost redirect (config-driven)
-	Static      map[string][]RR      // static specials + seeded hosts (forward + PTR)
-	AllowSuffix []string             // authoritative/stub/static suffixes (rebind scope, §4.2)
-	BuiltAt     time.Time
-	CFHealthy   bool // false => serving stale CF data (degraded)
+	Zones     map[string]*Zone     // canonical apex FQDN (trailing dot) -> zone
+	StubZones map[string]*StubZone // FQDN -> forward target (sub.example.com.)
+	ReverseZ  map[string]*RevZone  // configured PTR zones (e.g. 2.0.192.in-addr.arpa.)
+	VHosts    map[string]bool      // redirect set from :818 (relative labels)
+	Excluded  map[string]bool      // apex FQDNs NOT subject to vhost redirect (config-driven)
+	Static    map[string][]RR      // static specials + seeded hosts (forward + PTR)
+	// DDNSEligible is the set of DDNS-writable FQDNs (lowercased, trailing dot). These
+	// names are "managed" — their address comes from Cloudflare via the AUTHENTICATED
+	// write-back path — so the split-horizon mDNS overlay must never let an unauthenticated
+	// mDNS announcement shadow their A/AAAA (Q9 / §4.2 trust boundary).
+	DDNSEligible map[string]bool
+	AllowSuffix  []string // authoritative/stub/static suffixes (rebind scope, §4.2)
+	BuiltAt      time.Time
+	CFHealthy    bool // false => serving stale CF data (degraded)
 
 	// VHostV4/VHostV6 are the reverse proxy redirect targets the R3 vhost/naked/www rule
 	// answers with (design §2.4 step 6). Zero value => that family is NODATA.

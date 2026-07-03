@@ -569,3 +569,64 @@ func TestMDNSZoneOverlay(t *testing.T) {
 		t.Errorf("explicit CF owner should win over mDNS, got %v", answers(m, dns.TypeA))
 	}
 }
+
+// The mDNS overlay yields to MANAGED names: a DDNS-eligible owner is not shadowed by a raw
+// mDNS announcement (it falls through to the wildcard), while a non-eligible one overlays.
+func TestMDNSOverlayEligibilityGuard(t *testing.T) {
+	zone := &model.Zone{
+		Apex: "z.test.", SOA: soa("z.test."),
+		Records: map[string]map[uint16][]model.RR{}, ENT: map[string]bool{},
+		Wildcards:  map[uint16][]model.RR{dns.TypeA: {a("203.0.113.9")}},
+		TunnelAddr: map[string]map[uint16][]model.RR{},
+	}
+	snap := &model.Snapshot{
+		Zones:        map[string]*model.Zone{"z.test.": zone},
+		DDNSEligible: map[string]bool{"host.z.test.": true}, // managed name
+	}
+	view := &model.MDNSView{Forward: map[string][]model.RR{
+		"host": {a("10.0.0.5")}, // eligible -> must NOT shadow
+		"free": {a("10.0.0.6")}, // not eligible -> overlays
+	}}
+	if _, m := ask(t, snap, view, "host.z.test.", dns.TypeA); len(answers(m, dns.TypeA)) != 1 || answers(m, dns.TypeA)[0] != "203.0.113.9" {
+		t.Errorf("eligible name must fall to the wildcard, not mDNS; A = %v, want 203.0.113.9", answers(m, dns.TypeA))
+	}
+	if _, m := ask(t, snap, view, "free.z.test.", dns.TypeA); len(answers(m, dns.TypeA)) != 1 || answers(m, dns.TypeA)[0] != "10.0.0.6" {
+		t.Errorf("non-eligible mDNS host should overlay; A = %v, want 10.0.0.6", answers(m, dns.TypeA))
+	}
+}
+
+// An overridden name (vhost/mDNS) never inherits the wildcard's SVCB — it would point the
+// client back at the public endpoint.
+func TestOverrideStripsSVCB(t *testing.T) {
+	zone := &model.Zone{
+		Apex: "z.test.", SOA: soa("z.test."),
+		Records: map[string]map[uint16][]model.RR{}, ENT: map[string]bool{},
+		Wildcards: map[uint16][]model.RR{
+			dns.TypeSVCB: {{Type: dns.TypeSVCB, Class: dns.ClassINET, TTL: 300, Content: `1 . alpn="h2"`}},
+			dns.TypeMX:   {{Type: dns.TypeMX, Class: dns.ClassINET, TTL: 300, Priority: 10, Target: "mail.z.test."}},
+		},
+		TunnelAddr: map[string]map[uint16][]model.RR{},
+	}
+	// Sanity: a plain wildcard name DOES serve the SVCB (so the strip assertions aren't vacuous).
+	plain := &model.Snapshot{Zones: map[string]*model.Zone{"z.test.": zone}}
+	if _, m := ask(t, plain, &model.MDNSView{}, "plain.z.test.", dns.TypeSVCB); len(m.Answer) != 1 {
+		t.Fatalf("wildcard SVCB should serve for a plain name, got %+v (parse issue?)", m.Answer)
+	}
+	// vhost: SVCB stripped, ANY excludes it but keeps MX.
+	snapV := &model.Snapshot{Zones: map[string]*model.Zone{"z.test.": zone}, VHosts: map[string]bool{"app": true}, VHostV4: netip.MustParseAddr("10.0.0.7")}
+	if _, m := ask(t, snapV, &model.MDNSView{}, "app.z.test.", dns.TypeSVCB); len(m.Answer) != 0 {
+		t.Errorf("vhost SVCB should be NODATA, got %+v", m.Answer)
+	}
+	if _, m := ask(t, snapV, &model.MDNSView{}, "app.z.test.", dns.TypeANY); hasType(m, dns.TypeSVCB) || !hasType(m, dns.TypeMX) {
+		t.Errorf("vhost ANY should have MX but not SVCB, got %+v", m.Answer)
+	}
+	// mDNS: same.
+	snapM := &model.Snapshot{Zones: map[string]*model.Zone{"z.test.": zone}}
+	viewM := &model.MDNSView{Forward: map[string][]model.RR{"host": {a("10.0.0.5")}}}
+	if _, m := ask(t, snapM, viewM, "host.z.test.", dns.TypeSVCB); len(m.Answer) != 0 {
+		t.Errorf("mDNS SVCB should be NODATA, got %+v", m.Answer)
+	}
+	if _, m := ask(t, snapM, viewM, "host.z.test.", dns.TypeANY); hasType(m, dns.TypeSVCB) || !hasType(m, dns.TypeMX) {
+		t.Errorf("mDNS ANY should have MX but not SVCB, got %+v", m.Answer)
+	}
+}

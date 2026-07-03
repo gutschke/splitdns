@@ -245,13 +245,16 @@ func answerZoneOrVHost(snap *model.Snapshot, view *model.MDNSView, req *dns.Msg,
 	// owner but IS known on the LAN via mDNS serves its mDNS address(es) directly (so it is
 	// reachable + SSH-able on the LAN under its zone name) and inherits the rest — MX/TXT/…
 	// — from the wildcard. Address families the mDNS host lacks are NODATA, never the
-	// wildcard's public address. NOTE: this lets a trusted-LAN mDNS announcement shadow the
-	// A/AAAA of a non-vhost zone subdomain (same trust basis as the *.local plane).
-	if zone != nil && view != nil {
-		if zone.Records[owner] == nil && zone.TunnelAddr[owner] == nil {
-			if mrecs := view.Forward[owner]; len(mrecs) > 0 {
-				return Outcome{Msg: mdnsZoneReply(zone, req, name, owner, qtype, mrecs)}
-			}
+	// wildcard's public address.
+	//
+	// The overlay yields to HIGHER-PRIORITY hosts so a rogue mDNS announcement can't hijack
+	// a managed name: it applies ONLY when the owner is neither an explicit CF record
+	// (hard-coded) nor DDNS-eligible (managed via the authenticated write-back path). This
+	// is the same trust boundary as the *.local plane, minus the managed names.
+	if zone != nil && view != nil &&
+		zone.Records[owner] == nil && zone.TunnelAddr[owner] == nil && !snap.DDNSEligible[name] {
+		if mrecs := view.Forward[owner]; len(mrecs) > 0 {
+			return Outcome{Msg: mdnsZoneReply(zone, req, name, owner, qtype, mrecs)}
 		}
 	}
 	// Step 7 — authoritative CF zone.
@@ -294,14 +297,15 @@ func mdnsZoneReply(zone *model.Zone, req *dns.Msg, name, owner string, qtype uin
 	case dns.TypeANY:
 		appendMatching(resp, mrecs, name, dns.TypeANY) // all mDNS address records
 		for t, rrs := range zone.Wildcards {
-			if t == dns.TypeA || t == dns.TypeAAAA || t == dns.TypeCNAME || t == dns.TypeHTTPS {
+			if overrideStripped(t) {
 				continue
 			}
 			appendMatching(resp, rrs, name, t)
 		}
 		return resp
-	case dns.TypeCNAME, dns.TypeHTTPS:
-		// An mDNS host has no CNAME/HTTPS; leave NODATA.
+	case dns.TypeCNAME, dns.TypeHTTPS, dns.TypeSVCB:
+		// An mDNS host's address is local; CNAME/HTTPS/SVCB (which would point at the
+		// wildcard's public endpoint) are stripped to NODATA.
 	default:
 		appendMatching(resp, zone.Wildcards[qtype], name, qtype) // MX/TXT/CAA/… from the wildcard
 	}
@@ -309,6 +313,18 @@ func mdnsZoneReply(zone *model.Zone, req *dns.Msg, name, owner string, qtype uin
 		setNegativeSOA(resp, zone.SOA, zone.Apex, dns.RcodeSuccess) // NODATA (the name exists via mDNS)
 	}
 	return resp
+}
+
+// overrideStripped reports whether an RR type is address- or service-binding and so is NOT
+// inherited from the wildcard for a name whose address is overridden (vhost/mDNS): the
+// address (A/AAAA) is served locally, and CNAME/HTTPS/SVCB would otherwise (re)direct the
+// client to the wildcard's PUBLIC endpoint, defeating the split horizon.
+func overrideStripped(t uint16) bool {
+	switch t {
+	case dns.TypeA, dns.TypeAAAA, dns.TypeCNAME, dns.TypeHTTPS, dns.TypeSVCB:
+		return true
+	}
+	return false
 }
 
 // vhostInherited returns the RRsets a redirected name inherits for NON-address types:
@@ -339,12 +355,13 @@ func vhostReply(snap *model.Snapshot, req *dns.Msg, name, owner string, qtype ui
 			resp.Answer = append(resp.Answer, addrRR(name, dns.TypeAAAA, snap.VHostV6.String(), vhostTTL))
 			return resp
 		}
-	case dns.TypeCNAME, dns.TypeHTTPS:
-		// Explicitly stripped on the redirect path.
+	case dns.TypeCNAME, dns.TypeHTTPS, dns.TypeSVCB:
+		// Address/service-binding RRsets are stripped on the redirect path (they must not
+		// point at the wildcard's public endpoint).
 	case dns.TypeANY:
 		// Functional ANY on a redirected name: the reverse-proxy address(es), plus the
 		// inherited non-address RRsets (mail/zone metadata) — real records at the apex,
-		// otherwise the wildcard. Address and CNAME/HTTPS RRsets stay redirect-controlled.
+		// otherwise the wildcard. Address/CNAME/HTTPS/SVCB RRsets stay redirect-controlled.
 		if snap.VHostV4.IsValid() {
 			resp.Answer = append(resp.Answer, addrRR(name, dns.TypeA, snap.VHostV4.String(), vhostTTL))
 		}
@@ -352,7 +369,7 @@ func vhostReply(snap *model.Snapshot, req *dns.Msg, name, owner string, qtype ui
 			resp.Answer = append(resp.Answer, addrRR(name, dns.TypeAAAA, snap.VHostV6.String(), vhostTTL))
 		}
 		for t, rrs := range vhostInherited(zone, owner) {
-			if t == dns.TypeA || t == dns.TypeAAAA || t == dns.TypeCNAME || t == dns.TypeHTTPS {
+			if overrideStripped(t) {
 				continue
 			}
 			appendMatching(resp, rrs, name, t)
