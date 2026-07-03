@@ -98,14 +98,14 @@ func resolverArpa(snap *model.Snapshot, req *dns.Msg, name string, qtype uint16)
 	if snap.DDR == nil || name != "_dns.resolver.arpa." || (qtype != dns.TypeSVCB && qtype != dns.TypeANY) {
 		return resp // NODATA (ANY enumerates the SVCB, like the rest of the local horizon)
 	}
-	prio := uint16(1)
+	var prio uint16
 	if e := snap.DDR.DoT; e != nil {
-		resp.Answer = append(resp.Answer, ddrSVCB(snap.DDR, prio, []string{"dot"}, e.Port, ""))
 		prio++
+		resp.Answer = append(resp.Answer, ddrSVCB(snap.DDR, prio, []string{"dot"}, e.Port, ""))
 	}
 	if e := snap.DDR.DoH; e != nil {
-		resp.Answer = append(resp.Answer, ddrSVCB(snap.DDR, prio, []string{"h2"}, e.Port, e.Path+"{?dns}"))
 		prio++
+		resp.Answer = append(resp.Answer, ddrSVCB(snap.DDR, prio, []string{"h2"}, e.Port, e.Path+"{?dns}"))
 	}
 	return resp
 }
