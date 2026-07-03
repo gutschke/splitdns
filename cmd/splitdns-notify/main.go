@@ -90,7 +90,7 @@ func run(argv []string, out, errOut *os.File) int {
 	var (
 		cfgPath     = fs.String("config", "", "config file for [notify] (default: /etc/splitdns/notify.toml then splitdnsd.toml)")
 		port        = fs.Int("port", 5353, "mDNS UDP port for every target")
-		ttl         = fs.Uint("ttl", 120, "advertised record TTL in seconds")
+		ttl         = fs.Uint("ttl", 900, "advertised record TTL in seconds; MUST exceed your re-announce interval (splitdnsd drops the record when it elapses) — comfortably above the longest interval avoids a resolve gap")
 		noMulticast = fs.Bool("no-multicast", false, "do not announce to the link-local mDNS multicast groups")
 		cacheFlush  = fs.Bool("cache-flush", false, "set the mDNS cache-flush bit so receivers replace prior records")
 		quiet       = fs.Bool("quiet", false, "suppress per-target progress and soft-error messages")

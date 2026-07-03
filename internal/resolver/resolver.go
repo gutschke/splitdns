@@ -253,8 +253,13 @@ func answerZoneOrVHost(snap *model.Snapshot, view *model.MDNSView, req *dns.Msg,
 	// is the same trust boundary as the *.local plane, minus the managed names.
 	if zone != nil && view != nil &&
 		zone.Records[owner] == nil && zone.TunnelAddr[owner] == nil && !snap.DDNSEligible[name] {
-		if mrecs := view.Forward[owner]; len(mrecs) > 0 {
-			return Outcome{Msg: mdnsZoneReply(zone, req, name, owner, qtype, mrecs)}
+		// Only LOCAL-scope addresses (those in a managed reverse zone — the site's own v4
+		// LAN / GUA / ULA spaces) qualify: a host's public-Internet, CGNAT/Tailscale, or
+		// docker address is not how it's reached on the LAN, so serving it under the split-
+		// horizon name would push a LAN client off-net. If the host announces no local
+		// address, the overlay is skipped and the name falls to the wildcard.
+		if local := localScopeAddrs(view.Forward[owner]); len(local) > 0 {
+			return Outcome{Msg: mdnsZoneReply(zone, req, name, owner, qtype, local)}
 		}
 	}
 	// Step 7 — authoritative CF zone.
@@ -284,6 +289,38 @@ func isVHostCandidate(snap *model.Snapshot, apex, owner string) bool {
 // APEX still serves its real non-address RRsets (MX/SOA/NS/CAA/TXT/TLSA) — only a
 // pure www/vhost LABEL is address-only. (Inverting this would break mail/zone
 // metadata for a redirected apex.)
+// localScopeAddrs filters mDNS address records to those reachable within the site's own
+// network — the split-horizon test for what may appear under a CF zone name. It keeps
+// private (RFC1918 + ULA) and routed IPv6 GUA addresses — which span every internal subnet,
+// not just those that happen to have a configured reverse zone — and drops public IPv4,
+// CGNAT/Tailscale (100.64/10), link-local, and loopback: addresses that are not how a LAN
+// client reaches the host.
+func localScopeAddrs(mrecs []model.RR) []model.RR {
+	out := make([]model.RR, 0, len(mrecs))
+	for _, r := range mrecs {
+		if r.Type != dns.TypeA && r.Type != dns.TypeAAAA {
+			continue
+		}
+		if ip, err := netip.ParseAddr(r.Content); err == nil && isLocalScope(ip) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// isLocalScope reports whether an address is reachable on the site's internal network:
+// RFC1918 v4 / ULA v6 (IsPrivate) or a routed IPv6 global-unicast address. It excludes
+// public IPv4, CGNAT (100.64/10 — not IsPrivate), link-local, and loopback.
+func isLocalScope(ip netip.Addr) bool {
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return false
+	}
+	if ip.IsPrivate() { // RFC1918 v4 + ULA v6
+		return true
+	}
+	return ip.Is6() && ip.IsGlobalUnicast() // routed IPv6 GUA (the site's ISP prefix)
+}
+
 // mdnsZoneReply answers a CF-zone subdomain that resolves to an mDNS-known host: its
 // address record(s) come from the mDNS view, every other type is inherited from the
 // wildcard (split-horizon). A missing address family is NODATA — never the wildcard's

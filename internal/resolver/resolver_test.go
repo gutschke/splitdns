@@ -24,6 +24,11 @@ func cname(target string) model.RR {
 	return model.RR{Type: dns.TypeCNAME, Class: dns.ClassINET, TTL: 300, Content: target}
 }
 
+// rz10 is a reverse zone covering 10.0.0.0/8 so test mDNS addresses (10.x) count as local.
+func rz10() map[string]*model.RevZone {
+	return map[string]*model.RevZone{"10.in-addr.arpa.": {Apex: "10.in-addr.arpa.", SOA: soa("10.in-addr.arpa.")}}
+}
+
 func buildSnap() (*model.Snapshot, *model.MDNSView) {
 	example := &model.Zone{
 		Apex: "example.com.",
@@ -543,7 +548,7 @@ func TestMDNSZoneOverlay(t *testing.T) {
 		},
 		TunnelAddr: map[string]map[uint16][]model.RR{},
 	}
-	snap := &model.Snapshot{Zones: map[string]*model.Zone{"z.test.": zone}} // no vhost redirect
+	snap := &model.Snapshot{Zones: map[string]*model.Zone{"z.test.": zone}, ReverseZ: rz10()} // no vhost redirect
 	view := &model.MDNSView{Forward: map[string][]model.RR{"host": {a("10.0.0.5")}}}
 
 	if _, m := ask(t, snap, view, "host.z.test.", dns.TypeA); len(answers(m, dns.TypeA)) != 1 || answers(m, dns.TypeA)[0] != "10.0.0.5" {
@@ -581,6 +586,7 @@ func TestMDNSOverlayEligibilityGuard(t *testing.T) {
 	}
 	snap := &model.Snapshot{
 		Zones:        map[string]*model.Zone{"z.test.": zone},
+		ReverseZ:     rz10(),
 		DDNSEligible: map[string]bool{"host.z.test.": true}, // managed name
 	}
 	view := &model.MDNSView{Forward: map[string][]model.RR{
@@ -621,12 +627,41 @@ func TestOverrideStripsSVCB(t *testing.T) {
 		t.Errorf("vhost ANY should have MX but not SVCB, got %+v", m.Answer)
 	}
 	// mDNS: same.
-	snapM := &model.Snapshot{Zones: map[string]*model.Zone{"z.test.": zone}}
+	snapM := &model.Snapshot{Zones: map[string]*model.Zone{"z.test.": zone}, ReverseZ: rz10()}
 	viewM := &model.MDNSView{Forward: map[string][]model.RR{"host": {a("10.0.0.5")}}}
 	if _, m := ask(t, snapM, viewM, "host.z.test.", dns.TypeSVCB); len(m.Answer) != 0 {
 		t.Errorf("mDNS SVCB should be NODATA, got %+v", m.Answer)
 	}
 	if _, m := ask(t, snapM, viewM, "host.z.test.", dns.TypeANY); hasType(m, dns.TypeSVCB) || !hasType(m, dns.TypeMX) {
 		t.Errorf("mDNS ANY should have MX but not SVCB, got %+v", m.Answer)
+	}
+}
+
+// The overlay serves only site-local addresses: RFC1918 v4, ULA, and routed IPv6 GUA are
+// kept across ALL internal subnets (not just those with a reverse zone); public IPv4 and
+// CGNAT/Tailscale (100.64/10) are dropped.
+func TestOverlayLocalScopeFilter(t *testing.T) {
+	zone := &model.Zone{
+		Apex: "z.test.", SOA: soa("z.test."),
+		Records: map[string]map[uint16][]model.RR{}, ENT: map[string]bool{},
+		Wildcards:  map[uint16][]model.RR{dns.TypeA: {a("203.0.113.9")}},
+		TunnelAddr: map[string]map[uint16][]model.RR{},
+	}
+	snap := &model.Snapshot{Zones: map[string]*model.Zone{"z.test.": zone}} // no reverse zones at all
+	view := &model.MDNSView{Forward: map[string][]model.RR{"cam": {
+		a("172.20.0.90"),            // internal subnet (RFC1918) w/o a reverse zone -> KEEP
+		a("100.64.0.21"),            // CGNAT / Tailscale (100.64/10) -> DROP
+		a("198.51.100.78"),          // public IPv4 -> DROP
+		aaaa("2001:db8::114"),       // routed GUA -> KEEP
+		aaaa("fd12:3456:789a::114"), // ULA -> KEEP
+	}}}
+	_, m := ask(t, snap, view, "cam.z.test.", dns.TypeA)
+	got := answers(m, dns.TypeA)
+	if len(got) != 1 || got[0] != "172.20.0.90" {
+		t.Errorf("overlay A = %v, want only the internal-subnet [172.20.0.90] (public/CGNAT dropped)", got)
+	}
+	_, m6 := ask(t, snap, view, "cam.z.test.", dns.TypeAAAA)
+	if got := answers(m6, dns.TypeAAAA); len(got) != 2 {
+		t.Errorf("overlay AAAA = %v, want GUA + ULA (both site-local)", got)
 	}
 }
