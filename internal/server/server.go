@@ -92,9 +92,10 @@ type result struct {
 func (s *Server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	start := time.Now()
 	ip := clientIP(w.RemoteAddr())
+	transport := transportOf(w)
 	res := result{decision: qlog.Servfail, rcode: dns.RcodeServerFailure}
 	if s.cfg.QueryLog != nil {
-		defer func() { s.recordQuery(start, ip, req, res) }()
+		defer func() { s.recordQuery(start, ip, transport, req, res) }()
 	}
 
 	// Client access control (refuse beats allow).
@@ -144,20 +145,36 @@ func (s *Server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 }
 
 // recordQuery appends one telemetry entry (single-question queries only).
-func (s *Server) recordQuery(start time.Time, ip netip.Addr, req *dns.Msg, res result) {
+func (s *Server) recordQuery(start time.Time, ip netip.Addr, transport string, req *dns.Msg, res result) {
 	if len(req.Question) != 1 {
 		return
 	}
 	q := req.Question[0]
 	s.cfg.QueryLog.Record(qlog.Entry{
-		Time:     start,
-		Client:   ip,
-		Name:     q.Name,
-		Qtype:    dns.TypeToString[q.Qtype],
-		Decision: res.decision,
-		Rcode:    dns.RcodeToString[res.rcode],
-		Latency:  time.Since(start),
+		Time:      start,
+		Client:    ip,
+		Transport: transport,
+		Name:      q.Name,
+		Qtype:     dns.TypeToString[q.Qtype],
+		Decision:  res.decision,
+		Rcode:     dns.RcodeToString[res.rcode],
+		Latency:   time.Since(start),
 	})
+}
+
+// transportOf labels the transport a request arrived on. Encrypted front-ends decorate
+// the ResponseWriter with a Transport() method ("dot"/"doh"); a plain Do53 writer has
+// none, so we fall back to the TCP/UDP distinction.
+func transportOf(w dns.ResponseWriter) string {
+	if t, ok := w.(interface{ Transport() string }); ok {
+		if s := t.Transport(); s != "" {
+			return s
+		}
+	}
+	if isTCP(w) {
+		return "tcp"
+	}
+	return "udp"
 }
 
 func (s *Server) forward(w dns.ResponseWriter, req *dns.Msg, do func(context.Context) (*dns.Msg, error), rebind bool, snap *model.Snapshot, res *result) {

@@ -38,14 +38,15 @@ const (
 
 // Entry is one recorded query.
 type Entry struct {
-	Seq      uint64 // monotonic id assigned at Record time (stable key for live updates)
-	Time     time.Time
-	Client   netip.Addr
-	Name     string
-	Qtype    string
-	Decision Decision
-	Rcode    string
-	Latency  time.Duration
+	Seq       uint64 // monotonic id assigned at Record time (stable key for live updates)
+	Time      time.Time
+	Client    netip.Addr
+	Transport string // "udp", "tcp", "dot", or "doh"
+	Name      string
+	Qtype     string
+	Decision  Decision
+	Rcode     string
+	Latency   time.Duration
 }
 
 // NameCount is one query name and its decayed recent-activity score (rounded).
@@ -58,10 +59,11 @@ type NameCount struct {
 // (rounded) — roughly "queries within the last few HalfLifes", not a lifetime total.
 // TopNames is populated only by TopClients (for the clients it returns).
 type ClientStat struct {
-	Client   netip.Addr
-	Count    uint64
-	LastSeen time.Time
-	TopNames []NameCount
+	Client     netip.Addr
+	Count      uint64
+	LastSeen   time.Time
+	TopNames   []NameCount
+	Transports []NameCount // lifetime per-transport counts (udp/tcp/dot/doh) — did they upgrade?
 }
 
 // clientAgg is the internal per-client accumulator. score and the per-name scores are
@@ -69,11 +71,12 @@ type ClientStat struct {
 // float64 (no per-name clock). lastSeen is the real wall-clock of the last query, kept
 // undecayed for display.
 type clientAgg struct {
-	client   netip.Addr
-	score    float64            // decayed activity score
-	names    map[string]float64 // decayed per-name scores
-	lastSeen time.Time
-	decayAt  time.Time // time score/names were last decayed to
+	client     netip.Addr
+	score      float64            // decayed activity score
+	names      map[string]float64 // decayed per-name scores
+	transports map[string]uint64  // lifetime per-transport counts (bounded: ≤4 keys, no decay)
+	lastSeen   time.Time
+	decayAt    time.Time // time score/names were last decayed to
 }
 
 // Memory bounds. The hard ceiling on tracked state is maxClients × perClientNames name
@@ -93,9 +96,10 @@ const defaultHalfLife = 10 * time.Minute
 
 // Totals is a point-in-time rollup.
 type Totals struct {
-	Total      uint64
-	ByDecision map[Decision]uint64
-	Clients    int
+	Total       uint64
+	ByDecision  map[Decision]uint64
+	ByTransport map[string]uint64 // udp/tcp/dot/doh
+	Clients     int
 }
 
 // Log is a bounded, concurrency-safe query telemetry buffer.
@@ -111,6 +115,7 @@ type Log struct {
 	clients map[netip.Addr]*clientAgg
 	total   uint64
 	byDec   map[Decision]uint64
+	byXport map[string]uint64
 }
 
 // Option customizes a Log (mainly for tests injecting a clock/half-life).
@@ -147,6 +152,7 @@ func New(size, maxClients int, opts ...Option) *Log {
 		ring:       make([]Entry, size),
 		clients:    map[netip.Addr]*clientAgg{},
 		byDec:      map[Decision]uint64{},
+		byXport:    map[string]uint64{},
 	}
 	for _, o := range opts {
 		o(l)
@@ -193,18 +199,24 @@ func (l *Log) Record(e Entry) {
 		l.count++
 	}
 	l.byDec[e.Decision]++
+	if e.Transport != "" {
+		l.byXport[e.Transport]++
+	}
 	if e.Client.IsValid() {
 		ca := l.clients[e.Client]
 		if ca == nil {
 			if len(l.clients) >= l.maxClients {
 				return // already counted in totals; just not tracked per-client
 			}
-			ca = &clientAgg{client: e.Client, names: map[string]float64{}, decayAt: e.Time}
+			ca = &clientAgg{client: e.Client, names: map[string]float64{}, transports: map[string]uint64{}, decayAt: e.Time}
 			l.clients[e.Client] = ca
 		}
 		l.decayTo(ca, e.Time) // age existing weight before adding this query's
 		ca.score++
 		ca.lastSeen = e.Time
+		if e.Transport != "" {
+			ca.transports[e.Transport]++ // bounded: ≤4 transports, no cap needed
+		}
 		if e.Name != "" {
 			// Decay above may have pruned cold names, freeing slots; a known name always
 			// keeps counting, a new one only while under the per-client cap.
@@ -272,12 +284,31 @@ func (l *Log) TopClients(n int) []ClientStat {
 	out := make([]ClientStat, 0, len(aggs))
 	for _, ca := range aggs {
 		out = append(out, ClientStat{
-			Client:   ca.client,
-			Count:    scoreCount(ca.score),
-			LastSeen: ca.lastSeen,
-			TopNames: topNames(ca.names, topNamesPerClient),
+			Client:     ca.client,
+			Count:      scoreCount(ca.score),
+			LastSeen:   ca.lastSeen,
+			TopNames:   topNames(ca.names, topNamesPerClient),
+			Transports: transportCounts(ca.transports),
 		})
 	}
+	return out
+}
+
+// transportCounts renders a client's per-transport lifetime counts, busiest first.
+func transportCounts(m map[string]uint64) []NameCount {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make([]NameCount, 0, len(m))
+	for name, c := range m {
+		out = append(out, NameCount{Name: name, Count: c})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Count != out[j].Count {
+			return out[i].Count > out[j].Count
+		}
+		return out[i].Name < out[j].Name
+	})
 	return out
 }
 
@@ -331,5 +362,9 @@ func (l *Log) Totals() Totals {
 	for k, v := range l.byDec {
 		bd[k] = v
 	}
-	return Totals{Total: l.total, ByDecision: bd, Clients: len(l.clients)}
+	bx := make(map[string]uint64, len(l.byXport))
+	for k, v := range l.byXport {
+		bx[k] = v
+	}
+	return Totals{Total: l.total, ByDecision: bd, ByTransport: bx, Clients: len(l.clients)}
 }

@@ -175,3 +175,36 @@ func TestDecayDisabled(t *testing.T) {
 		t.Errorf("decay-disabled top = %+v, want count 5 despite elapsed time", top)
 	}
 }
+
+// Transport is tracked globally (Totals.ByTransport) and per-client (did they upgrade?).
+func TestTransportTracking(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	l := New(100, 100, WithClock(func() time.Time { return now }))
+	rec := func(client, transport string, n int) {
+		for i := 0; i < n; i++ {
+			e := entry(client, "x.", Forward, now)
+			e.Transport = transport
+			l.Record(e)
+		}
+	}
+	rec("10.0.0.1", "udp", 3)
+	rec("10.0.0.1", "dot", 2) // this client upgraded to DoT
+	rec("10.0.0.2", "udp", 1) // still plaintext only
+
+	if tot := l.Totals(); tot.ByTransport["udp"] != 4 || tot.ByTransport["dot"] != 2 {
+		t.Errorf("ByTransport = %v, want udp=4 dot=2", tot.ByTransport)
+	}
+	var c1 ClientStat
+	for _, c := range l.TopClients(10) {
+		if c.Client.String() == "10.0.0.1" {
+			c1 = c
+		}
+	}
+	got := map[string]uint64{}
+	for _, nc := range c1.Transports {
+		got[nc.Name] = nc.Count
+	}
+	if got["udp"] != 3 || got["dot"] != 2 {
+		t.Errorf("client .1 transports = %v, want udp=3 dot=2", got)
+	}
+}
