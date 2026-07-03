@@ -930,7 +930,7 @@ func (s *Server) build() page {
 	sort.Strings(p.VHosts)
 
 	p.MDNSFwd = hostViews(view.Forward)
-	p.MDNSRev = hostViews(view.Reverse)
+	p.MDNSRev = reverseHostViews(view.Reverse, snap.LocalDomain)
 	// mDNS reverse keys are in-addr/ip6.arpa names; order them by address, not alphabet.
 	sort.Slice(p.MDNSRev, func(i, j int) bool { return lessReverseDNS(p.MDNSRev[i].Name, p.MDNSRev[j].Name) })
 
@@ -1131,6 +1131,26 @@ func ownerRecords(z *model.Zone) []rrView {
 		}
 	}
 	return out
+}
+
+// reverseHostViews renders the mDNS reverse view, rewriting PTR targets from the
+// mDNS-native host.local to the served canonical host.<local-domain> (e.g. host.lan) so the
+// panel matches what the resolver actually answers over unicast. Empty/"local" local domain
+// leaves *.local unchanged.
+func reverseHostViews(m map[string][]model.RR, localDomain string) []hostView {
+	hv := hostViews(m)
+	if localDomain == "" || localDomain == "local" {
+		return hv
+	}
+	suffix := "." + localDomain + "."
+	for i := range hv {
+		for j, rec := range hv[i].Records {
+			if base := strings.TrimSuffix(rec, ".local."); base != rec {
+				hv[i].Records[j] = base + suffix
+			}
+		}
+	}
+	return hv
 }
 
 func hostViews(m map[string][]model.RR) []hostView {
