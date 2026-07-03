@@ -20,9 +20,13 @@ type Snapshot struct {
 	// write-back path — so the split-horizon mDNS overlay must never let an unauthenticated
 	// mDNS announcement shadow their A/AAAA (Q9 / §4.2 trust boundary).
 	DDNSEligible map[string]bool
-	AllowSuffix  []string // authoritative/stub/static suffixes (rebind scope, §4.2)
-	BuiltAt      time.Time
-	CFHealthy    bool // false => serving stale CF data (degraded)
+	// LocalDomain is the bare unicast local-domain label (e.g. "lan"); host.<LocalDomain>
+	// resolves from the mDNS view like host.local, and is the canonical target for PTRs.
+	// Empty => *.local only.
+	LocalDomain string
+	AllowSuffix []string // authoritative/stub/static suffixes (rebind scope, §4.2)
+	BuiltAt     time.Time
+	CFHealthy   bool // false => serving stale CF data (degraded)
 
 	// VHostV4/VHostV6 are the reverse proxy redirect targets the R3 vhost/naked/www rule
 	// answers with (design §2.4 step 6). Zero value => that family is NODATA.

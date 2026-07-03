@@ -665,3 +665,43 @@ func TestOverlayLocalScopeFilter(t *testing.T) {
 		t.Errorf("overlay AAAA = %v, want GUA + ULA (both site-local)", got)
 	}
 }
+
+// The configured local domain resolves LAN hosts like *.local, and reverse returns ONE
+// canonical PTR under that domain.
+func TestLocalDomainForwardAndReverse(t *testing.T) {
+	snap, view := buildSnap()
+	snap.LocalDomain = "lan"
+	if _, m := ask(t, snap, view, "edge.lan.", dns.TypeA); len(answers(m, dns.TypeA)) != 1 || answers(m, dns.TypeA)[0] != "192.0.2.50" {
+		t.Errorf("edge.lan A = %v, want [192.0.2.50]", answers(m, dns.TypeA))
+	}
+	if _, m := ask(t, snap, view, "edge.local.", dns.TypeA); len(answers(m, dns.TypeA)) != 1 {
+		t.Errorf("edge.local must still resolve, got %v", answers(m, dns.TypeA))
+	}
+	if _, m := ask(t, snap, view, "ghost.lan.", dns.TypeA); m.Rcode != dns.RcodeNameError {
+		t.Errorf("unknown .lan rcode = %d, want NXDOMAIN", m.Rcode)
+	}
+	_, mr := ask(t, snap, view, "10.2.0.192.in-addr.arpa.", dns.TypePTR)
+	if len(mr.Answer) != 1 {
+		t.Fatalf("canonical PTR count = %d, want 1", len(mr.Answer))
+	}
+	if p := mr.Answer[0].(*dns.PTR).Ptr; p != "edge.lan." {
+		t.Errorf("canonical PTR = %s, want edge.lan.", p)
+	}
+}
+
+// When several hosts claim one IP, reverse prefers a real hostname over a machine id and
+// returns a single canonical PTR.
+func TestCanonicalReversePrefersHostname(t *testing.T) {
+	snap, view := buildSnap()
+	snap.LocalDomain = "lan"
+	snap.ReverseZ["10.in-addr.arpa."] = &model.RevZone{Apex: "10.in-addr.arpa.", SOA: soa("10.in-addr.arpa.")}
+	arpa := "5.0.0.10.in-addr.arpa."
+	view.Reverse[arpa] = []model.RR{
+		{Type: dns.TypePTR, Class: dns.ClassINET, TTL: 120, Content: "0912320f-cbf9-4f76-bc56-82eb9444b0a2.local.", Target: "0912320f-cbf9-4f76-bc56-82eb9444b0a2.local."},
+		{Type: dns.TypePTR, Class: dns.ClassINET, TTL: 120, Content: "printer.local.", Target: "printer.local."},
+	}
+	_, m := ask(t, snap, view, arpa, dns.TypePTR)
+	if len(m.Answer) != 1 || m.Answer[0].(*dns.PTR).Ptr != "printer.lan." {
+		t.Errorf("canonical PTR = %v, want [printer.lan.] (real name beats the id)", m.Answer)
+	}
+}

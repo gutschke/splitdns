@@ -60,9 +60,11 @@ func Resolve(snap *model.Snapshot, view *model.MDNSView, req *dns.Msg) Outcome {
 	if isArpa(name) {
 		return answerReverse(snap, view, req, name, qtype)
 	}
-	// Step 4 — *.local / LAN (R4): served from the mDNS view only, never forwarded.
-	if strings.HasSuffix(name, ".local.") {
-		return answerLocal(view, req, name, qtype)
+	// Step 4 — *.local / *.<local-domain> LAN (R4): served from the mDNS view only, never
+	// forwarded. The configurable local domain (e.g. .lan) lets single-search-domain clients
+	// reach LAN hosts by a real name.
+	if lbl, ok := localLabel(snap, name); ok {
+		return answerLocal(view, req, name, lbl, qtype)
 	}
 	// Step 5 — stub/forward zones take precedence over the parent CF zone.
 	if tgt := stubMatch(snap, name); len(tgt) > 0 {
@@ -206,8 +208,14 @@ func answerReverse(snap *model.Snapshot, view *model.MDNSView, req *dns.Msg, nam
 	resp.Authoritative = true
 	matched := false
 	if qtype == dns.TypePTR || qtype == dns.TypeANY {
-		matched = appendMatching(resp, view.Reverse[name], name, dns.TypePTR)
+		// A configured static PTR is operator-authoritative and wins. Otherwise synthesize a
+		// single CANONICAL PTR from the mDNS view: one name (preferring a real hostname over
+		// a UUID/instance id when several claim the IP) under the local domain (host.lan),
+		// not the raw multi-valued host.local set.
 		if appendMatching(resp, snap.Static[name], name, dns.TypePTR) {
+			matched = true
+		} else if ptr := canonicalReversePTR(view.Reverse[name], name, snap.LocalDomain); ptr != nil {
+			resp.Answer = append(resp.Answer, ptr)
 			matched = true
 		}
 	}
@@ -217,13 +225,88 @@ func answerReverse(snap *model.Snapshot, view *model.MDNSView, req *dns.Msg, nam
 	return Outcome{Msg: resp}
 }
 
-func answerLocal(view *model.MDNSView, req *dns.Msg, name string, qtype uint16) Outcome {
-	label := strings.TrimSuffix(name, ".local.")
+// localLabel reports whether name is under .local or the configured local domain and, if
+// so, returns the bare host label (the mDNS view key).
+func localLabel(snap *model.Snapshot, name string) (string, bool) {
+	if lbl := strings.TrimSuffix(name, ".local."); lbl != name {
+		return lbl, true
+	}
+	if snap.LocalDomain != "" {
+		if lbl := strings.TrimSuffix(name, "."+snap.LocalDomain+"."); lbl != name {
+			return lbl, true
+		}
+	}
+	return "", false
+}
+
+// canonicalReversePTR builds one canonical PTR for a reverse name from the mDNS reverse
+// entries, rewriting the host to the local domain (host.lan). When several hosts claim the
+// IP it prefers a real hostname over a UUID/instance id, then the lexically smallest for
+// determinism. Returns nil if there is nothing to answer.
+func canonicalReversePTR(ptrs []model.RR, name, localDomain string) dns.RR {
+	best, bestTTL := "", uint32(0)
+	for _, r := range ptrs {
+		target := r.Target
+		if target == "" {
+			target = r.Content
+		}
+		host := strings.TrimSuffix(target, ".local.")
+		if host == target || host == "" {
+			continue
+		}
+		if best == "" || betterCanonical(host, best) {
+			best, bestTTL = host, r.TTL
+		}
+	}
+	if best == "" {
+		return nil
+	}
+	suffix := ".local."
+	if localDomain != "" {
+		suffix = "." + localDomain + "."
+	}
+	if bestTTL == 0 {
+		bestTTL = 120
+	}
+	target := best + suffix
+	return &dns.PTR{
+		Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: bestTTL},
+		Ptr: target,
+	}
+}
+
+// betterCanonical reports whether candidate should replace best as the canonical name: a
+// real hostname beats a UUID/instance id; within the same class the lexically smaller wins.
+func betterCanonical(candidate, best string) bool {
+	cu, bu := looksLikeID(candidate), looksLikeID(best)
+	if cu != bu {
+		return bu // candidate wins iff best is the id and candidate is not
+	}
+	return candidate < best
+}
+
+// looksLikeID reports whether s is a machine id rather than a human hostname: only hex
+// digits and dashes, with enough hex to be an id (UUID, 32-hex blob, etc.).
+func looksLikeID(s string) bool {
+	hex := 0
+	for _, c := range s {
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f':
+			hex++
+		case c == '-':
+		default:
+			return false
+		}
+	}
+	return hex >= 16
+}
+
+func answerLocal(view *model.MDNSView, req *dns.Msg, name, label string, qtype uint16) Outcome {
 	resp := reply(req)
 	resp.Authoritative = true
 	recs, exists := view.Forward[label]
 	if !exists {
-		// Unknown *.local host: NXDOMAIN (mDNS carries no SOA, so none in AUTHORITY).
+		// Unknown LAN host: NXDOMAIN (mDNS carries no SOA, so none in AUTHORITY).
 		resp.Rcode = dns.RcodeNameError
 		return Outcome{Msg: resp}
 	}

@@ -21,8 +21,21 @@ type Source struct {
 	expireEvery time.Duration
 }
 
+// Option customizes a Source at construction.
+type Option func(*Source)
+
+// WithServeStale keeps a record served for stale past its announced TTL, and retains it for
+// goodbye after an explicit mDNS goodbye (a cushion against an avahi bounce). Zero values
+// leave the passive-expiry default (no serve-stale; goodbye coerced to 120s).
+func WithServeStale(stale, goodbye time.Duration) Option {
+	return func(s *Source) {
+		s.cache.staleGrace = stale
+		s.cache.goodbyeGrace = goodbye
+	}
+}
+
 // NewSource builds a Source. onChange/now may be nil (now defaults to time.Now).
-func NewSource(onChange ChangeFunc, now func() time.Time) *Source {
+func NewSource(onChange ChangeFunc, now func() time.Time, opts ...Option) *Source {
 	if now == nil {
 		now = time.Now
 	}
@@ -30,6 +43,9 @@ func NewSource(onChange ChangeFunc, now func() time.Time) *Source {
 		cache:       NewCache(onChange),
 		now:         now,
 		expireEvery: 30 * time.Second,
+	}
+	for _, o := range opts {
+		o(s)
 	}
 	s.publish()
 	return s

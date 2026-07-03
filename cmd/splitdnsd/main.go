@@ -176,7 +176,7 @@ func main() {
 		if writer != nil {
 			writer.Submit(ddns.Change{Host: host, Addrs: addrs})
 		}
-	}, nil)
+	}, nil, mdns.WithServeStale(cfg.MDNS.StaleGraceDuration(), cfg.MDNS.GoodbyeGraceDuration()))
 	workers = append(workers, supervisor.Worker{Name: "mdns", Ceiling: 5 * time.Minute, Run: src.Run})
 
 	// D7: an announcement may trigger write-back via a valid TSIG signature (source-IP

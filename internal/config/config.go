@@ -29,6 +29,7 @@ type Config struct {
 	Access     AccessConfig    `toml:"access"`
 	Upstream   UpstreamConfig  `toml:"upstream"`
 	Zones      ZonesConfig     `toml:"zones"`
+	MDNS       MDNSConfig      `toml:"mdns"`
 	VHost      VHostConfig     `toml:"vhost"`
 	Cloudflare CFConfig        `toml:"cloudflare"`
 	DDNS       DDNSConfig      `toml:"ddns"`
@@ -78,6 +79,43 @@ type ZonesConfig struct {
 	Reverse       []string            `toml:"reverse"`        // explicit, stable reverse-zone apexes
 	ReverseDetect string              `toml:"reverse_detect"` // off|private|global|all
 	Stub          map[string][]string `toml:"stub"`           // apex -> stub resolver host:port
+}
+
+// MDNSConfig controls the LAN plane: the unicast local domain served from the mDNS view
+// (alongside the always-on *.local), and how long the passive cache keeps serving a record
+// after its announced TTL (serve-stale). local_domain lets clients that only understand a
+// single search domain reach LAN hosts under a real name (e.g. host.lan). Empty
+// local_domain serves *.local only.
+type MDNSConfig struct {
+	LocalDomain  string `toml:"local_domain"`  // unicast local domain, default "lan"; "" = *.local only
+	StaleGrace   string `toml:"stale_grace"`   // serve past the announced TTL, default "10m"; "0" disables
+	GoodbyeGrace string `toml:"goodbye_grace"` // retain after an mDNS goodbye (avahi bounce cushion), default "30s"
+}
+
+// LocalDomainLabel returns the normalized bare local-domain label (lowercased, no dots),
+// or "" when disabled.
+func (m MDNSConfig) LocalDomainLabel() string {
+	return strings.Trim(strings.ToLower(strings.TrimSpace(m.LocalDomain)), ".")
+}
+
+// StaleGraceDuration resolves stale_grace (default 10m; unparsable => default).
+func (m MDNSConfig) StaleGraceDuration() time.Duration {
+	return parseDurOr(m.StaleGrace, 10*time.Minute)
+}
+
+// GoodbyeGraceDuration resolves goodbye_grace (default 30s; unparsable => default).
+func (m MDNSConfig) GoodbyeGraceDuration() time.Duration {
+	return parseDurOr(m.GoodbyeGrace, 30*time.Second)
+}
+
+func parseDurOr(s string, def time.Duration) time.Duration {
+	if s == "" {
+		return def
+	}
+	if d, err := time.ParseDuration(s); err == nil {
+		return d
+	}
+	return def
 }
 
 // VHostConfig configures the reverse-proxy redirect (R3). The reverse proxy can be
@@ -379,7 +417,11 @@ func Default() Config {
 		},
 		// VHost/topology defaults are intentionally EMPTY so the source stays pristine
 		// (no site IPs). The live config supplies real values.
-		VHost:      VHostConfig{},
+		VHost: VHostConfig{},
+		// LAN plane: serve host.lan (a single-search-domain-friendly local name) alongside
+		// *.local, and keep records ~10m past their announced TTL (serve-stale) with a short
+		// cushion after an mDNS goodbye so an avahi bounce doesn't blink hosts out.
+		MDNS:       MDNSConfig{LocalDomain: "lan", StaleGrace: "10m", GoodbyeGrace: "30s"},
 		Cloudflare: CFConfig{ReadTokenFile: "/etc/splitdns/cloudflare-read.token"},
 		DDNS:       DDNSConfig{Enabled: false, DryRun: true, Rate: "10m", NotifySocket: "/run/splitdns/notify.sock"},
 		Diag:       DiagConfig{Addr: "127.0.0.1:8080"},

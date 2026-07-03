@@ -26,16 +26,21 @@ const maxHosts = 4096
 // above any legitimate host announcement, but bounded.
 const maxTTL = 4500
 
+// staleServeTTL caps the DNS TTL handed out while a record is being served stale, so
+// clients re-check soon (and pick up a refresh) rather than caching the stale value long.
+const staleServeTTL = 30
+
 // ChangeFunc is called when a host's cached address set changes (including going
 // empty on expiry). It is the DDNS trigger; the wiring layer adapts it to a
 // ddns.Change. The cache never calls it while holding its lock.
 type ChangeFunc func(host string, addrs []netip.Addr)
 
 type entry struct {
-	addrs    map[netip.Addr]struct{}
-	expiry   time.Time
-	lastSeen time.Time
-	notified string // canonical join of the address set last sent to onChange
+	addrs      map[netip.Addr]struct{}
+	freshUntil time.Time // announced-TTL expiry — drives the SERVED DNS TTL
+	expiry     time.Time // removal time = freshUntil + staleGrace (serve-stale window)
+	lastSeen   time.Time
+	notified   string // canonical join of the address set last sent to onChange
 }
 
 // Cache is the concurrent *.local host store. All methods are safe for concurrent
@@ -44,6 +49,12 @@ type Cache struct {
 	mu       sync.Mutex
 	hosts    map[string]*entry
 	onChange ChangeFunc
+	// staleGrace keeps a record served past its announced TTL (bridging a reconciler that
+	// re-announces slower than the TTL); goodbyeGrace is the short cushion kept after an
+	// explicit mDNS goodbye so an avahi bounce does not blink the host out. Both default 0
+	// (no serve-stale; goodbye coerced to the legacy 120s) unless configured.
+	staleGrace   time.Duration
+	goodbyeGrace time.Duration
 }
 
 // NewCache returns an empty cache. onChange may be nil.
@@ -64,8 +75,11 @@ func (c *Cache) Apply(a Announcement, now time.Time, trusted bool) bool {
 	if a.Host == "" || len(a.Addrs) == 0 {
 		return false
 	}
+	// TTL=0 is an mDNS goodbye. With goodbyeGrace configured we honor it (mark stale now,
+	// keep a short cushion); otherwise fall back to the legacy 120s coercion.
+	goodbye := a.TTL == 0 && c.goodbyeGrace > 0
 	ttl := a.TTL
-	if ttl == 0 {
+	if ttl == 0 && !goodbye {
 		ttl = 120
 	}
 	if ttl > maxTTL {
@@ -91,7 +105,13 @@ func (c *Cache) Apply(a Announcement, now time.Time, trusted bool) bool {
 		e.addrs[addr] = struct{}{}
 	}
 	e.lastSeen = now
-	e.expiry = now.Add(time.Duration(ttl) * time.Second)
+	if goodbye {
+		e.freshUntil = now // immediately stale (served with a short TTL)
+		e.expiry = now.Add(c.goodbyeGrace)
+	} else {
+		e.freshUntil = now.Add(time.Duration(ttl) * time.Second)
+		e.expiry = e.freshUntil.Add(c.staleGrace) // serve-stale window past the announced TTL
+	}
 	changed, set := c.diffLocked(a.Host, e)
 	c.mu.Unlock()
 
@@ -178,7 +198,16 @@ func (c *Cache) View(now time.Time) *model.MDNSView {
 			continue
 		}
 		fqdn := host + ".local."
-		ttl := ttlUntil(e.expiry, now)
+		// Serve the announced-TTL remainder while fresh; once stale (serve-stale window),
+		// serve a short TTL so clients re-check soon and pick up a refresh promptly.
+		ttl := ttlUntil(e.freshUntil, now)
+		if now.After(e.freshUntil) {
+			if rem := ttlUntil(e.expiry, now); rem < staleServeTTL {
+				ttl = rem
+			} else {
+				ttl = staleServeTTL
+			}
+		}
 		set := make([]netip.Addr, 0, len(e.addrs))
 		for a := range e.addrs {
 			set = append(set, a)

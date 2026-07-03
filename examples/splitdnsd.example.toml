@@ -58,6 +58,21 @@ reverse_detect = "off"
 # Delegated subtrees forwarded to a stub resolver.
 # "sub.example.com." = ["192.0.2.53:53"]
 
+[mdns]
+# The LAN plane. Alongside the always-on *.local, serve a unicast local domain so
+# clients that only understand ONE search domain can still reach LAN hosts by a real
+# name (host.lan). Reverse (PTR) for a LAN address returns a single canonical name
+# under this domain, preferring a real hostname over a machine id. "" => *.local only.
+local_domain = "lan"
+# Serve-stale: the cache is a PASSIVE listener that expires a record at its announced
+# mDNS TTL. If your announcer re-broadcasts slower than that TTL, keep serving the last
+# value for this grace window so hosts do not blink out between announcements. "0"
+# disables. (Also raise splitdns-notify's -ttl above its re-announce interval.)
+stale_grace = "10m"
+# After an explicit mDNS goodbye (a host leaving), keep it this brief cushion instead of
+# dropping instantly, so a mere avahi restart followed by a re-announce is seamless.
+goodbye_grace = "30s"
+
 [vhost]
 # Reverse-proxy redirect (any product: nginx, Caddy, Traefik, ...): naked domain / www / vhosts.
 # feed     = "192.0.2.10:818"

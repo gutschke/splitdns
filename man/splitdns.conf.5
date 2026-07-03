@@ -95,6 +95,28 @@ spaces such as the ISP-assigned GUA.
 A table mapping a delegated subtree apex (FQDN, trailing dot) to an array of stub
 resolver \fIhost:port\fR addresses, e.g.
 .RB \(dq "\(dqsub.example.com.\(dq = [\(dq192.0.2.53:53\(dq]" \(dq.
+.SH "[mdns]"
+The LAN plane: the mDNS view served over unicast, and how long records survive.
+.TP
+.B local_domain
+Bare label of a unicast local domain served from the mDNS view alongside the
+always-on \fI*.local\fR (default \fBlan\fR). \fIhost.lan\fR then resolves like
+\fIhost.local\fR \(em useful for clients that accept only a single search domain.
+Reverse (PTR) for a LAN address returns one canonical name under this domain,
+preferring a real hostname over a machine id when several claim the address. Empty
+serves \fI*.local\fR only.
+.TP
+.B stale_grace
+Serve-stale window (Go duration, default \fB10m\fR; \fB0\fR disables). The cache is a
+passive listener that expires a record at its announced mDNS TTL; if an announcer
+re-broadcasts more slowly than that TTL, the last value keeps being served for this
+long so hosts do not blink out between announcements. The served DNS TTL is capped
+short while stale. See also \fBsplitdns\-notify\fR(8) \fB\-ttl\fR.
+.TP
+.B goodbye_grace
+Cushion kept after an explicit mDNS goodbye (Go duration, default \fB30s\fR) instead of
+removing the host instantly, so an avahi restart immediately followed by a re-announce
+is seamless.
 .SH "[vhost]"
 .TP
 .B feed
