@@ -705,3 +705,27 @@ func TestCanonicalReversePrefersHostname(t *testing.T) {
 		t.Errorf("canonical PTR = %v, want [printer.lan.] (real name beats the id)", m.Answer)
 	}
 }
+
+// A host with NO local address is not hidden: its only-global addresses are served (per
+// family), rather than falling through to the wildcard.
+func TestOverlayGlobalFallback(t *testing.T) {
+	zone := &model.Zone{
+		Apex: "z.test.", SOA: soa("z.test."),
+		Records: map[string]map[uint16][]model.RR{}, ENT: map[string]bool{},
+		Wildcards:  map[uint16][]model.RR{dns.TypeA: {a("203.0.113.9")}},
+		TunnelAddr: map[string]map[uint16][]model.RR{},
+	}
+	snap := &model.Snapshot{Zones: map[string]*model.Zone{"z.test.": zone}}
+	// wan announces only public + CGNAT IPv4 (no local); both should be served.
+	view := &model.MDNSView{Forward: map[string][]model.RR{"wan": {a("198.51.100.5"), a("100.64.0.9")}}}
+	_, m := ask(t, snap, view, "wan.z.test.", dns.TypeA)
+	if got := answers(m, dns.TypeA); len(got) != 2 {
+		t.Errorf("only-global host A = %v, want both globals served (not hidden -> wildcard)", got)
+	}
+	// A host WITH a local IPv4 still drops the public one (local preferred).
+	view.Forward["mix"] = []model.RR{a("10.5.5.5"), a("198.51.100.5")}
+	_, m2 := ask(t, snap, view, "mix.z.test.", dns.TypeA)
+	if got := answers(m2, dns.TypeA); len(got) != 1 || got[0] != "10.5.5.5" {
+		t.Errorf("mixed host A = %v, want only the local [10.5.5.5]", got)
+	}
+}

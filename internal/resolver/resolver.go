@@ -372,30 +372,55 @@ func isVHostCandidate(snap *model.Snapshot, apex, owner string) bool {
 // APEX still serves its real non-address RRsets (MX/SOA/NS/CAA/TXT/TLSA) — only a
 // pure www/vhost LABEL is address-only. (Inverting this would break mail/zone
 // metadata for a redirected apex.)
-// localScopeAddrs filters mDNS address records to those reachable within the site's own
-// network — the split-horizon test for what may appear under a CF zone name. It keeps
-// private (RFC1918 + ULA) and routed IPv6 GUA addresses — which span every internal subnet,
-// not just those that happen to have a configured reverse zone — and drops public IPv4,
-// CGNAT/Tailscale (100.64/10), link-local, and loopback: addresses that are not how a LAN
-// client reaches the host.
+// localScopeAddrs selects the mDNS addresses to serve under a CF zone name. PER FAMILY it
+// prefers site-local addresses — private (RFC1918 + ULA) and routed IPv6 GUA, which span
+// every internal subnet regardless of configured reverse zones — so a LAN client takes the
+// local path instead of hairpinning out. But if a family has NO local address it falls back
+// to the host's remaining (public/CGNAT) addresses rather than hiding a host that is only
+// reachable globally. Unusable addresses (loopback, link-local, multicast) are always
+// dropped. Families are independent, so an IPv4-only client is never stranded by an
+// IPv6-only local address.
 func localScopeAddrs(mrecs []model.RR) []model.RR {
-	out := make([]model.RR, 0, len(mrecs))
+	var v4loc, v4all, v6loc, v6all []model.RR
 	for _, r := range mrecs {
-		if r.Type != dns.TypeA && r.Type != dns.TypeAAAA {
+		ip, err := netip.ParseAddr(r.Content)
+		if err != nil || !isServable(ip) {
 			continue
 		}
-		if ip, err := netip.ParseAddr(r.Content); err == nil && isLocalScope(ip) {
-			out = append(out, r)
+		local := isLocalScope(ip)
+		switch r.Type {
+		case dns.TypeA:
+			v4all = append(v4all, r)
+			if local {
+				v4loc = append(v4loc, r)
+			}
+		case dns.TypeAAAA:
+			v6all = append(v6all, r)
+			if local {
+				v6loc = append(v6loc, r)
+			}
 		}
 	}
-	return out
+	preferLocal := func(loc, all []model.RR) []model.RR {
+		if len(loc) > 0 {
+			return loc
+		}
+		return all // only-global: serve it rather than hide a reachable host
+	}
+	return append(preferLocal(v4loc, v4all), preferLocal(v6loc, v6all)...)
+}
+
+// isServable reports whether an address is usable as a unicast answer at all (not loopback,
+// link-local, multicast, or unspecified).
+func isServable(ip netip.Addr) bool {
+	return !ip.IsLoopback() && !ip.IsLinkLocalUnicast() && !ip.IsMulticast() && !ip.IsUnspecified()
 }
 
 // isLocalScope reports whether an address is reachable on the site's internal network:
 // RFC1918 v4 / ULA v6 (IsPrivate) or a routed IPv6 global-unicast address. It excludes
 // public IPv4, CGNAT (100.64/10 — not IsPrivate), link-local, and loopback.
 func isLocalScope(ip netip.Addr) bool {
-	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsMulticast() || ip.IsUnspecified() {
+	if !isServable(ip) {
 		return false
 	}
 	if ip.IsPrivate() { // RFC1918 v4 + ULA v6
