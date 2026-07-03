@@ -30,6 +30,12 @@ The build produces **two** packages:
 sudo apt install ./dist/splitdnsd_*.deb      # the server (also pulls in splitdns-notify)
 ```
 
+Use `apt install ./…deb`, **not** `dpkg -i` — `dpkg` ignores `Recommends`, so the optional
+`ieee-data` package (OUI database that gives manufacturer names in the diagnostics host
+panel) won't be pulled in. It's optional: without it, host enrichment still works but shows
+raw MACs instead of vendors. If you did use `dpkg -i`, run `sudo apt install ieee-data`
+(or `sudo apt-get -f install`).
+
 The `splitdnsd` package creates the unprivileged `splitdns` account and `/etc/splitdns`,
 `/etc/splitdns/secrets`, `/var/lib/splitdns`, and installs a hardened unit. It does not
 ship a live config and does not start the service.
