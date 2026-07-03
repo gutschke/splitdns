@@ -33,6 +33,7 @@ import (
 	"github.com/gutschke/splitdns/internal/diag"
 	"github.com/gutschke/splitdns/internal/encrypted"
 	"github.com/gutschke/splitdns/internal/forwarder"
+	"github.com/gutschke/splitdns/internal/hostinfo"
 	"github.com/gutschke/splitdns/internal/loglimit"
 	"github.com/gutschke/splitdns/internal/mdns"
 	"github.com/gutschke/splitdns/internal/mirror"
@@ -373,8 +374,22 @@ func main() {
 	}
 
 	// Read-only diagnostics HTTP (R10), localhost-only by default.
+	hostRes := hostinfo.New(hostinfo.NewOUIDB(), hostinfo.Options{Ping: true})
 	diagSrv := diag.New(cfg.Diag.Addr, st.snapshot.Load, src.View, version, func(m string) { slog.Warn(m) }).
-		WithConfigFile(*configPath)
+		WithConfigFile(*configPath).
+		WithHostInfo(func(name string) (hostinfo.Info, bool) {
+			recs, ok := src.View().Forward[name]
+			if !ok {
+				return hostinfo.Info{}, false
+			}
+			addrs := make([]netip.Addr, 0, len(recs))
+			for _, rr := range recs {
+				if ip, err := netip.ParseAddr(rr.Content); err == nil {
+					addrs = append(addrs, ip)
+				}
+			}
+			return hostRes.Lookup(name, addrs), true
+		})
 	diagSrv.WithCacheStats(func() (anscache.Stats, bool) {
 		if ansCache == nil {
 			return anscache.Stats{}, false

@@ -27,6 +27,7 @@ import (
 	"github.com/gutschke/splitdns/internal/anscache"
 	"github.com/gutschke/splitdns/internal/ddns"
 	"github.com/gutschke/splitdns/internal/forwarder"
+	"github.com/gutschke/splitdns/internal/hostinfo"
 	"github.com/gutschke/splitdns/internal/model"
 	"github.com/gutschke/splitdns/internal/netmatch"
 	"github.com/gutschke/splitdns/internal/qlog"
@@ -56,7 +57,8 @@ type Server struct {
 	controlsActive bool // set at Start: controls enabled AND (password set OR loopback)
 	log            func(string)
 	version        string
-	configFile     string // path shown (redacted) in the config panel; "" => panel omitted
+	configFile     string                                  // path shown (redacted) in the config panel; "" => panel omitted
+	hostInfo       func(name string) (hostinfo.Info, bool) // lazy per-host enrichment; nil => omitted
 
 	now func() time.Time // injectable clock for rate-limit/backoff tests (default time.Now)
 
@@ -86,6 +88,33 @@ func New(addr string, snapshot func() *model.Snapshot, view func() *model.MDNSVi
 // the polled JSON) from GET /config with cryptographic material redacted. Empty path omits
 // the panel.
 func (s *Server) WithConfigFile(path string) *Server { s.configFile = path; return s }
+
+// WithHostInfo wires lazy per-host enrichment (vendor/MAC/scope), served from GET
+// /host?name=<label> only for hosts present in the mDNS view. The provider returns
+// (info, true) for a known host and (_, false) otherwise.
+func (s *Server) WithHostInfo(fn func(name string) (hostinfo.Info, bool)) *Server {
+	s.hostInfo = fn
+	return s
+}
+
+// handleHostInfo serves enrichment for a single mDNS host. Lazy (only on demand), bounded to
+// known hosts (unknown names are 404, so it can't be driven for arbitrary work), and cached
+// by the provider. All data is local; nothing is sent off the box.
+func (s *Server) handleHostInfo(w http.ResponseWriter, r *http.Request) {
+	name := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("name")))
+	if name == "" || len(name) > 253 {
+		http.Error(w, "usage: /host?name=<mdns-label>", http.StatusBadRequest)
+		return
+	}
+	info, ok := s.hostInfo(name)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(info)
+}
 
 // secretAssign matches an inline secret assignment in TOML — a bare `secret`,
 // `tsig_secret`, `control_password`, `password`, `token`, or `api_key` key (NOT the
@@ -319,6 +348,9 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 	if s.configFile != "" {
 		mux.HandleFunc("/config", s.handleConfig)
+	}
+	if s.hostInfo != nil {
+		mux.HandleFunc("/host", s.handleHostInfo)
 	}
 	if s.controlsActive {
 		mux.HandleFunc("/control/", s.handleControl)
@@ -784,27 +816,28 @@ func (s *Server) snap() *model.Snapshot {
 // --- redacted view model (NO ZoneID/RecordID, NO token) ---
 
 type page struct {
-	Version   string        `json:"version"`
-	BuiltAt   time.Time     `json:"built_at"`
-	CFHealthy bool          `json:"cf_healthy"`
-	Zones     []zoneView    `json:"zones"`
-	Reverse   []string      `json:"reverse_zones"`
-	Stub      []stubView    `json:"stub_zones"`
-	VHosts    []string      `json:"vhosts"`
-	VHostV4   string        `json:"vhost_v4,omitempty"`
-	VHostV6   string        `json:"vhost_v6,omitempty"`
-	MDNSFwd   []hostView    `json:"mdns_forward"`
-	MDNSRev   []hostView    `json:"mdns_reverse"`
-	HasConfig bool          `json:"-"` // config panel available (rendered lazily via /config)
-	Cache     *cacheView    `json:"answer_cache,omitempty"`
-	Queries   *queryStats   `json:"queries,omitempty"`
-	Backends  []backendView `json:"backends,omitempty"`
-	Workers   []workerView  `json:"workers,omitempty"`
-	Enc       *EncStatus    `json:"encrypted,omitempty"`
-	Controls  *controlsView `json:"-"` // HTML-only (the JSON view stays purely read-only)
-	SelfTest  bool          `json:"-"` // HTML-only: render the self-tests link
-	DDNSSim   bool          `json:"-"` // HTML-only: render the DDNS-simulate form
-	TQuery    bool          `json:"-"` // HTML-only: render the transport-query tool form
+	Version     string        `json:"version"`
+	BuiltAt     time.Time     `json:"built_at"`
+	CFHealthy   bool          `json:"cf_healthy"`
+	Zones       []zoneView    `json:"zones"`
+	Reverse     []string      `json:"reverse_zones"`
+	Stub        []stubView    `json:"stub_zones"`
+	VHosts      []string      `json:"vhosts"`
+	VHostV4     string        `json:"vhost_v4,omitempty"`
+	VHostV6     string        `json:"vhost_v6,omitempty"`
+	MDNSFwd     []hostView    `json:"mdns_forward"`
+	MDNSRev     []hostView    `json:"mdns_reverse"`
+	HasConfig   bool          `json:"-"` // config panel available (rendered lazily via /config)
+	HasHostInfo bool          `json:"-"` // per-host enrichment available (lazy via /host)
+	Cache       *cacheView    `json:"answer_cache,omitempty"`
+	Queries     *queryStats   `json:"queries,omitempty"`
+	Backends    []backendView `json:"backends,omitempty"`
+	Workers     []workerView  `json:"workers,omitempty"`
+	Enc         *EncStatus    `json:"encrypted,omitempty"`
+	Controls    *controlsView `json:"-"` // HTML-only (the JSON view stays purely read-only)
+	SelfTest    bool          `json:"-"` // HTML-only: render the self-tests link
+	DDNSSim     bool          `json:"-"` // HTML-only: render the DDNS-simulate form
+	TQuery      bool          `json:"-"` // HTML-only: render the transport-query tool form
 }
 
 // controlsView drives the HTML control panel; it lists which actions are wired and
@@ -1000,6 +1033,7 @@ func (s *Server) build() page {
 	p.MDNSFwd = hostViews(view.Forward)
 	p.MDNSRev = reverseHostViews(view.Reverse, snap.LocalDomain)
 	p.HasConfig = s.configFile != ""
+	p.HasHostInfo = s.hostInfo != nil
 	// mDNS reverse keys are in-addr/ip6.arpa names; order them by address, not alphabet.
 	sort.Slice(p.MDNSRev, func(i, j int) bool { return lessReverseDNS(p.MDNSRev[i].Name, p.MDNSRev[j].Name) })
 
@@ -1501,7 +1535,7 @@ transport <select name="transport"><option value="do53">Do53 (UDP)</option><opti
 <details><summary>mDNS forward</summary>
 <p class="muted">badge <span class="badge">id</span> marks a machine/instance id (container, VM, or a device with no friendly hostname).</p>
 <div data-live="mdns_forward"><table><tbody>
-{{range .MDNSFwd}}<tr data-key="{{.Name}}"><td data-f="name">{{.Name}}{{if .Kind}} <span class="badge">{{.Kind}}</span>{{end}}</td><td data-f="records">{{range .Records}}{{.}}; {{end}}</td></tr>{{end}}
+{{range .MDNSFwd}}<tr data-key="{{.Name}}"><td data-f="name">{{.Name}}{{if .Kind}} <span class="badge">{{.Kind}}</span>{{end}}</td><td data-f="records">{{range .Records}}{{.}}; {{end}}</td><td data-f="info" class="muted">{{if $.HasHostInfo}}<a class="hi" data-h="{{.Name}}" href="#" title="identify this host (vendor/scope)">identify</a>{{end}}</td></tr>{{end}}
 </tbody></table></div></details>
 <details><summary>mDNS reverse</summary><div data-live="mdns_reverse"><table><tbody>
 {{range .MDNSRev}}<tr data-key="{{.Name}}"><td data-f="name">{{.Name}}</td><td data-f="records">{{range .Records}}{{.}}; {{end}}</td></tr>{{end}}
@@ -1614,7 +1648,7 @@ transport <select name="transport"><option value="do53">Do53 (UDP)</option><opti
 
   // mDNS forward/reverse: keyed by host/arpa name; only the records cell changes.
   function mdnsRecords(tr, x){ patchText(fcell(tr, 'records'), (x.records || []).map(function(r){ return r + '; '; }).join('')); }
-  function makeMDNS(x){ var tr = document.createElement('tr'); tr.innerHTML = '<td data-f="name"></td><td data-f="records"></td>'; var nc = fcell(tr, 'name'); nc.textContent = x.name; if(x.kind){ nc.appendChild(document.createTextNode(' ')); var b = document.createElement('span'); b.className = 'badge'; b.textContent = x.kind; nc.appendChild(b); } mdnsRecords(tr, x); return tr; }
+  function makeMDNS(x){ var tr = document.createElement('tr'); tr.innerHTML = '<td data-f="name"></td><td data-f="records"></td><td data-f="info" class="muted"></td>'; var nc = fcell(tr, 'name'); nc.textContent = x.name; if(x.kind){ nc.appendChild(document.createTextNode(' ')); var b = document.createElement('span'); b.className = 'badge'; b.textContent = x.kind; nc.appendChild(b); } if(hasHostInfo){ var a = document.createElement('a'); a.className = 'hi'; a.href = '#'; a.dataset.h = x.name; a.textContent = 'identify'; fcell(tr, 'info').appendChild(a); } mdnsRecords(tr, x); return tr; }
   function mdnsPatch(root, d){ reconcile(root.querySelector('tbody'), d || [], function(x){ return x.name; }, makeMDNS, mdnsRecords); }
 
   // ---- per-section patchers (key === data-live === /diag.json field) ----
@@ -1816,6 +1850,26 @@ transport <select name="transport"><option value="do53">Do53 (UDP)</option><opti
   document.addEventListener('toggle', function(e){ if(e.target.tagName === 'DETAILS' && e.target.open) ratchetIn(e.target); }, true);
   document.querySelectorAll('[data-live] table').forEach(ratchet); // seed widths from server-rendered content
   setTopbarH();
+
+  // Host enrichment: fetch vendor/scope for one mDNS host on demand (lazy, cached server-side).
+  var hasHostInfo = {{if .HasHostInfo}}true{{else}}false{{end}};
+  function fmtHostInfo(d){
+    var parts = [];
+    if(d.vendors && d.vendors.length) parts.push(d.vendors.join(', '));
+    if(d.families) parts.push(d.families);
+    if(d.scopes && d.scopes.length) parts.push(d.scopes.join('/'));
+    return parts.length ? parts.join(' — ') : 'unidentified';
+  }
+  document.addEventListener('click', function(ev){
+    var a = ev.target && ev.target.closest ? ev.target.closest('a.hi') : null;
+    if(!a) return;
+    ev.preventDefault();
+    var cell = a.parentNode; cell.textContent = '…';
+    fetch('/host?name=' + encodeURIComponent(a.dataset.h), { cache: 'no-store' })
+      .then(function(r){ return r.ok ? r.json() : Promise.reject(r.status); })
+      .then(function(d){ cell.textContent = fmtHostInfo(d); })
+      .catch(function(e){ cell.textContent = 'n/a (' + e + ')'; });
+  });
 
   // Config panel: fetch the redacted config lazily on first expand (never in the poll).
   var cfgP = document.getElementById('cfgpanel');
