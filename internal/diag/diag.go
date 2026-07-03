@@ -1886,6 +1886,7 @@ transport <select name="transport"><option value="do53">Do53 (UDP)</option><opti
   function fmtHostInfo(d){
     var parts = [];
     if(d.vendors && d.vendors.length) parts.push(d.vendors.join(', '));
+    if(d.services && d.services.length) parts.push(d.services.join(' '));
     if(d.families) parts.push(d.families);
     if(d.scopes && d.scopes.length) parts.push(d.scopes.join('/'));
     return parts.length ? parts.join(' — ') : 'unidentified';

@@ -86,3 +86,58 @@ func canonHost(name string) string {
 	}
 	return h
 }
+
+// Service links a DNS-SD service type (e.g. "_ipp._tcp") to the bare *.local host that
+// offers it, derived from an SRV record's owner (the instance) and target (the host). It is
+// a passive diagnostic fingerprint only — never answered on the wire.
+type Service struct {
+	Host string
+	Type string
+	TTL  uint32
+}
+
+// ParseServices extracts host->service-type links from an mDNS response's SRV records.
+// Non-response / unparseable packets yield nothing.
+func ParseServices(b []byte) []Service {
+	var m dns.Msg
+	if err := m.Unpack(b); err != nil || !m.Response {
+		return nil
+	}
+	var out []Service
+	seen := map[string]bool{}
+	for _, rr := range m.Answer {
+		srv, ok := rr.(*dns.SRV)
+		if !ok {
+			continue
+		}
+		host := canonHost(srv.Target)
+		typ := serviceType(srv.Hdr.Name)
+		if host == "" || typ == "" {
+			continue
+		}
+		key := host + "|" + typ
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, Service{Host: host, Type: typ, TTL: srv.Hdr.Ttl})
+	}
+	return out
+}
+
+// serviceType extracts the "_app._proto" DNS-SD service type from an instance owner name
+// ("Instance._app._proto.local."), or "" if the trailing two labels are not both
+// underscore-prefixed.
+func serviceType(name string) string {
+	n := strings.TrimSuffix(strings.ToLower(name), ".")
+	n = strings.TrimSuffix(n, ".local")
+	labels := strings.Split(n, ".")
+	if len(labels) < 2 {
+		return ""
+	}
+	app, proto := labels[len(labels)-2], labels[len(labels)-1]
+	if strings.HasPrefix(app, "_") && strings.HasPrefix(proto, "_") {
+		return app + "." + proto
+	}
+	return ""
+}

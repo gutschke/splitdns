@@ -378,7 +378,8 @@ func main() {
 	diagSrv := diag.New(cfg.Diag.Addr, st.snapshot.Load, src.View, version, func(m string) { slog.Warn(m) }).
 		WithConfigFile(*configPath).
 		WithHostInfo(func(name string) (hostinfo.Info, bool) {
-			recs, ok := src.View().Forward[name]
+			view := src.View()
+			recs, ok := view.Forward[name]
 			if !ok {
 				return hostinfo.Info{}, false
 			}
@@ -388,7 +389,9 @@ func main() {
 					addrs = append(addrs, ip)
 				}
 			}
-			return hostRes.Lookup(name, addrs), true
+			info := hostRes.Lookup(name, addrs)
+			info.Services = view.Services[name] // passive DNS-SD fingerprint
+			return info, true
 		})
 	diagSrv.WithCacheStats(func() (anscache.Stats, bool) {
 		if ansCache == nil {

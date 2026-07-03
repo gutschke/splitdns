@@ -16,6 +16,7 @@ type Info struct {
 	MACs     []string `json:"macs,omitempty"`     // distinct MACs found (EUI-64 or ARP)
 	Families string   `json:"families,omitempty"` // "IPv4+IPv6" | "IPv4" | "IPv6"
 	Scopes   []string `json:"scopes,omitempty"`   // address scopes present (LAN/GUA/ULA/public/CGNAT/…)
+	Services []string `json:"services,omitempty"` // DNS-SD service types (set by the caller from the mDNS view)
 }
 
 // Options configure a Resolver.

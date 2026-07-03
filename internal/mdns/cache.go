@@ -37,8 +37,9 @@ type ChangeFunc func(host string, addrs []netip.Addr)
 
 type entry struct {
 	addrs      map[netip.Addr]struct{}
-	freshUntil time.Time // announced-TTL expiry — drives the SERVED DNS TTL
-	expiry     time.Time // removal time = freshUntil + staleGrace (serve-stale window)
+	services   map[string]struct{} // DNS-SD service types the host advertises (diagnostic)
+	freshUntil time.Time           // announced-TTL expiry — drives the SERVED DNS TTL
+	expiry     time.Time           // removal time = freshUntil + staleGrace (serve-stale window)
 	lastSeen   time.Time
 	notified   string // canonical join of the address set last sent to onChange
 }
@@ -126,6 +127,30 @@ func (c *Cache) Apply(a Announcement, now time.Time, trusted bool) bool {
 		}
 	}
 	return changed
+}
+
+// ApplyService records that an EXISTING cached host advertises a DNS-SD service type
+// (diagnostic fingerprint). Returns true if the type was newly added. Services for an
+// unknown host are dropped — they attach on a later packet once the host's address is known,
+// and they share the host entry's lifetime. Never creates a host or affects resolution.
+func (c *Cache) ApplyService(host, typ string, now time.Time) bool {
+	if host == "" || typ == "" {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.hosts[host]
+	if !ok {
+		return false
+	}
+	if e.services == nil {
+		e.services = map[string]struct{}{}
+	}
+	if _, dup := e.services[typ]; dup {
+		return false
+	}
+	e.services[typ] = struct{}{}
+	return true
 }
 
 // evictOldestLocked removes and returns the host with the oldest lastSeen (the LRU
@@ -227,6 +252,17 @@ func (c *Cache) View(now time.Time) *model.MDNSView {
 					Content: fqdn, Target: fqdn,
 				})
 			}
+		}
+		if len(e.services) > 0 && len(e.addrs) > 0 {
+			svcs := make([]string, 0, len(e.services))
+			for s := range e.services {
+				svcs = append(svcs, s)
+			}
+			sort.Strings(svcs)
+			if v.Services == nil {
+				v.Services = map[string][]string{}
+			}
+			v.Services[host] = svcs
 		}
 	}
 	return v

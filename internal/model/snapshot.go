@@ -94,5 +94,8 @@ type MDNSView struct {
 	Forward map[string][]RR
 	// Reverse maps an in-addr/ip6 arpa name -> PTR RRs.
 	Reverse map[string][]RR
-	BuiltAt time.Time
+	// Services maps a bare hostname -> the DNS-SD service types it advertises (e.g.
+	// "_ipp._tcp"), a passive fingerprint for diagnostics only. Never answered on the wire.
+	Services map[string][]string
+	BuiltAt  time.Time
 }

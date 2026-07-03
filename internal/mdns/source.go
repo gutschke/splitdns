@@ -63,6 +63,13 @@ func (s *Source) HandlePacket(b []byte, trusted bool) {
 			changed = true
 		}
 	}
+	// DNS-SD service types (diagnostic fingerprint) attach to known hosts; parsed after
+	// addresses so a host announced in the same packet already exists.
+	for _, svc := range ParseServices(b) {
+		if s.cache.ApplyService(svc.Host, svc.Type, now) {
+			changed = true
+		}
+	}
 	if changed {
 		s.publish()
 	}
