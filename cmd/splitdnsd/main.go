@@ -373,7 +373,8 @@ func main() {
 	}
 
 	// Read-only diagnostics HTTP (R10), localhost-only by default.
-	diagSrv := diag.New(cfg.Diag.Addr, st.snapshot.Load, src.View, version, func(m string) { slog.Warn(m) })
+	diagSrv := diag.New(cfg.Diag.Addr, st.snapshot.Load, src.View, version, func(m string) { slog.Warn(m) }).
+		WithConfigFile(*configPath)
 	diagSrv.WithCacheStats(func() (anscache.Stats, bool) {
 		if ansCache == nil {
 			return anscache.Stats{}, false

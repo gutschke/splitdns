@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -55,6 +56,7 @@ type Server struct {
 	controlsActive bool // set at Start: controls enabled AND (password set OR loopback)
 	log            func(string)
 	version        string
+	configFile     string // path shown (redacted) in the config panel; "" => panel omitted
 
 	now func() time.Time // injectable clock for rate-limit/backoff tests (default time.Now)
 
@@ -78,6 +80,42 @@ func New(addr string, snapshot func() *model.Snapshot, view func() *model.MDNSVi
 		addr = "127.0.0.1:8080"
 	}
 	return &Server{addr: addr, snapshot: snapshot, view: view, version: version, log: log, ctlLast: map[string]time.Time{}, now: time.Now}
+}
+
+// WithConfigFile enables the collapsible config panel, served lazily (on tab-expand, not in
+// the polled JSON) from GET /config with cryptographic material redacted. Empty path omits
+// the panel.
+func (s *Server) WithConfigFile(path string) *Server { s.configFile = path; return s }
+
+// secretAssign matches an inline secret assignment in TOML — a bare `secret`,
+// `tsig_secret`, `control_password`, `password`, `token`, or `api_key` key (NOT the
+// `*_file` path variants, which \b excludes since underscores are word chars). The value
+// (group 2) is replaced with a redaction marker.
+var secretAssign = regexp.MustCompile(`(?i)\b(secret|tsig_secret|control_password|password|passwd|token|api_key|apikey)(\s*=\s*)("[^"]*"|'[^']*'|[^\s,}]+)`)
+
+// redactConfig masks inline cryptographic material in a raw TOML config so the config panel
+// never discloses a key/token/password even if the operator inlined one instead of using a
+// *_file reference.
+func redactConfig(b []byte) string {
+	return secretAssign.ReplaceAllString(string(b), `$1$2"***REDACTED***"`)
+}
+
+// handleConfig serves the redacted config file. Read on demand (small file, only hit on
+// tab-expand), never cached in the polled payload.
+func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
+	if s.configFile == "" {
+		http.NotFound(w, r)
+		return
+	}
+	b, err := os.ReadFile(s.configFile)
+	if err != nil {
+		http.Error(w, "config unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	fmt.Fprintf(w, "# %s (cryptographic material redacted)\n%s", s.configFile, redactConfig(b))
 }
 
 // WithCacheStats wires a provider for the forward-path answer-cache counters. fn
@@ -278,6 +316,9 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 	if s.transportQuery != nil {
 		mux.HandleFunc("/tquery", s.handleTransportQuery)
+	}
+	if s.configFile != "" {
+		mux.HandleFunc("/config", s.handleConfig)
 	}
 	if s.controlsActive {
 		mux.HandleFunc("/control/", s.handleControl)
@@ -754,6 +795,7 @@ type page struct {
 	VHostV6   string        `json:"vhost_v6,omitempty"`
 	MDNSFwd   []hostView    `json:"mdns_forward"`
 	MDNSRev   []hostView    `json:"mdns_reverse"`
+	HasConfig bool          `json:"-"` // config panel available (rendered lazily via /config)
 	Cache     *cacheView    `json:"answer_cache,omitempty"`
 	Queries   *queryStats   `json:"queries,omitempty"`
 	Backends  []backendView `json:"backends,omitempty"`
@@ -882,6 +924,32 @@ type stubView struct {
 type hostView struct {
 	Name    string   `json:"name"`
 	Records []string `json:"records"`
+	Kind    string   `json:"kind,omitempty"` // "" for a normal host; "id" for a machine/instance id
+}
+
+// classifyHost labels an mDNS host name so the UI can flag machine/instance ids (container,
+// VM, or device without a friendly hostname) that would otherwise confuse the reader.
+func classifyHost(name string) string {
+	if looksLikeMachineID(name) {
+		return "id"
+	}
+	return ""
+}
+
+// looksLikeMachineID reports whether a label is a machine/instance id (only hex digits and
+// dashes, with enough hex to be an id) rather than a human hostname.
+func looksLikeMachineID(s string) bool {
+	hex := 0
+	for _, c := range s {
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f':
+			hex++
+		case c == '-':
+		default:
+			return false
+		}
+	}
+	return hex >= 16
 }
 
 func (s *Server) build() page {
@@ -931,6 +999,7 @@ func (s *Server) build() page {
 
 	p.MDNSFwd = hostViews(view.Forward)
 	p.MDNSRev = reverseHostViews(view.Reverse, snap.LocalDomain)
+	p.HasConfig = s.configFile != ""
 	// mDNS reverse keys are in-addr/ip6.arpa names; order them by address, not alphabet.
 	sort.Slice(p.MDNSRev, func(i, j int) bool { return lessReverseDNS(p.MDNSRev[i].Name, p.MDNSRev[j].Name) })
 
@@ -1156,7 +1225,7 @@ func reverseHostViews(m map[string][]model.RR, localDomain string) []hostView {
 func hostViews(m map[string][]model.RR) []hostView {
 	var out []hostView
 	for name, rrs := range m {
-		hv := hostView{Name: name}
+		hv := hostView{Name: name, Kind: classifyHost(name)}
 		for _, rr := range rrs {
 			hv.Records = append(hv.Records, dns.TypeToString[rr.Type]+" "+rr.RDATA())
 		}
@@ -1241,6 +1310,8 @@ table.sortable thead th{position:sticky;top:calc(var(--topbar-h) + 1.9rem);backg
 .chip b{font-variant-numeric:tabular-nums} .chip .lbl{color:#777}
 .chip.ok{border-color:#9c9} .chip.flag{border-color:#e88;background:#fdeaea}
 .chip.clickable{cursor:pointer}
+.badge{font-size:.7rem;padding:0 .35rem;border-radius:.35rem;background:#e6e6e6;color:#555;vertical-align:middle}
+#cfgtext{max-height:22rem;overflow:auto;background:#f6f6f6;padding:.6rem;border-radius:4px;white-space:pre;font:12px/1.35 ui-monospace,monospace;color:#333}
 /* control-action feedback + lock affordances (see the control JS) */
 .ctl-msg{font-size:.85rem;margin-left:.4rem;font-variant-numeric:tabular-nums}
 .ctl-msg.ok{color:#161} .ctl-msg.flag{color:#c00} .ctl-msg.muted{color:#777}
@@ -1427,12 +1498,15 @@ transport <select name="transport"><option value="do53">Do53 (UDP)</option><opti
 <details><summary>Stub zones</summary><table>{{range .Stub}}<tr><td>{{.Apex}}</td><td>{{range .Targets}}{{.}} {{end}}</td></tr>{{end}}</table></details>
 <details><summary>VHosts</summary><p>reverse proxy {{.VHostV4}} {{.VHostV6}}</p>
 <table>{{range .VHosts}}<tr><td>{{.}}</td></tr>{{end}}</table></details>
-<details><summary>mDNS forward</summary><div data-live="mdns_forward"><table><tbody>
-{{range .MDNSFwd}}<tr data-key="{{.Name}}"><td data-f="name">{{.Name}}</td><td data-f="records">{{range .Records}}{{.}}; {{end}}</td></tr>{{end}}
+<details><summary>mDNS forward</summary>
+<p class="muted">badge <span class="badge">id</span> marks a machine/instance id (container, VM, or a device with no friendly hostname).</p>
+<div data-live="mdns_forward"><table><tbody>
+{{range .MDNSFwd}}<tr data-key="{{.Name}}"><td data-f="name">{{.Name}}{{if .Kind}} <span class="badge">{{.Kind}}</span>{{end}}</td><td data-f="records">{{range .Records}}{{.}}; {{end}}</td></tr>{{end}}
 </tbody></table></div></details>
 <details><summary>mDNS reverse</summary><div data-live="mdns_reverse"><table><tbody>
 {{range .MDNSRev}}<tr data-key="{{.Name}}"><td data-f="name">{{.Name}}</td><td data-f="records">{{range .Records}}{{.}}; {{end}}</td></tr>{{end}}
 </tbody></table></div></details>
+{{if .HasConfig}}<details id="cfgpanel"><summary>Config <span class="muted">effective file — cryptographic material redacted</span></summary><pre id="cfgtext" class="muted">Loading…</pre></details>{{end}}
 </section>
 <script>
 (function(){
@@ -1540,7 +1614,7 @@ transport <select name="transport"><option value="do53">Do53 (UDP)</option><opti
 
   // mDNS forward/reverse: keyed by host/arpa name; only the records cell changes.
   function mdnsRecords(tr, x){ patchText(fcell(tr, 'records'), (x.records || []).map(function(r){ return r + '; '; }).join('')); }
-  function makeMDNS(x){ var tr = document.createElement('tr'); tr.innerHTML = '<td data-f="name"></td><td data-f="records"></td>'; fcell(tr, 'name').textContent = x.name; mdnsRecords(tr, x); return tr; }
+  function makeMDNS(x){ var tr = document.createElement('tr'); tr.innerHTML = '<td data-f="name"></td><td data-f="records"></td>'; var nc = fcell(tr, 'name'); nc.textContent = x.name; if(x.kind){ nc.appendChild(document.createTextNode(' ')); var b = document.createElement('span'); b.className = 'badge'; b.textContent = x.kind; nc.appendChild(b); } mdnsRecords(tr, x); return tr; }
   function mdnsPatch(root, d){ reconcile(root.querySelector('tbody'), d || [], function(x){ return x.name; }, makeMDNS, mdnsRecords); }
 
   // ---- per-section patchers (key === data-live === /diag.json field) ----
@@ -1742,6 +1816,17 @@ transport <select name="transport"><option value="do53">Do53 (UDP)</option><opti
   document.addEventListener('toggle', function(e){ if(e.target.tagName === 'DETAILS' && e.target.open) ratchetIn(e.target); }, true);
   document.querySelectorAll('[data-live] table').forEach(ratchet); // seed widths from server-rendered content
   setTopbarH();
+
+  // Config panel: fetch the redacted config lazily on first expand (never in the poll).
+  var cfgP = document.getElementById('cfgpanel');
+  if(cfgP){ cfgP.addEventListener('toggle', function(){
+    if(!cfgP.open || cfgP.dataset.loaded) return;
+    cfgP.dataset.loaded = '1';
+    fetch('/config', { cache: 'no-store' })
+      .then(function(r){ return r.ok ? r.text() : Promise.reject(r.status); })
+      .then(function(t){ document.getElementById('cfgtext').textContent = t; })
+      .catch(function(e){ cfgP.dataset.loaded = ''; document.getElementById('cfgtext').textContent = 'config unavailable (' + e + ')'; });
+  }); }
 
   poll(); // kick off live updates
 })();
