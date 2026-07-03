@@ -34,6 +34,19 @@ func Resolve(snap *model.Snapshot, view *model.MDNSView, req *dns.Msg) Outcome {
 	name := strings.ToLower(dns.Fqdn(q.Name))
 	qtype := q.Qtype
 
+	// Step 1b — resolver.arpa is a special-use domain (RFC 9462 §6.4) that MUST be
+	// answered locally and never forwarded to the public root. With Discovery of
+	// Designated Resolvers unconfigured, we return authoritative NODATA (NOERROR, no
+	// records) for the whole space — the correct "no designated encrypted resolver"
+	// signal — so a client's DDR probe (SVCB _dns.resolver.arpa) stays on the LAN
+	// instead of leaking upstream. (This is also the hook where a future DDR feature
+	// would synthesize the SVCB pointing at splitdnsd's own encrypted endpoint.)
+	if name == "resolver.arpa." || strings.HasSuffix(name, ".resolver.arpa.") {
+		resp := reply(req)
+		resp.Authoritative = true
+		return Outcome{Msg: resp}
+	}
+
 	// Step 2 — static specials / seeded hosts (R5), exact match wins.
 	if out, ok := answerStatic(snap, req, name, qtype); ok {
 		return out

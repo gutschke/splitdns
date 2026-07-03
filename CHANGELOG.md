@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Resolver
+- `resolver.arpa` (RFC 9462 special-use domain) is now answered locally as authoritative
+  NODATA and never forwarded upstream, so a client's Discovery of Designated Resolvers
+  probe (`SVCB _dns.resolver.arpa`) stays on the LAN. This is also the hook a future
+  encrypted-transport (DoT/DoH) feature would use to advertise a designated resolver.
+
 ## [0.1.0] — 2026-06-25
 
 First public release: a split-horizon DNS resolver that mirrors Cloudflare-hosted

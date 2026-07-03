@@ -317,3 +317,29 @@ func TestForwardMinimalANY(t *testing.T) {
 		t.Errorf("minimal-ANY rcode = %d, want NOERROR", msg.Rcode)
 	}
 }
+
+// resolver.arpa (RFC 9462) is a special-use domain: answered locally as authoritative
+// NODATA and NEVER forwarded, so a DDR probe can't leak to the public root.
+func TestResolverArpaSpecialUse(t *testing.T) {
+	snap := &model.Snapshot{}
+	view := &model.MDNSView{}
+	for _, name := range []string{"_dns.resolver.arpa", "resolver.arpa", "foo.resolver.arpa"} {
+		out, msg := ask(t, snap, view, name, dns.TypeSVCB)
+		if out.Forward || len(out.Stub) > 0 {
+			t.Errorf("%s: must be answered locally, got Forward=%v Stub=%v", name, out.Forward, out.Stub)
+		}
+		if msg == nil {
+			t.Fatalf("%s: nil message", name)
+		}
+		if msg.Rcode != dns.RcodeSuccess || len(msg.Answer) != 0 {
+			t.Errorf("%s: want NOERROR/NODATA (empty), got rcode=%s answers=%d", name, dns.RcodeToString[msg.Rcode], len(msg.Answer))
+		}
+		if !msg.Authoritative {
+			t.Errorf("%s: response should be authoritative", name)
+		}
+	}
+	// A lookalike that is NOT under resolver.arpa must still forward normally.
+	if out, _ := ask(t, snap, view, "resolver.arpa.example.com", dns.TypeA); !out.Forward {
+		t.Errorf("resolver.arpa.example.com should forward, got %+v", out)
+	}
+}
