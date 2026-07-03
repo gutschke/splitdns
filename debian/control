@@ -10,7 +10,7 @@ Rules-Requires-Root: no
 Package: splitdnsd
 Architecture: any
 Depends: ${misc:Depends}, adduser
-Recommends: splitdns-notify (= ${binary:Version})
+Recommends: splitdns-notify (= ${binary:Version}), ieee-data
 Description: split-horizon DNS resolver with optional Cloudflare mirror
  splitdnsd is a lightweight authoritative and forwarding DNS resolver for a
  trusted LAN. It serves *.local names from mDNS, answers reverse (PTR) zones,

@@ -103,7 +103,7 @@ Maintainer: gutschke <gutschke@users.noreply.github.com>
 Section: net
 Priority: optional
 Depends: adduser, init-system-helpers (>= 1.54~)
-Recommends: splitdns-notify (= ${PKGVER})
+Recommends: splitdns-notify (= ${PKGVER}), ieee-data
 Built-Using: ${BUILT_USING}
 Homepage: https://github.com/gutschke/splitdns
 Description: split-horizon DNS resolver with Cloudflare mirror
