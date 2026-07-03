@@ -284,6 +284,27 @@ func vhostReply(snap *model.Snapshot, req *dns.Msg, name, owner string, qtype ui
 		}
 	case dns.TypeCNAME, dns.TypeHTTPS:
 		// Explicitly stripped on the redirect path.
+	case dns.TypeANY:
+		// Functional ANY on a redirected name: the reverse-proxy address(es), plus (at
+		// the apex) the real non-address RRsets (mail/zone metadata). Address and
+		// CNAME/HTTPS RRsets remain redirect-controlled.
+		if snap.VHostV4.IsValid() {
+			resp.Answer = append(resp.Answer, addrRR(name, dns.TypeA, snap.VHostV4.String(), vhostTTL))
+		}
+		if snap.VHostV6.IsValid() {
+			resp.Answer = append(resp.Answer, addrRR(name, dns.TypeAAAA, snap.VHostV6.String(), vhostTTL))
+		}
+		if owner == "" && zone != nil {
+			for t, rrs := range zone.Records[""] {
+				if t == dns.TypeA || t == dns.TypeAAAA || t == dns.TypeCNAME || t == dns.TypeHTTPS {
+					continue
+				}
+				appendMatching(resp, rrs, name, t)
+			}
+		}
+		if len(resp.Answer) > 0 {
+			return resp
+		}
 	default:
 		// At the apex, non-address RRsets are real (mail, zone metadata).
 		if owner == "" && zone != nil {

@@ -466,6 +466,21 @@ func TestFunctionalLocalANY(t *testing.T) {
 	if _, ml := ask(t, snap, view, "edge.local.", dns.TypeANY); len(ml.Answer) == 0 {
 		t.Error("*.local ANY should return the host's records")
 	}
+	// Wildcard match: ANY enumerates the synthesized RRsets (the reported bug — was NODATA
+	// while A/AAAA worked). Here the flattened wildcard tunnel A + AAAA.
+	_, mw := ask(t, snap, view, "random.example.com.", dns.TypeANY)
+	if wt := answerTypes(mw); !wt[dns.TypeA] || !wt[dns.TypeAAAA] {
+		t.Errorf("wildcard ANY missing A/AAAA (got %v)", mw.Answer)
+	}
+	// Vhost-redirected label: ANY returns the reverse-proxy address.
+	if _, mv := ask(t, snap, view, "shop.example.com.", dns.TypeANY); len(mv.Answer) == 0 {
+		t.Error("vhost ANY should return the redirect address")
+	}
+	// Redirected apex: ANY returns the redirect address plus the real MX (zone metadata).
+	_, ma := ask(t, snap, view, "example.com.", dns.TypeANY)
+	if at := answerTypes(ma); !at[dns.TypeA] || !at[dns.TypeMX] {
+		t.Errorf("apex vhost ANY should include redirect A + real MX (got %v)", ma.Answer)
+	}
 	// Forwarded/public name: ANY stays minimal (a single HINFO RFC8482), never enumerated.
 	_, mf := ask(t, snap, view, "notlocal.example.org.", dns.TypeANY)
 	if len(mf.Answer) != 1 {

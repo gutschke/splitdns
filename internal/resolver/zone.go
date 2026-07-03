@@ -95,6 +95,25 @@ func answerAuthoritative(req *dns.Msg, zone *model.Zone, name, owner string, qty
 func wildcardOrNX(resp *dns.Msg, zone *model.Zone, name string, qtype uint16) *dns.Msg {
 	wt := zone.TunnelAddr["*"]
 	wc := zone.Wildcards
+	if qtype == dns.TypeANY {
+		// Functional ANY at a wildcard match (RFC 4592): enumerate every synthesized
+		// RRset, mirroring the exact-owner ANY case — a flattened wildcard CNAME is
+		// suppressed in favor of its tunnel addresses. No wildcard at all => NXDOMAIN.
+		if len(wc) == 0 && len(wt) == 0 {
+			setNegativeSOA(resp, zone.SOA, zone.Apex, dns.RcodeNameError)
+			return resp
+		}
+		for t, rrs := range wc {
+			if t == dns.TypeCNAME && len(wt) > 0 {
+				continue
+			}
+			appendMatching(resp, rrs, name, t)
+		}
+		for t, rrs := range wt {
+			appendMatching(resp, rrs, name, t)
+		}
+		return resp
+	}
 	if (qtype == dns.TypeA || qtype == dns.TypeAAAA) && len(wt[qtype]) > 0 {
 		appendMatching(resp, wt[qtype], name, qtype)
 		return resp
