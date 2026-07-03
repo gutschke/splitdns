@@ -95,6 +95,7 @@ func (r *Resolver) compute(addrs []netip.Addr) Info {
 		if !ip.IsValid() {
 			continue
 		}
+		ip = ip.Unmap() // treat ::ffff:a.b.c.d as the IPv4 it is
 		if ip.Is4() {
 			v4 = true
 		} else {

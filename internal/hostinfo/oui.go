@@ -81,9 +81,11 @@ func (d *OUIDB) ensure(now time.Time) {
 	}
 	d.checking.Lock()
 	defer d.checking.Unlock()
-	// Re-check under the load lock (another goroutine may have just loaded).
+	// Re-check under the load lock (another goroutine may have just loaded). Capture every
+	// field we need under the RLock — never read d.table/d.src outside a lock (data race).
 	d.mu.RLock()
-	fresh = d.table != nil && now.Sub(d.checked) < refreshEvery
+	loaded := d.table != nil
+	fresh = loaded && now.Sub(d.checked) < refreshEvery
 	prevSrc, prevMtime := d.src, d.mtime
 	d.mu.RUnlock()
 	if fresh {
@@ -95,7 +97,7 @@ func (d *OUIDB) ensure(now time.Time) {
 		d.store(map[uint32]string{}, "", time.Time{}, now)
 		return
 	}
-	if d.table != nil && src == prevSrc && mtime.Equal(prevMtime) {
+	if loaded && src == prevSrc && mtime.Equal(prevMtime) {
 		d.mu.Lock()
 		d.checked = now
 		d.mu.Unlock()

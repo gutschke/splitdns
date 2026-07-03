@@ -291,7 +291,7 @@ func looksLikeID(s string) bool {
 	hex := 0
 	for _, c := range s {
 		switch {
-		case c >= '0' && c <= '9', c >= 'a' && c <= 'f':
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f', c >= 'A' && c <= 'F':
 			hex++
 		case c == '-':
 		default:

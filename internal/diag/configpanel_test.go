@@ -63,3 +63,31 @@ func TestConfigEndpointRedacts(t *testing.T) {
 		t.Errorf("non-secret config should be shown:\n%s", body)
 	}
 }
+
+// Regression for the review's H1/H2: multi-line-string and array secret values must not
+// leak their bodies, and every secret key the config schema defines is masked.
+func TestRedactConfigMultilineAndArray(t *testing.T) {
+	in := []byte(`ok = "keepme"
+control_password = """
+SUPERSECRETBODY
+"""
+tsig_secret = '''
+LITERALSECRET
+'''
+api_key = ["AKIALEAK1", "AKIALEAK2"]
+token = [
+  "MULTILINELEAK1",
+  "MULTILINELEAK2",
+]
+tsig_keys = [ { name = "n", secret = "INLINELEAK==" } ]
+`)
+	out := redactConfig(in)
+	for _, leak := range []string{"SUPERSECRETBODY", "LITERALSECRET", "AKIALEAK1", "AKIALEAK2", "MULTILINELEAK1", "MULTILINELEAK2", "INLINELEAK=="} {
+		if strings.Contains(out, leak) {
+			t.Errorf("secret %q leaked:\n%s", leak, out)
+		}
+	}
+	if !strings.Contains(out, `ok = "keepme"`) {
+		t.Errorf("non-secret line lost:\n%s", out)
+	}
+}

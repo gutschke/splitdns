@@ -116,17 +116,47 @@ func (s *Server) handleHostInfo(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(info)
 }
 
-// secretAssign matches an inline secret assignment in TOML — a bare `secret`,
-// `tsig_secret`, `control_password`, `password`, `token`, or `api_key` key (NOT the
-// `*_file` path variants, which \b excludes since underscores are word chars). The value
-// (group 2) is replaced with a redaction marker.
-var secretAssign = regexp.MustCompile(`(?i)\b(secret|tsig_secret|control_password|password|passwd|token|api_key|apikey)(\s*=\s*)("[^"]*"|'[^']*'|[^\s,}]+)`)
+const secretKeyAlt = `secret|tsig_secret|control_password|password|passwd|token|api_key|apikey`
+
+// secretKeyLine matches a LINE-START assignment to a secret key (quoted keys allowed),
+// capturing the "key = " prefix (group 1) so the WHOLE value — single-line, multi-line
+// ("""/”'), or array — can be replaced. The `*_file` path keys don't match: after the
+// keyword the regex requires `=`, but `secret_file` has `_file` there.
+var secretKeyLine = regexp.MustCompile(`(?i)^(\s*"?(?:` + secretKeyAlt + `)"?\s*=\s*)(.*)$`)
+
+// secretInline redacts a single-line secret assignment appearing ANYWHERE on a line (e.g.
+// a `secret = "…"` inside an inline table), replacing just its value (group 3).
+var secretInline = regexp.MustCompile(`(?i)\b(` + secretKeyAlt + `)(\s*=\s*)("[^"]*"|'[^']*'|[^\s,}\]]+)`)
 
 // redactConfig masks inline cryptographic material in a raw TOML config so the config panel
 // never discloses a key/token/password even if the operator inlined one instead of using a
-// *_file reference.
+// *_file reference. It handles single-line values, TOML multi-line strings ("""…""" /
+// ”'…”'), and arrays (whose body may span lines), plus secrets embedded in inline tables.
 func redactConfig(b []byte) string {
-	return secretAssign.ReplaceAllString(string(b), `$1$2"***REDACTED***"`)
+	var out []string
+	closer := "" // when set, we are inside a redacted multi-line/array value: drop lines until it closes
+	for _, line := range strings.Split(string(b), "\n") {
+		if closer != "" {
+			if strings.Contains(line, closer) {
+				closer = ""
+			}
+			continue // drop the redacted body (and the line that closes it)
+		}
+		if m := secretKeyLine.FindStringSubmatch(line); m != nil {
+			out = append(out, m[1]+`"***REDACTED***"`)
+			switch val := strings.TrimSpace(m[2]); {
+			case strings.HasPrefix(val, `"""`) && !strings.Contains(val[3:], `"""`):
+				closer = `"""`
+			case strings.HasPrefix(val, `'''`) && !strings.Contains(val[3:], `'''`):
+				closer = `'''`
+			case strings.HasPrefix(val, "[") && !strings.Contains(val, "]"):
+				closer = "]"
+			}
+			continue
+		}
+		out = append(out, secretInline.ReplaceAllString(line, `$1$2"***REDACTED***"`))
+	}
+	return strings.Join(out, "\n")
 }
 
 // handleConfig serves the redacted config file. Read on demand (small file, only hit on
@@ -975,7 +1005,7 @@ func looksLikeMachineID(s string) bool {
 	hex := 0
 	for _, c := range s {
 		switch {
-		case c >= '0' && c <= '9', c >= 'a' && c <= 'f':
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f', c >= 'A' && c <= 'F':
 			hex++
 		case c == '-':
 		default:
