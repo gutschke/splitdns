@@ -70,7 +70,7 @@ func Resolve(snap *model.Snapshot, view *model.MDNSView, req *dns.Msg) Outcome {
 	}
 	// Steps 6+7 — vhost redirect (short-circuit) then authoritative CF zone.
 	if apex := longestZoneSuffix(name, snap.Zones); apex != "" {
-		return answerZoneOrVHost(snap, req, name, apex, qtype)
+		return answerZoneOrVHost(snap, view, req, name, apex, qtype)
 	}
 	// Step 8 — everything else is forwarded. ANY is answered minimally (RFC 8482,
 	// §2.4c) instead of relayed, so splitdnsd cannot be used as an ANY-amplification
@@ -231,7 +231,7 @@ func answerLocal(view *model.MDNSView, req *dns.Msg, name string, qtype uint16) 
 	return Outcome{Msg: resp}
 }
 
-func answerZoneOrVHost(snap *model.Snapshot, req *dns.Msg, name, apex string, qtype uint16) Outcome {
+func answerZoneOrVHost(snap *model.Snapshot, view *model.MDNSView, req *dns.Msg, name, apex string, qtype uint16) Outcome {
 	zone := snap.Zones[apex]
 	owner := relativeOwner(name, apex)
 
@@ -240,6 +240,19 @@ func answerZoneOrVHost(snap *model.Snapshot, req *dns.Msg, name, apex string, qt
 	// zones (Snapshot.Excluded) fall through to the authoritative assembler.
 	if isVHostCandidate(snap, apex, owner) {
 		return Outcome{Msg: vhostReply(snap, req, name, owner, qtype, zone)}
+	}
+	// Step 6b — split-horizon mDNS overlay: a single-label host that is NOT an explicit CF
+	// owner but IS known on the LAN via mDNS serves its mDNS address(es) directly (so it is
+	// reachable + SSH-able on the LAN under its zone name) and inherits the rest — MX/TXT/…
+	// — from the wildcard. Address families the mDNS host lacks are NODATA, never the
+	// wildcard's public address. NOTE: this lets a trusted-LAN mDNS announcement shadow the
+	// A/AAAA of a non-vhost zone subdomain (same trust basis as the *.local plane).
+	if zone != nil && view != nil {
+		if zone.Records[owner] == nil && zone.TunnelAddr[owner] == nil {
+			if mrecs := view.Forward[owner]; len(mrecs) > 0 {
+				return Outcome{Msg: mdnsZoneReply(zone, req, name, owner, qtype, mrecs)}
+			}
+		}
 	}
 	// Step 7 — authoritative CF zone.
 	return Outcome{Msg: answerAuthoritative(req, zone, name, owner, qtype)}
@@ -268,6 +281,50 @@ func isVHostCandidate(snap *model.Snapshot, apex, owner string) bool {
 // APEX still serves its real non-address RRsets (MX/SOA/NS/CAA/TXT/TLSA) — only a
 // pure www/vhost LABEL is address-only. (Inverting this would break mail/zone
 // metadata for a redirected apex.)
+// mdnsZoneReply answers a CF-zone subdomain that resolves to an mDNS-known host: its
+// address record(s) come from the mDNS view, every other type is inherited from the
+// wildcard (split-horizon). A missing address family is NODATA — never the wildcard's
+// public address — so LAN traffic reaches the host directly.
+func mdnsZoneReply(zone *model.Zone, req *dns.Msg, name, owner string, qtype uint16, mrecs []model.RR) *dns.Msg {
+	resp := reply(req)
+	resp.Authoritative = true
+	switch qtype {
+	case dns.TypeA, dns.TypeAAAA:
+		appendMatching(resp, mrecs, name, qtype)
+	case dns.TypeANY:
+		appendMatching(resp, mrecs, name, dns.TypeANY) // all mDNS address records
+		for t, rrs := range zone.Wildcards {
+			if t == dns.TypeA || t == dns.TypeAAAA || t == dns.TypeCNAME || t == dns.TypeHTTPS {
+				continue
+			}
+			appendMatching(resp, rrs, name, t)
+		}
+		return resp
+	case dns.TypeCNAME, dns.TypeHTTPS:
+		// An mDNS host has no CNAME/HTTPS; leave NODATA.
+	default:
+		appendMatching(resp, zone.Wildcards[qtype], name, qtype) // MX/TXT/CAA/… from the wildcard
+	}
+	if len(resp.Answer) == 0 {
+		setNegativeSOA(resp, zone.SOA, zone.Apex, dns.RcodeSuccess) // NODATA (the name exists via mDNS)
+	}
+	return resp
+}
+
+// vhostInherited returns the RRsets a redirected name inherits for NON-address types:
+// the real apex RRsets at the apex, otherwise the wildcard RRsets (so a vhost/www label
+// still answers the zone-wide MX/TXT/CAA/etc). Address families are never inherited — a
+// redirected name's A/AAAA is exclusively the reverse proxy.
+func vhostInherited(zone *model.Zone, owner string) map[uint16][]model.RR {
+	if zone == nil {
+		return nil
+	}
+	if owner == "" {
+		return zone.Records[""]
+	}
+	return zone.Wildcards
+}
+
 func vhostReply(snap *model.Snapshot, req *dns.Msg, name, owner string, qtype uint16, zone *model.Zone) *dns.Msg {
 	resp := reply(req)
 	resp.Authoritative = true
@@ -285,33 +342,30 @@ func vhostReply(snap *model.Snapshot, req *dns.Msg, name, owner string, qtype ui
 	case dns.TypeCNAME, dns.TypeHTTPS:
 		// Explicitly stripped on the redirect path.
 	case dns.TypeANY:
-		// Functional ANY on a redirected name: the reverse-proxy address(es), plus (at
-		// the apex) the real non-address RRsets (mail/zone metadata). Address and
-		// CNAME/HTTPS RRsets remain redirect-controlled.
+		// Functional ANY on a redirected name: the reverse-proxy address(es), plus the
+		// inherited non-address RRsets (mail/zone metadata) — real records at the apex,
+		// otherwise the wildcard. Address and CNAME/HTTPS RRsets stay redirect-controlled.
 		if snap.VHostV4.IsValid() {
 			resp.Answer = append(resp.Answer, addrRR(name, dns.TypeA, snap.VHostV4.String(), vhostTTL))
 		}
 		if snap.VHostV6.IsValid() {
 			resp.Answer = append(resp.Answer, addrRR(name, dns.TypeAAAA, snap.VHostV6.String(), vhostTTL))
 		}
-		if owner == "" && zone != nil {
-			for t, rrs := range zone.Records[""] {
-				if t == dns.TypeA || t == dns.TypeAAAA || t == dns.TypeCNAME || t == dns.TypeHTTPS {
-					continue
-				}
-				appendMatching(resp, rrs, name, t)
+		for t, rrs := range vhostInherited(zone, owner) {
+			if t == dns.TypeA || t == dns.TypeAAAA || t == dns.TypeCNAME || t == dns.TypeHTTPS {
+				continue
 			}
+			appendMatching(resp, rrs, name, t)
 		}
 		if len(resp.Answer) > 0 {
 			return resp
 		}
 	default:
-		// At the apex, non-address RRsets are real (mail, zone metadata).
-		if owner == "" && zone != nil {
-			if rrs := zone.Records[""][qtype]; len(rrs) > 0 {
-				appendMatching(resp, rrs, name, qtype)
-				return resp
-			}
+		// Non-address RRsets are inherited from the zone: the real apex RRset at the apex,
+		// otherwise the wildcard — so a vhost/www name still answers MX/TXT/CAA/etc.
+		if rrs := vhostInherited(zone, owner)[qtype]; len(rrs) > 0 {
+			appendMatching(resp, rrs, name, qtype)
+			return resp
 		}
 	}
 	if zone != nil {

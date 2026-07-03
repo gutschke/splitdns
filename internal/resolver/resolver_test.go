@@ -490,3 +490,82 @@ func TestFunctionalLocalANY(t *testing.T) {
 		t.Errorf("forwarded ANY should be minimal HINFO, got %v", mf.Answer[0])
 	}
 }
+
+// A vhost/www label serves the reverse-proxy address for A/AAAA but INHERITS the zone's
+// non-address RRsets (MX/TXT/CAA…) from the wildcard — never the wildcard's address.
+func TestVHostInheritsWildcard(t *testing.T) {
+	zone := &model.Zone{
+		Apex: "z.test.", SOA: soa("z.test."),
+		Records: map[string]map[uint16][]model.RR{},
+		ENT:     map[string]bool{},
+		Wildcards: map[uint16][]model.RR{
+			dns.TypeMX: {{Name: "*.z.test.", Type: dns.TypeMX, Class: dns.ClassINET, TTL: 300, Priority: 10, Target: "mail.z.test."}},
+			dns.TypeA:  {a("203.0.113.9")}, // wildcard address — must NOT leak to a vhost name
+		},
+		TunnelAddr: map[string]map[uint16][]model.RR{},
+	}
+	snap := &model.Snapshot{
+		Zones:   map[string]*model.Zone{"z.test.": zone},
+		VHosts:  map[string]bool{"app": true},
+		VHostV4: netip.MustParseAddr("10.0.0.7"),
+	}
+	view := &model.MDNSView{}
+
+	_, ma := ask(t, snap, view, "app.z.test.", dns.TypeA)
+	if len(ma.Answer) != 1 || ma.Answer[0].(*dns.A).A.String() != "10.0.0.7" {
+		t.Errorf("vhost A = %+v, want the proxy 10.0.0.7 (not the wildcard 203.0.113.9)", ma.Answer)
+	}
+	if _, mmx := ask(t, snap, view, "app.z.test.", dns.TypeMX); len(mmx.Answer) != 1 {
+		t.Errorf("vhost MX should inherit the wildcard MX, got %+v", mmx.Answer)
+	}
+	_, many := ask(t, snap, view, "app.z.test.", dns.TypeANY)
+	types := map[uint16]bool{}
+	for _, rr := range many.Answer {
+		types[rr.Header().Rrtype] = true
+	}
+	if !types[dns.TypeA] || !types[dns.TypeMX] {
+		t.Errorf("vhost ANY should be proxy A + wildcard MX, got %+v", many.Answer)
+	}
+}
+
+// Split-horizon mDNS overlay: a non-vhost, non-CF-owner subdomain that is an mDNS host
+// serves its LAN address(es), inherits MX/etc from the wildcard, NODATAs a missing address
+// family (never leaks the wildcard's public address), and yields to an explicit CF owner.
+func TestMDNSZoneOverlay(t *testing.T) {
+	zone := &model.Zone{
+		Apex: "z.test.", SOA: soa("z.test."),
+		Records: map[string]map[uint16][]model.RR{},
+		ENT:     map[string]bool{},
+		Wildcards: map[uint16][]model.RR{
+			dns.TypeMX:   {{Type: dns.TypeMX, Class: dns.ClassINET, TTL: 300, Priority: 10, Target: "mail.z.test."}},
+			dns.TypeA:    {a("203.0.113.9")}, // wildcard public address — must NOT win over mDNS
+			dns.TypeAAAA: {aaaa("2001:db8::9")},
+		},
+		TunnelAddr: map[string]map[uint16][]model.RR{},
+	}
+	snap := &model.Snapshot{Zones: map[string]*model.Zone{"z.test.": zone}} // no vhost redirect
+	view := &model.MDNSView{Forward: map[string][]model.RR{"host": {a("10.0.0.5")}}}
+
+	if _, m := ask(t, snap, view, "host.z.test.", dns.TypeA); len(answers(m, dns.TypeA)) != 1 || answers(m, dns.TypeA)[0] != "10.0.0.5" {
+		t.Errorf("mDNS-zone A = %v, want mDNS [10.0.0.5] (not wildcard 203.0.113.9)", answers(m, dns.TypeA))
+	}
+	if _, m := ask(t, snap, view, "host.z.test.", dns.TypeAAAA); len(m.Answer) != 0 {
+		t.Errorf("mDNS-zone AAAA should be NODATA (host has no v6, never leak wildcard AAAA), got %+v", m.Answer)
+	}
+	if _, m := ask(t, snap, view, "host.z.test.", dns.TypeMX); len(m.Answer) != 1 {
+		t.Errorf("mDNS-zone MX should inherit the wildcard, got %+v", m.Answer)
+	}
+	_, many := ask(t, snap, view, "host.z.test.", dns.TypeANY)
+	types := map[uint16]bool{}
+	for _, rr := range many.Answer {
+		types[rr.Header().Rrtype] = true
+	}
+	if !types[dns.TypeA] || !types[dns.TypeMX] || types[dns.TypeAAAA] {
+		t.Errorf("mDNS-zone ANY = %+v, want A+MX (no wildcard AAAA)", many.Answer)
+	}
+	// An explicit CF owner wins over the mDNS overlay.
+	zone.Records["host"] = map[uint16][]model.RR{dns.TypeA: {a("203.0.113.77")}}
+	if _, m := ask(t, snap, view, "host.z.test.", dns.TypeA); len(answers(m, dns.TypeA)) != 1 || answers(m, dns.TypeA)[0] != "203.0.113.77" {
+		t.Errorf("explicit CF owner should win over mDNS, got %v", answers(m, dns.TypeA))
+	}
+}
