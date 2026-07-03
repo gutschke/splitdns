@@ -374,7 +374,9 @@ func main() {
 	}
 
 	// Read-only diagnostics HTTP (R10), localhost-only by default.
-	hostRes := hostinfo.New(hostinfo.NewOUIDB(), hostinfo.Options{Ping: true})
+	oui := hostinfo.NewOUIDB()
+	hostRes := hostinfo.New(oui, hostinfo.Options{Ping: true})    // lazy /host panel: may probe ARP
+	clientRes := hostinfo.New(oui, hostinfo.Options{Ping: false}) // poll path: passive only, no probing
 	diagSrv := diag.New(cfg.Diag.Addr, st.snapshot.Load, src.View, version, func(m string) { slog.Warn(m) }).
 		WithConfigFile(*configPath).
 		WithHostInfo(func(name string) (hostinfo.Info, bool) {
@@ -435,6 +437,11 @@ func main() {
 			}
 		}
 		return ""
+	})
+	// Best-effort device/vendor guess per client, from the client's MAC (EUI-64 in an IPv6
+	// address, or the local ARP table) -> OUI. Passive + cached; runs in the diag poll.
+	diagSrv.WithClientDevice(func(ip netip.Addr) string {
+		return strings.Join(clientRes.Lookup(ip.String(), []netip.Addr{ip}).Vendors, ", ")
 	})
 	if cfg.Diag.SocketMode != "" {
 		// Non-fatal: a bad diag.socket_mode must not stop DNS — warn and keep the default.

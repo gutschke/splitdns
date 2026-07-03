@@ -50,6 +50,7 @@ type Server struct {
 	selftest       func(context.Context) []TestResult
 	ddnsSim        func(ctx context.Context, host string, addrs []netip.Addr, ignoreEligible bool) ddns.SimResult
 	clientName     func(netip.Addr) string // resolve a client IP to a name (cache/mDNS only)
+	clientDevice   func(netip.Addr) string // guess a client's device/vendor from its MAC (nil => omitted)
 	allow          func(netip.Addr) bool   // nil => allow all sources
 	socketMode     os.FileMode             // Unix-socket permission (0 => 0660)
 	controls       Controls
@@ -274,6 +275,11 @@ func (s *Server) WithControls(c Controls) *Server { s.controls = c; return s }
 // WithClientNames wires a resolver from a client IP to a display name (from the mDNS
 // view / answer cache only — no network lookups). Used to annotate the query telemetry.
 func (s *Server) WithClientNames(fn func(netip.Addr) string) *Server { s.clientName = fn; return s }
+
+// WithClientDevice wires a cheap, passive device/vendor guess (from the client's MAC via
+// the local neighbor table / EUI-64) shown next to each client in the Queries panel. It runs
+// in the poll, so the provider must be cached and must NOT probe the network.
+func (s *Server) WithClientDevice(fn func(netip.Addr) string) *Server { s.clientDevice = fn; return s }
 
 // WithAccess restricts which source IPs may reach the endpoint. nil (the default) allows
 // all. Unix-socket clients are always allowed.
@@ -924,6 +930,7 @@ type queryView struct {
 type clientView struct {
 	Client     string          `json:"client"`
 	Name       string          `json:"name,omitempty"`
+	Device     string          `json:"device,omitempty"` // vendor/device guess from the client's MAC (OUI)
 	Count      uint64          `json:"count"`
 	LastSeen   string          `json:"last_seen"`
 	TopNames   []nameCountView `json:"top_names,omitempty"`  // this client's most-asked names
@@ -1076,7 +1083,7 @@ func (s *Server) build() page {
 		}
 	}
 	if s.qlog != nil {
-		p.Queries = buildQueryStats(s.qlog, s.clientName)
+		p.Queries = buildQueryStats(s.qlog, s.clientName, s.clientDevice)
 	}
 	if s.backends != nil {
 		p.Backends = buildBackends(s.backends())
@@ -1114,12 +1121,18 @@ func hitRatio(hits, misses uint64) string {
 // recentQueryLimit caps how many recent queries the page renders (the ring may hold more).
 const recentQueryLimit = 100
 
-func buildQueryStats(l *qlog.Log, nameFor func(netip.Addr) string) *queryStats {
+func buildQueryStats(l *qlog.Log, nameFor, deviceFor func(netip.Addr) string) *queryStats {
 	name := func(a netip.Addr) string {
 		if nameFor == nil || !a.IsValid() {
 			return ""
 		}
 		return nameFor(a)
+	}
+	device := func(a netip.Addr) string {
+		if deviceFor == nil || !a.IsValid() {
+			return ""
+		}
+		return deviceFor(a)
 	}
 	tot := l.Totals()
 	qs := &queryStats{Total: tot.Total, Clients: tot.Clients, ByDecision: map[string]uint64{}, ByTransport: map[string]uint64{}}
@@ -1147,6 +1160,7 @@ func buildQueryStats(l *qlog.Log, nameFor func(netip.Addr) string) *queryStats {
 		cv := clientView{
 			Client:   addrStr(c.Client),
 			Name:     name(c.Client),
+			Device:   device(c.Client),
 			Count:    c.Count,
 			LastSeen: c.LastSeen.Format("15:04:05"),
 		}
@@ -1538,8 +1552,8 @@ transport <select name="transport"><option value="do53">Do53 (UDP)</option><opti
 <p class="muted"><span data-f="by_decision">{{range $d, $n := .ByDecision}}{{$d}}={{$n}} {{end}}</span></p>
 <p class="muted">transport: <span data-f="by_transport">{{range $t, $n := .ByTransport}}{{$t}}={{$n}} {{end}}</span></p>
 <h3>Busiest clients <span class="muted">(recent activity — counts decay ~10&nbsp;min half-life; the transports column is lifetime, to see whether a client ever upgraded; click a header to sort)</span></h3>
-<table class="sortable" data-rows="top_clients" data-defsort="2:num:desc"><thead><tr><th>client</th><th>name</th><th>queries</th><th>last seen</th><th>top names</th><th>transports</th></tr></thead><tbody>
-{{range .Top}}<tr data-key="{{.Client}}"><td data-f="client">{{.Client}}</td><td data-f="name" class="muted">{{.Name}}</td><td data-f="count">{{.Count}}</td><td data-f="last_seen" class="muted">{{.LastSeen}}</td><td data-f="top_names" class="muted">{{range .TopNames}}{{.Name}} ({{.Count}}) {{end}}</td><td data-f="transports">{{range .Transports}}{{.Name}}:{{.Count}} {{end}}</td></tr>{{end}}</tbody></table>
+<table class="sortable" data-rows="top_clients" data-defsort="3:num:desc"><thead><tr><th>client</th><th>name</th><th>device</th><th>queries</th><th>last seen</th><th>top names</th><th>transports</th></tr></thead><tbody>
+{{range .Top}}<tr data-key="{{.Client}}"><td data-f="client">{{.Client}}</td><td data-f="name" class="muted">{{.Name}}</td><td data-f="device" class="muted">{{.Device}}</td><td data-f="count">{{.Count}}</td><td data-f="last_seen" class="muted">{{.LastSeen}}</td><td data-f="top_names" class="muted">{{range .TopNames}}{{.Name}} ({{.Count}}) {{end}}</td><td data-f="transports">{{range .Transports}}{{.Name}}:{{.Count}} {{end}}</td></tr>{{end}}</tbody></table>
 <h3>Recent queries <span class="muted">(click a header to sort)</span></h3>
 <table class="sortable" data-rows="recent" data-defsort="key:num:desc"><thead><tr><th>time</th><th>client</th><th>proto</th><th>name</th><th>type</th><th>decision</th><th>rcode</th><th>ms</th></tr></thead><tbody>
 {{range .Recent}}<tr data-key="{{.Seq}}"><td data-f="time" class="muted">{{.Time}}</td><td data-f="client">{{.Client}}{{if .ClientName}} <span data-f="cname" class="muted">{{.ClientName}}</span>{{end}}</td><td data-f="transport">{{.Transport}}</td><td data-f="name">{{.Name}}</td><td data-f="type">{{.Type}}</td>
@@ -1713,8 +1727,8 @@ transport <select name="transport"><option value="do53">Do53 (UDP)</option><opti
       var xports = function(a){ return (a || []).map(function(n){ return n.name + ':' + n.count; }).join(' '); };
       var top = root.querySelector('table[data-rows="top_clients"]');
       reconcile(top.tBodies[0], d.top_clients || [], function(x){ return x.client; },
-        function(x){ var tr = document.createElement('tr'); tr.innerHTML = '<td data-f="client"></td><td data-f="name" class="muted"></td><td data-f="count"></td><td data-f="last_seen" class="muted"></td><td data-f="top_names" class="muted"></td><td data-f="transports"></td>'; fcell(tr,'client').textContent = x.client; return tr; },
-        function(tr, x){ patchText(fcell(tr,'name'), x.name || ''); patchText(fcell(tr,'count'), x.count); patchText(fcell(tr,'last_seen'), x.last_seen || ''); patchText(fcell(tr,'top_names'), (x.top_names || []).map(function(n){ return n.name + ' (' + n.count + ')'; }).join(' ')); patchText(fcell(tr,'transports'), xports(x.transports)); });
+        function(x){ var tr = document.createElement('tr'); tr.innerHTML = '<td data-f="client"></td><td data-f="name" class="muted"></td><td data-f="device" class="muted"></td><td data-f="count"></td><td data-f="last_seen" class="muted"></td><td data-f="top_names" class="muted"></td><td data-f="transports"></td>'; fcell(tr,'client').textContent = x.client; return tr; },
+        function(tr, x){ patchText(fcell(tr,'name'), x.name || ''); patchText(fcell(tr,'device'), x.device || ''); patchText(fcell(tr,'count'), x.count); patchText(fcell(tr,'last_seen'), x.last_seen || ''); patchText(fcell(tr,'top_names'), (x.top_names || []).map(function(n){ return n.name + ' (' + n.count + ')'; }).join(' ')); patchText(fcell(tr,'transports'), xports(x.transports)); });
       applySort(top);
       var rec = root.querySelector('table[data-rows="recent"]');
       reconcile(rec.tBodies[0], d.recent || [], function(x){ return x.seq; }, makeRecent, fillRecent); // only the client name can change
