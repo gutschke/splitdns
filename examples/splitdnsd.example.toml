@@ -172,3 +172,29 @@ dir = "/var/lib/splitdns"
 # answers      = true
 # serve_stale  = true
 # max_entries  = 10000
+
+# ---------------------------------------------------------------------------
+# Encrypted client front-end (DoT + DoH) with DDR discovery — OPT-IN, OFF by
+# default. Lets LAN clients reach THIS resolver over DNS-over-TLS (RFC 7858)
+# and DNS-over-HTTPS (RFC 8484), auto-discovered via RFC 9462 (Chrome/ChromeOS)
+# or opportunistically (Android on :853), so they encrypt to you instead of a
+# public resolver that would bypass split-horizon. See guide/encrypted-dns.md.
+[encrypted]
+# enabled = false
+# Certificate for the Authentication Domain Name (ADN). Use a PUBLICLY-TRUSTED
+# cert whose SAN is the ADN (your existing ACME setup). Key mode 0400 splitdns:splitdns.
+# cert_file = "/etc/splitdns/tls/adn.crt"
+# key_file  = "/etc/splitdns/tls/adn.key"
+# adn = "dns.example.net"     # must resolve to this resolver's LAN IPs (split-horizon)
+# mode = ""                    # "" inherits [listen].mode; or "explicit" + addresses
+# addresses = []
+# advertise_ddr = true         # synthesize the SVCB at _dns.resolver.arpa
+# ipv4_hint = []               # override DDR hints/ADN A (default: bound listener addrs)
+# ipv6_hint = []
+# [encrypted.dot]
+# enabled = true
+# port    = 853
+# [encrypted.doh]
+# enabled = true
+# port    = 443
+# path    = "/dns-query"

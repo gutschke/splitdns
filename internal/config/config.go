@@ -5,6 +5,8 @@ package config
 
 import (
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net/netip"
 	"os"
@@ -14,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/miekg/dns"
 	"github.com/pelletier/go-toml/v2"
 
 	"github.com/gutschke/splitdns/internal/netmatch"
@@ -22,16 +25,17 @@ import (
 
 // Config is the fully-resolved runtime configuration.
 type Config struct {
-	Listen     ListenConfig   `toml:"listen"`
-	Access     AccessConfig   `toml:"access"`
-	Upstream   UpstreamConfig `toml:"upstream"`
-	Zones      ZonesConfig    `toml:"zones"`
-	VHost      VHostConfig    `toml:"vhost"`
-	Cloudflare CFConfig       `toml:"cloudflare"`
-	DDNS       DDNSConfig     `toml:"ddns"`
-	Notify     NotifyConfig   `toml:"notify"`
-	Diag       DiagConfig     `toml:"diag"`
-	Cache      CacheConfig    `toml:"cache"`
+	Listen     ListenConfig    `toml:"listen"`
+	Access     AccessConfig    `toml:"access"`
+	Upstream   UpstreamConfig  `toml:"upstream"`
+	Zones      ZonesConfig     `toml:"zones"`
+	VHost      VHostConfig     `toml:"vhost"`
+	Cloudflare CFConfig        `toml:"cloudflare"`
+	DDNS       DDNSConfig      `toml:"ddns"`
+	Notify     NotifyConfig    `toml:"notify"`
+	Diag       DiagConfig      `toml:"diag"`
+	Cache      CacheConfig     `toml:"cache"`
+	Encrypted  EncryptedConfig `toml:"encrypted"`
 }
 
 // ListenConfig controls which local addresses :53 binds. Mode "private-auto"
@@ -282,6 +286,72 @@ type DiagConfig struct {
 	ControlPasswordFile string `toml:"control_password_file"`
 }
 
+// EncryptedConfig is the OPT-IN encrypted client front-end (DoT/DoH) plus its DDR
+// advertising (RFC 9462). Disabled by default. When enabled it terminates DNS-over-TLS
+// and/or DNS-over-HTTPS for LAN clients using an operator-provided certificate for the
+// Authentication Domain Name (ADN); a failure to load the cert degrades to Do53-only
+// (fail-closed) rather than taking the daemon down.
+type EncryptedConfig struct {
+	Enabled  bool   `toml:"enabled"`
+	CertFile string `toml:"cert_file"` // PEM cert chain for the ADN
+	KeyFile  string `toml:"key_file"`  // PEM private key, mode 0400 splitdns:splitdns
+	ADN      string `toml:"adn"`       // Authentication Domain Name (a cert SAN)
+	// Mode/Addresses mirror [listen]: "" inherits [listen].mode; "explicit" needs addresses.
+	Mode      string   `toml:"mode"`
+	Addresses []string `toml:"addresses"`
+	// AdvertiseDDR emits the SVCB designation at _dns.resolver.arpa (default follows Enabled
+	// via Default()). Turn off to run the encrypted listeners without DDR discovery.
+	AdvertiseDDR bool `toml:"advertise_ddr"`
+	// IPv4Hint/IPv6Hint override the DDR address hints (and the ADN A/AAAA). Empty uses the
+	// encrypted listeners' own bound local-scope addresses.
+	IPv4Hint []string `toml:"ipv4_hint"`
+	IPv6Hint []string `toml:"ipv6_hint"`
+
+	DoT DoTConfig `toml:"dot"`
+	DoH DoHConfig `toml:"doh"`
+}
+
+// DoTConfig is the DNS-over-TLS listener (RFC 7858), default port 853.
+type DoTConfig struct {
+	Enabled bool `toml:"enabled"`
+	Port    int  `toml:"port"`
+}
+
+// DoHConfig is the DNS-over-HTTPS listener (RFC 8484), default port 443, path /dns-query.
+type DoHConfig struct {
+	Enabled bool   `toml:"enabled"`
+	Port    int    `toml:"port"`
+	Path    string `toml:"path"`
+}
+
+// ADNFqdn returns the ADN as a lowercased FQDN with trailing dot (as the resolver stores
+// and compares it), or "" if unset.
+func (e EncryptedConfig) ADNFqdn() string {
+	if e.ADN == "" {
+		return ""
+	}
+	return dns.Fqdn(strings.ToLower(e.ADN))
+}
+
+// LoadCert loads and validates the ADN cert+key pair (parse + not expired).
+func (e EncryptedConfig) LoadCert() (tls.Certificate, error) {
+	cert, err := tls.LoadX509KeyPair(e.CertFile, e.KeyFile)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	leaf := cert.Leaf
+	if leaf == nil {
+		if leaf, err = x509.ParseCertificate(cert.Certificate[0]); err != nil {
+			return tls.Certificate{}, fmt.Errorf("parse leaf: %w", err)
+		}
+		cert.Leaf = leaf
+	}
+	if time.Now().After(leaf.NotAfter) {
+		return tls.Certificate{}, fmt.Errorf("certificate expired on %s", leaf.NotAfter.Format(time.RFC3339))
+	}
+	return cert, nil
+}
+
 // CacheConfig holds the warm-start cache location plus the forward-path answer cache
 // tunables. TTL flooring/capping uses the DNS-best-practice defaults (RFC 2308/8767/
 // 9520) baked into the anscache package; only the high-level knobs are exposed here.
@@ -314,6 +384,14 @@ func Default() Config {
 		DDNS:       DDNSConfig{Enabled: false, DryRun: true, Rate: "10m", NotifySocket: "/run/splitdns/notify.sock"},
 		Diag:       DiagConfig{Addr: "127.0.0.1:8080"},
 		Cache:      CacheConfig{Dir: "/var/lib/splitdns", Answers: true, MaxEntries: 10000, ServeStale: true},
+		// Encrypted client front-end OFF by default; if enabled, both transports come up on
+		// their standard ports and DDR is advertised.
+		Encrypted: EncryptedConfig{
+			Enabled:      false,
+			AdvertiseDDR: true,
+			DoT:          DoTConfig{Enabled: true, Port: 853},
+			DoH:          DoHConfig{Enabled: true, Port: 443, Path: "/dns-query"},
+		},
 	}
 }
 
@@ -403,6 +481,49 @@ func (c Config) Validate() error {
 		if _, err := strconv.ParseUint(c.DDNS.NotifySocketMode, 8, 32); err != nil {
 			return fmt.Errorf("ddns.notify_socket_mode %q is not octal (e.g. \"0660\")", c.DDNS.NotifySocketMode)
 		}
+	}
+	if err := c.Encrypted.validate(); err != nil {
+		return fmt.Errorf("encrypted: %w", err)
+	}
+	return nil
+}
+
+// validate checks the encrypted front-end config. A disabled block never fails; an enabled
+// one must name at least one transport, load a valid (parseable, unexpired) cert, and have
+// sane ports/ADN/path. Loading the cert here means -check-config catches a bad/expired cert
+// at ExecStartPre, before the daemon even starts.
+func (e EncryptedConfig) validate() error {
+	if !e.Enabled {
+		return nil
+	}
+	if !e.DoT.Enabled && !e.DoH.Enabled {
+		return fmt.Errorf("enabled but neither dot nor doh is enabled")
+	}
+	if e.CertFile == "" || e.KeyFile == "" {
+		return fmt.Errorf("cert_file and key_file are required when enabled")
+	}
+	if _, err := e.LoadCert(); err != nil {
+		return fmt.Errorf("cert: %w", err)
+	}
+	if e.ADN == "" || dns.Fqdn(e.ADN) == "." {
+		return fmt.Errorf("adn is required when enabled")
+	}
+	if _, ok := dns.IsDomainName(e.ADN); !ok {
+		return fmt.Errorf("adn %q is not a valid domain name", e.ADN)
+	}
+	if e.DoT.Enabled && (e.DoT.Port <= 0 || e.DoT.Port > 65535) {
+		return fmt.Errorf("dot.port %d out of range", e.DoT.Port)
+	}
+	if e.DoH.Enabled {
+		if e.DoH.Port <= 0 || e.DoH.Port > 65535 {
+			return fmt.Errorf("doh.port %d out of range", e.DoH.Port)
+		}
+		if !strings.HasPrefix(e.DoH.Path, "/") {
+			return fmt.Errorf("doh.path %q must start with /", e.DoH.Path)
+		}
+	}
+	if e.Mode == "explicit" && len(e.Addresses) == 0 {
+		return fmt.Errorf("mode=explicit requires addresses")
 	}
 	return nil
 }

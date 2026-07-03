@@ -5,10 +5,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"net/netip"
 	"os"
 	"os/signal"
@@ -26,6 +31,7 @@ import (
 	"github.com/gutschke/splitdns/internal/config"
 	"github.com/gutschke/splitdns/internal/ddns"
 	"github.com/gutschke/splitdns/internal/diag"
+	"github.com/gutschke/splitdns/internal/encrypted"
 	"github.com/gutschke/splitdns/internal/forwarder"
 	"github.com/gutschke/splitdns/internal/loglimit"
 	"github.com/gutschke/splitdns/internal/mdns"
@@ -47,6 +53,7 @@ var version = "dev"
 // (§2.1, §2.2). The CF mirror/builder will Store newer snapshots here.
 type state struct {
 	snapshot atomic.Pointer[model.Snapshot]
+	ddr      atomic.Pointer[model.DDRAdvert] // current DDR advert (nil => resolver.arpa NODATA)
 }
 
 func main() {
@@ -101,6 +108,22 @@ func main() {
 		fmt.Printf("reverse zones (explicit + detect=%s): %v\n", detect, revZones)
 		if len(refused) > 0 {
 			fmt.Printf("reverse zones REFUSED (not boundary-aligned, configure explicitly): %v\n", refused)
+		}
+		if cfg.Encrypted.Enabled {
+			if cfg.Encrypted.DoT.Enabled {
+				if a, e := encListenAddrs(cfg, cfg.Encrypted.DoT.Port); e == nil {
+					fmt.Printf("encrypted DoT: %v\n", a)
+				}
+			}
+			if cfg.Encrypted.DoH.Enabled {
+				if a, e := encListenAddrs(cfg, cfg.Encrypted.DoH.Port); e == nil {
+					fmt.Printf("encrypted DoH: %v path=%s\n", a, cfg.Encrypted.DoH.Path)
+				}
+			}
+			// The cert was already parsed+expiry-checked by config.Load()'s Validate().
+			cert, _ := cfg.Encrypted.LoadCert()
+			fmt.Printf("encrypted adn=%s cert=%s (expires %s) advertise_ddr=%v\n",
+				cfg.Encrypted.ADN, cfg.Encrypted.CertFile, cert.Leaf.NotAfter.Format(time.RFC3339), cfg.Encrypted.AdvertiseDDR)
 		}
 		return
 	}
@@ -333,7 +356,18 @@ func main() {
 	}
 	defer srv.Shutdown()
 
-	// Tell systemd (Type=notify) that startup is complete and :53 is bound.
+	// Encrypted client front-end (DoT/DoH) + DDR advertising — OPT-IN, best-effort. A cert
+	// or bind failure logs and skips the encrypted plane; Do53 is unaffected (fail-closed).
+	// The advert is published only after listeners bind and the cert validates, and is
+	// re-synced on cert reload (SIGHUP / mtime), so a client is never sent to a dead port.
+	var encMgr *encrypted.Manager
+	var encReloader *encrypted.CertReloader
+	if cfg.Encrypted.Enabled {
+		encMgr, encReloader = startEncrypted(ctx, cfg, srv, builder, &st.ddr)
+	}
+
+	// Tell systemd (Type=notify) that startup is complete and :53 is bound. Fired after the
+	// best-effort encrypted start so an optional DoT/DoH bind failure can't wedge readiness.
 	if err := supervisor.NotifyReady(); err != nil {
 		slog.Warn("sd_notify READY failed", "err", err)
 	}
@@ -352,6 +386,12 @@ func main() {
 	diagSrv.WithQueryLog(queryLog)
 	diagSrv.WithBackends(fwd.Backends)
 	diagSrv.WithWorkers(sup.Stats)
+	if encMgr != nil {
+		diagSrv.WithEncrypted(func() *diag.EncStatus {
+			return buildEncStatus(cfg, encReloader, encMgr, &st.ddr, st.snapshot.Load, src.View)
+		})
+	}
+	diagSrv.WithTransportQuery(makeTransportQuery(listen, encMgr, cfg))
 	// Resolve a client IP to a display name from local data only (mDNS reverse view, then
 	// a cached PTR) — never a fresh network lookup.
 	diagSrv.WithClientNames(func(ip netip.Addr) string {
@@ -516,6 +556,9 @@ func main() {
 		dctx, cancel := context.WithTimeout(context.Background(), diagShutdownBound)
 		defer cancel()
 		diagSrv.Shutdown(dctx)
+		if encMgr != nil {
+			encMgr.Shutdown(dctx) // stop accepting encrypted connections before Do53
+		}
 		srv.Shutdown()
 	})
 }
@@ -543,6 +586,327 @@ func shutdownWithDeadline(grace time.Duration, shut func()) {
 		dumpGoroutines()
 		osExit(1)
 	}
+}
+
+// startEncrypted brings up the opt-in DoT/DoH listeners and wires DDR advertising. It is
+// best-effort: any cert/bind failure logs and it returns whatever came up (possibly nil),
+// never blocking Do53. The DDR advert is (re)published only while a valid cert is loaded
+// and is re-synced on cert reload (mtime poll + SIGHUP).
+func startEncrypted(ctx context.Context, cfg config.Config, handler *server.Server, builder *mirror.Builder, ddr *atomic.Pointer[model.DDRAdvert]) (*encrypted.Manager, *encrypted.CertReloader) {
+	ec := cfg.Encrypted
+	reloader, err := encrypted.NewCertReloader(ec.CertFile, ec.KeyFile, func(m string) { slog.Warn(m) })
+	if err != nil {
+		slog.Error("encrypted: certificate unavailable — DoT/DoH disabled, Do53 unaffected", "err", err)
+		return nil, nil
+	}
+	mgr := encrypted.NewManager(handler, reloader, func(m string) { slog.Info(m) })
+	dotUp, dohUp := false, false
+	if ec.DoT.Enabled {
+		if addrs, aerr := encListenAddrs(cfg, ec.DoT.Port); aerr != nil {
+			slog.Warn("encrypted: DoT address selection failed", "err", aerr)
+		} else if serr := mgr.StartDoT(addrs); serr != nil {
+			slog.Warn("encrypted: DoT listener failed — continuing without it", "err", serr)
+		} else {
+			dotUp = true
+		}
+	}
+	if ec.DoH.Enabled {
+		if addrs, aerr := encListenAddrs(cfg, ec.DoH.Port); aerr != nil {
+			slog.Warn("encrypted: DoH address selection failed", "err", aerr)
+		} else if serr := mgr.StartDoH(addrs, ec.DoH.Path); serr != nil {
+			slog.Warn("encrypted: DoH listener failed — continuing without it", "err", serr)
+		} else {
+			dohUp = true
+		}
+	}
+	if !dotUp && !dohUp {
+		return nil, nil
+	}
+
+	if ec.AdvertiseDDR {
+		v4, v6 := ddrHints(ec, mgr)
+		builder.SetDDRProvider(func() *model.DDRAdvert { return ddr.Load() })
+		resync := func() {
+			var adv *model.DDRAdvert
+			if reloader.Valid() { // withdraw the advert if the cert lapses (fail-closed)
+				adv = &model.DDRAdvert{ADN: ec.ADNFqdn(), V4Hints: v4, V6Hints: v6}
+				if dotUp {
+					adv.DoT = &model.DDREndpoint{Port: uint16(ec.DoT.Port)}
+				}
+				if dohUp {
+					adv.DoH = &model.DDREndpoint{Port: uint16(ec.DoH.Port), Path: ec.DoH.Path}
+				}
+			}
+			ddr.Store(adv)
+			builder.Republish()
+		}
+		resync()
+		go reloader.Run(ctx, resync)
+		go func() {
+			hup := make(chan os.Signal, 1)
+			signal.Notify(hup, syscall.SIGHUP)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-hup:
+					reloader.ReloadNow(resync)
+				}
+			}
+		}()
+	}
+	return mgr, reloader
+}
+
+// buildEncStatus assembles the diagnostics view of the encrypted front-end + DDR: cert
+// details, listeners, the SVCB actually served, and the upgrade-readiness checklist.
+func buildEncStatus(cfg config.Config, rel *encrypted.CertReloader, mgr *encrypted.Manager, ddr *atomic.Pointer[model.DDRAdvert], snap func() *model.Snapshot, view func() *model.MDNSView) *diag.EncStatus {
+	ec := cfg.Encrypted
+	es := &diag.EncStatus{Enabled: ec.Enabled, ADN: ec.ADN, AdvertiseDDR: ec.AdvertiseDDR, DoHPath: ec.DoH.Path, CertValid: rel.Valid()}
+	notAfter, sans, ok := rel.CertInfo()
+	es.SANs = sans
+	if ok {
+		if d := time.Until(notAfter); d < 0 {
+			es.Expiry = "EXPIRED " + notAfter.Format("2006-01-02")
+		} else {
+			es.Expiry = fmt.Sprintf("in %dd (%s)", int(d.Hours()/24), notAfter.Format("2006-01-02"))
+		}
+	}
+	for _, a := range mgr.DoTAddrs() {
+		es.DoT = append(es.DoT, a.String())
+	}
+	for _, a := range mgr.DoHAddrs() {
+		es.DoH = append(es.DoH, a.String())
+	}
+	adv := ddr.Load()
+	es.DDRReady = adv != nil
+	if s := snap(); s != nil { // render the SVCB actually served (reuses the resolver)
+		req := new(dns.Msg)
+		req.SetQuestion("_dns.resolver.arpa.", dns.TypeSVCB)
+		if out := resolver.Resolve(s, view(), req); out.Msg != nil {
+			for _, rr := range out.Msg.Answer {
+				es.SVCB = append(es.SVCB, rr.String())
+			}
+		}
+	}
+	adnOK := sanMatches(sans, ec.ADN)
+	hints := adv != nil && (len(adv.V4Hints) > 0 || len(adv.V6Hints) > 0)
+	es.Checks = []diag.EncCheck{
+		{Name: "encrypted enabled", OK: ec.Enabled},
+		{Name: "certificate valid & unexpired", OK: rel.Valid(), Detail: es.Expiry},
+		{Name: "ADN matches a certificate SAN", OK: adnOK, Detail: ec.ADN},
+		{Name: "DoT listener up", OK: len(es.DoT) > 0},
+		{Name: "DoH listener up", OK: len(es.DoH) > 0},
+		{Name: "DDR advertising (SVCB served)", OK: adv != nil},
+		{Name: "ADN resolves to LAN address hints", OK: hints},
+	}
+	return es
+}
+
+// makeTransportQuery returns the diagnostics transport tester: it issues a query at THIS
+// resolver over Do53/DoT/DoH and reports the answer plus the TLS handshake (so an operator
+// can see exactly why a client fails to upgrade). Encrypted transports report "not enabled"
+// when the front-end is off.
+func makeTransportQuery(listen []string, mgr *encrypted.Manager, cfg config.Config) func(context.Context, string, string, string) diag.TransportResult {
+	adn := cfg.Encrypted.ADN
+	dohPath := cfg.Encrypted.DoH.Path
+	do53 := queryTarget(listen)
+	var dotAddr, dohAddr string
+	if mgr != nil {
+		if a := mgr.DoTAddrs(); len(a) > 0 {
+			dotAddr = a[0].String()
+		}
+		if a := mgr.DoHAddrs(); len(a) > 0 {
+			dohAddr = a[0].String()
+		}
+	}
+	return func(ctx context.Context, transport, name, qtype string) diag.TransportResult {
+		res := diag.TransportResult{Transport: transport, Query: name + "/" + qtype}
+		qt := dns.StringToType[qtype]
+		if qt == 0 {
+			qt = dns.TypeA
+		}
+		m := new(dns.Msg)
+		m.SetQuestion(dns.Fqdn(name), qt)
+		start := time.Now()
+		switch transport {
+		case "do53", "udp":
+			res.Target = do53
+			resp, _, err := (&dns.Client{Net: "udp", Timeout: 4 * time.Second}).Exchange(m, do53)
+			fillAnswer(&res, resp, err)
+		case "tcp":
+			res.Target = do53
+			resp, _, err := (&dns.Client{Net: "tcp", Timeout: 4 * time.Second}).Exchange(m, do53)
+			fillAnswer(&res, resp, err)
+		case "dot":
+			if dotAddr == "" {
+				res.Err = "DoT listener not enabled"
+				break
+			}
+			res.Target = dotAddr
+			conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 4 * time.Second}, "tcp", dotAddr, &tls.Config{ServerName: adn, NextProtos: []string{"dot"}})
+			if err != nil {
+				res.Err = "TLS: " + err.Error()
+				break
+			}
+			defer conn.Close()
+			res.TLS = tlsSummary(conn.ConnectionState())
+			resp, _, err := (&dns.Client{}).ExchangeWithConn(m, &dns.Conn{Conn: conn})
+			fillAnswer(&res, resp, err)
+		case "doh":
+			if dohAddr == "" {
+				res.Err = "DoH listener not enabled"
+				break
+			}
+			u := "https://" + dohAddr + dohPath
+			res.Target = u
+			wire, _ := m.Pack()
+			req, _ := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(wire))
+			req.Header.Set("Content-Type", "application/dns-message")
+			client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{ServerName: adn}}}
+			hr, err := client.Do(req)
+			if err != nil {
+				res.Err = err.Error()
+				break
+			}
+			defer hr.Body.Close()
+			if hr.TLS != nil {
+				res.TLS = tlsSummary(*hr.TLS)
+			}
+			if hr.StatusCode != http.StatusOK {
+				res.Err = "HTTP " + hr.Status
+				break
+			}
+			body, _ := io.ReadAll(io.LimitReader(hr.Body, 65535))
+			resp := new(dns.Msg)
+			if e := resp.Unpack(body); e != nil {
+				res.Err = "unpack: " + e.Error()
+				break
+			}
+			fillAnswer(&res, resp, nil)
+		default:
+			res.Err = "unknown transport"
+		}
+		res.LatencyMS = float64(time.Since(start).Microseconds()) / 1000
+		return res
+	}
+}
+
+func fillAnswer(res *diag.TransportResult, resp *dns.Msg, err error) {
+	if err != nil {
+		res.Err = err.Error()
+		return
+	}
+	if resp == nil {
+		res.Err = "no response"
+		return
+	}
+	res.OK = true
+	res.Rcode = dns.RcodeToString[resp.Rcode]
+	for _, rr := range resp.Answer {
+		res.Answer = append(res.Answer, rr.String())
+	}
+}
+
+func tlsSummary(cs tls.ConnectionState) string {
+	ver := map[uint16]string{tls.VersionTLS12: "TLS1.2", tls.VersionTLS13: "TLS1.3"}[cs.Version]
+	if ver == "" {
+		ver = fmt.Sprintf("0x%04x", cs.Version)
+	}
+	s := ver
+	if cs.NegotiatedProtocol != "" {
+		s += " alpn=" + cs.NegotiatedProtocol
+	}
+	if len(cs.PeerCertificates) > 0 {
+		s += " cert=" + cs.PeerCertificates[0].Subject.CommonName
+	}
+	return s
+}
+
+// queryTarget picks a reachable address for the transport tester's Do53 query — a loopback
+// listener if one is bound, else the first listen address.
+func queryTarget(listen []string) string {
+	for _, a := range listen {
+		if ap, err := netip.ParseAddrPort(a); err == nil && ap.Addr().IsLoopback() {
+			return a
+		}
+	}
+	if len(listen) > 0 {
+		return listen[0]
+	}
+	return "127.0.0.1:53"
+}
+
+// sanMatches reports whether adn is covered by one of the cert's SAN DNS names (exact or
+// a single-label wildcard).
+func sanMatches(sans []string, adn string) bool {
+	adn = strings.TrimSuffix(strings.ToLower(adn), ".")
+	for _, s := range sans {
+		s = strings.TrimSuffix(strings.ToLower(s), ".")
+		if s == adn {
+			return true
+		}
+		if strings.HasPrefix(s, "*.") && strings.HasSuffix(adn, s[1:]) && strings.Count(adn, ".") == strings.Count(s, ".") {
+			return true
+		}
+	}
+	return false
+}
+
+// encListenAddrs resolves the encrypted front-end's bind set for one transport port.
+// Unlike [listen], explicit encrypted addresses are bare IPs (the port comes from
+// dot.port/doh.port), so we append it here; private-auto enumeration appends it already.
+func encListenAddrs(cfg config.Config, port int) ([]string, error) {
+	ec := cfg.Encrypted
+	mode := ec.Mode
+	if mode == "" {
+		mode = cfg.Listen.Mode
+	}
+	if mode == "explicit" {
+		out := make([]string, 0, len(ec.Addresses))
+		for _, h := range ec.Addresses {
+			out = append(out, net.JoinHostPort(h, strconv.Itoa(port)))
+		}
+		return out, nil
+	}
+	return netmatch.SelectListenAddrs(mode, ec.Addresses, port)
+}
+
+// ddrHints returns the DDR address hints (and thus the ADN A/AAAA) split by family: the
+// explicit config override if set, else the encrypted listeners' own bound addresses,
+// skipping loopback/unspecified.
+func ddrHints(ec config.EncryptedConfig, mgr *encrypted.Manager) (v4, v6 []netip.Addr) {
+	for _, s := range ec.IPv4Hint {
+		if a, err := netip.ParseAddr(s); err == nil && a.Is4() {
+			v4 = append(v4, a)
+		}
+	}
+	for _, s := range ec.IPv6Hint {
+		if a, err := netip.ParseAddr(s); err == nil && a.Is6() && !a.Is4() {
+			v6 = append(v6, a)
+		}
+	}
+	if len(v4) > 0 || len(v6) > 0 {
+		return v4, v6
+	}
+	seen := map[netip.Addr]bool{}
+	for _, a := range mgr.BoundAddrs() {
+		ap, err := netip.ParseAddrPort(a.String())
+		if err != nil {
+			continue
+		}
+		ip := ap.Addr().Unmap()
+		if ip.IsLoopback() || ip.IsUnspecified() || seen[ip] {
+			continue
+		}
+		seen[ip] = true
+		if ip.Is4() {
+			v4 = append(v4, ip)
+		} else {
+			v6 = append(v6, ip)
+		}
+	}
+	return v4, v6
 }
 
 // dumpGoroutines writes every goroutine's stack to stderr (the journal) so a wedged

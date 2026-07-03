@@ -171,3 +171,50 @@ func TestObservabilitySectionsOmittedWhenUnset(t *testing.T) {
 		}
 	}
 }
+
+// The encrypted/DDR status panel and per-query transport render in both JSON and HTML.
+func TestEncryptedStatusAndTransport(t *testing.T) {
+	snap := testSnap()
+	s := New("127.0.0.1:0", func() *model.Snapshot { return snap }, func() *model.MDNSView { return &model.MDNSView{} }, "t", nil)
+
+	now := time.Unix(1_700_000_000, 0)
+	ql := qlog.New(50, 50, qlog.WithClock(func() time.Time { return now }))
+	ql.Record(qlog.Entry{Time: now, Client: netip.MustParseAddr("10.0.0.9"), Transport: "dot", Name: "a.example.", Qtype: "A", Decision: qlog.Forward, Rcode: "NOERROR"})
+	s.WithQueryLog(ql)
+
+	s.WithEncrypted(func() *EncStatus {
+		return &EncStatus{
+			Enabled: true, ADN: "dns.example.net", CertValid: true, Expiry: "in 40d (2026-08-12)",
+			SANs: []string{"dns.example.net"}, DoT: []string{"192.0.2.53:853"},
+			DoH: []string{"192.0.2.53:443"}, DoHPath: "/dns-query",
+			AdvertiseDDR: true, DDRReady: true,
+			SVCB:   []string{`_dns.resolver.arpa.	300	IN	SVCB 1 dns.example.net. alpn="dot" port=853`},
+			Checks: []EncCheck{{Name: "certificate valid & unexpired", OK: true, Detail: "in 40d"}, {Name: "DoT listener up", OK: true}},
+		}
+	})
+
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer s.Shutdown(context.Background())
+
+	_, body := get(t, "http://"+s.Addr()+"/diag.json")
+	for _, want := range []string{
+		`"encrypted"`, `"cert_valid": true`, `"ddr_ready": true`, `"dns.example.net"`, // status
+		`"by_transport"`, `"transport": "dot"`, // per-query + rollup transport
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("diag.json missing %q", want)
+		}
+	}
+
+	_, html := get(t, "http://"+s.Addr()+"/")
+	for _, want := range []string{
+		"Encrypted &amp; DDR", "DDR advertised", "certificate valid", // status panel
+		"<th>proto</th>", "<th>transports</th>", // transport columns
+	} {
+		if !strings.Contains(html, want) {
+			t.Errorf("HTML missing %q", want)
+		}
+	}
+}

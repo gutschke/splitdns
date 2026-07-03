@@ -303,6 +303,46 @@ SERVFAIL \(em the fail-static behavior (RFC 8767). Default \fBtrue\fR.
 .TP
 .B max_entries
 Integer. LRU capacity of the answer cache. Default \fB10000\fR.
+.SH "[encrypted]"
+Opt-in encrypted client front-end: DNS-over-TLS (RFC 7858) and DNS-over-HTTPS
+(RFC 8484) listeners that reuse the same query pipeline as \fB:53\fR (so they inherit the
+\fB[access]\fR policy, the answer cache, and the rebinding filter), plus Discovery of
+Designated Resolvers advertising (RFC 9462). Disabled by default. A missing or unparsable
+certificate degrades to Do53-only rather than taking the daemon down (fail-closed).
+.TP
+.B enabled
+Boolean. Master switch. Default \fBfalse\fR.
+.TP
+.B cert_file\fR, \fBkey_file
+PEM certificate chain and private key for the ADN. Use a publicly-trusted certificate
+whose SAN is the ADN. The key should be mode \fB0400 splitdns:splitdns\fR. Both are
+required when enabled; they are parsed and expiry-checked at startup (and by
+\fB\-check\-config\fR), and hot-reloaded on \fBSIGHUP\fR or file change.
+.TP
+.B adn
+The Authentication Domain Name a client validates the TLS certificate against. It
+\fImust\fR resolve to this resolver's LAN addresses (the daemon answers it authoritatively
+via split-horizon). Required when enabled.
+.TP
+.B mode\fR, \fBaddresses
+Bind selection, mirroring \fB[listen]\fR. Empty \fBmode\fR inherits \fB[listen].mode\fR;
+\fB"explicit"\fR requires \fBaddresses\fR. Default binds only local-scope addresses.
+.TP
+.B advertise_ddr
+Boolean. Synthesize the SVCB designation at \fB_dns.resolver.arpa\fR so DDR-capable
+clients auto-upgrade. Advertised only while a valid certificate is loaded. Default
+\fBtrue\fR.
+.TP
+.B ipv4_hint\fR, \fBipv6_hint
+Override the DDR address hints (and the ADN's A/AAAA). Empty uses the encrypted
+listeners' own bound addresses.
+.TP
+.B [encrypted.dot]
+\fBenabled\fR (default \fBtrue\fR) and \fBport\fR (default \fB853\fR) for the DoT listener.
+.TP
+.B [encrypted.doh]
+\fBenabled\fR (default \fBtrue\fR), \fBport\fR (default \fB443\fR), and \fBpath\fR
+(default \fB"/dns-query"\fR) for the DoH listener.
 .SH EXAMPLE
 A fully annotated example appears in
 .IR /usr/share/doc/splitdnsd/splitdnsd.example.toml .

@@ -43,6 +43,8 @@ type Server struct {
 	qlog           *qlog.Log                        // query telemetry; nil => section omitted
 	backends       func() []forwarder.BackendStatus
 	workers        func() map[string]supervisor.WorkerStats
+	encStatus      func() *EncStatus // encrypted front-end (DoT/DoH)+DDR status; nil => omitted
+	transportQuery func(ctx context.Context, transport, name, qtype string) TransportResult
 	selftest       func(context.Context) []TestResult
 	ddnsSim        func(ctx context.Context, host string, addrs []netip.Addr, ignoreEligible bool) ddns.SimResult
 	clientName     func(netip.Addr) string // resolve a client IP to a name (cache/mDNS only)
@@ -97,6 +99,55 @@ func (s *Server) WithQueryLog(l *qlog.Log) *Server { s.qlog = l; return s }
 
 // WithBackends wires a provider for upstream/backend health (circuit-breaker status).
 func (s *Server) WithBackends(fn func() []forwarder.BackendStatus) *Server { s.backends = fn; return s }
+
+// WithEncrypted wires a provider for the encrypted front-end (DoT/DoH) + DDR status.
+func (s *Server) WithEncrypted(fn func() *EncStatus) *Server { s.encStatus = fn; return s }
+
+// EncStatus is the encrypted-front-end (DoT/DoH) and DDR advertising status the console
+// renders, so an operator can see the certificate and debug why clients don't upgrade.
+type EncStatus struct {
+	Enabled      bool       `json:"enabled"`
+	ADN          string     `json:"adn,omitempty"`
+	CertValid    bool       `json:"cert_valid"`
+	Expiry       string     `json:"expiry,omitempty"` // pre-rendered, e.g. "in 41d (2026-…)" / "EXPIRED"
+	SANs         []string   `json:"sans,omitempty"`   // certificate SAN DNS names
+	DoT          []string   `json:"dot,omitempty"`    // bound DoT listener addresses
+	DoH          []string   `json:"doh,omitempty"`    // bound DoH listener addresses
+	DoHPath      string     `json:"doh_path,omitempty"`
+	AdvertiseDDR bool       `json:"advertise_ddr"`
+	DDRReady     bool       `json:"ddr_ready"`      // the SVCB designation is currently served
+	SVCB         []string   `json:"svcb,omitempty"` // the SVCB RRs actually served at _dns.resolver.arpa
+	Checks       []EncCheck `json:"checks,omitempty"`
+}
+
+// EncCheck is one precondition for DDR upgrade (the "why won't clients upgrade" list).
+type EncCheck struct {
+	Name   string `json:"name"`
+	OK     bool   `json:"ok"`
+	Detail string `json:"detail,omitempty"`
+}
+
+// TransportResult is the outcome of a diagnostic query issued at the resolver over a
+// specific transport (Do53/DoT/DoH) — including TLS handshake details, which is exactly
+// what tells you why a client fails to upgrade.
+type TransportResult struct {
+	Transport string   `json:"transport"`
+	Target    string   `json:"target,omitempty"`
+	Query     string   `json:"query"`
+	OK        bool     `json:"ok"`
+	Rcode     string   `json:"rcode,omitempty"`
+	Answer    []string `json:"answer,omitempty"`
+	TLS       string   `json:"tls,omitempty"` // negotiated version + ALPN + peer cert
+	LatencyMS float64  `json:"latency_ms"`
+	Err       string   `json:"error,omitempty"`
+}
+
+// WithTransportQuery wires the transport tester (GET /tquery): it runs a query at the
+// resolver over the chosen transport and reports the result. nil omits the tool.
+func (s *Server) WithTransportQuery(fn func(ctx context.Context, transport, name, qtype string) TransportResult) *Server {
+	s.transportQuery = fn
+	return s
+}
 
 // WithWorkers wires a provider for supervisor worker stats (restarts/stalls/panics).
 func (s *Server) WithWorkers(fn func() map[string]supervisor.WorkerStats) *Server {
@@ -225,6 +276,9 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.ddnsSim != nil {
 		mux.HandleFunc("/ddns-simulate", s.handleDDNSSimulate)
 	}
+	if s.transportQuery != nil {
+		mux.HandleFunc("/tquery", s.handleTransportQuery)
+	}
 	if s.controlsActive {
 		mux.HandleFunc("/control/", s.handleControl)
 	}
@@ -308,6 +362,7 @@ var controlMinInterval = map[string]time.Duration{
 	"restart":        10 * time.Second,
 	"selftest":       2 * time.Second, // active probes; don't let a client hammer them
 	"ddns-simulate":  1 * time.Second,
+	"tquery":         1 * time.Second, // issues a real query (incl. a TLS handshake)
 }
 
 // handleSelfTest runs the on-demand self-tests (GET) under a bounded context and renders
@@ -376,6 +431,59 @@ func (s *Server) handleDDNSSimulate(w http.ResponseWriter, r *http.Request) {
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(res)
 }
+
+// handleTransportQuery runs a diagnostic query at the resolver over a chosen transport
+// (GET; it only queries, never mutates). Renders HTML or JSON.
+func (s *Server) handleTransportQuery(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.FormValue("name"))
+	if name == "" {
+		http.Error(w, "usage: /tquery?name=<fqdn>&type=A&transport=do53|tcp|dot|doh", http.StatusBadRequest)
+		return
+	}
+	qtype := strings.ToUpper(strings.TrimSpace(r.FormValue("type")))
+	if qtype == "" {
+		qtype = "A"
+	}
+	transport := strings.ToLower(strings.TrimSpace(r.FormValue("transport")))
+	if transport == "" {
+		transport = "do53"
+	}
+	if !s.controlRateOK("tquery") {
+		http.Error(w, "rate-limited; retry shortly", http.StatusTooManyRequests)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 6*time.Second)
+	defer cancel()
+	res := s.transportQuery(ctx, transport, name, qtype)
+	if strings.Contains(r.Header.Get("Accept"), "text/html") {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if err := tqueryTmpl.Execute(w, res); err != nil {
+			s.log(fmt.Sprintf("diag: tquery render: %v", err))
+		}
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(res)
+}
+
+var tqueryTmpl = template.Must(template.New("tquery").Parse(`<!doctype html>
+<html><head><meta charset="utf-8"><title>Transport query</title>
+<style>body{font:14px/1.4 system-ui,sans-serif;margin:1.5rem;color:#222}
+.ok{color:#161} .flag{color:#c00} .muted{color:#777}
+pre{background:#f6f8fa;padding:.6rem;border-radius:4px;overflow:auto}</style>
+</head><body>
+<h1>Transport query <span class="muted">{{.Transport}}</span></h1><p><a href="/">&larr; back</a></p>
+<p><b>{{.Query}}</b> via <b>{{.Transport}}</b>{{if .Target}} → {{.Target}}{{end}} —
+{{if .OK}}<span class="ok">OK</span>{{else}}<span class="flag">FAILED</span>{{end}}
+<span class="muted">({{printf "%.1f" .LatencyMS}} ms)</span></p>
+{{if .Err}}<p class="flag">error: {{.Err}}</p>{{end}}
+{{if .TLS}}<p class="muted">TLS: {{.TLS}}</p>{{end}}
+{{if .Rcode}}<p>rcode: <b>{{.Rcode}}</b></p>{{end}}
+{{if .Answer}}<pre>{{range .Answer}}{{.}}
+{{end}}</pre>{{end}}
+</body></html>`))
 
 var ddnsSimTmpl = template.Must(template.New("ddnssim").Funcs(template.FuncMap{
 	"add": func(a, b int) int { return a + b },
@@ -650,9 +758,11 @@ type page struct {
 	Queries   *queryStats   `json:"queries,omitempty"`
 	Backends  []backendView `json:"backends,omitempty"`
 	Workers   []workerView  `json:"workers,omitempty"`
+	Enc       *EncStatus    `json:"encrypted,omitempty"`
 	Controls  *controlsView `json:"-"` // HTML-only (the JSON view stays purely read-only)
 	SelfTest  bool          `json:"-"` // HTML-only: render the self-tests link
 	DDNSSim   bool          `json:"-"` // HTML-only: render the DDNS-simulate form
+	TQuery    bool          `json:"-"` // HTML-only: render the transport-query tool form
 }
 
 // controlsView drives the HTML control panel; it lists which actions are wired and
@@ -685,11 +795,12 @@ type cacheEntryView struct {
 
 // queryStats is the query-telemetry rollup plus the recent ring and busiest clients.
 type queryStats struct {
-	Total      uint64            `json:"total"`
-	Clients    int               `json:"clients"`
-	ByDecision map[string]uint64 `json:"by_decision"`
-	Recent     []queryView       `json:"recent"`
-	Top        []clientView      `json:"top_clients"`
+	Total       uint64            `json:"total"`
+	Clients     int               `json:"clients"`
+	ByDecision  map[string]uint64 `json:"by_decision"`
+	ByTransport map[string]uint64 `json:"by_transport"`
+	Recent      []queryView       `json:"recent"`
+	Top         []clientView      `json:"top_clients"`
 }
 
 type queryView struct {
@@ -697,6 +808,7 @@ type queryView struct {
 	Time       string  `json:"time"`
 	Client     string  `json:"client"`
 	ClientName string  `json:"client_name,omitempty"`
+	Transport  string  `json:"transport"`
 	Name       string  `json:"name"`
 	Type       string  `json:"type"`
 	Decision   string  `json:"decision"`
@@ -705,11 +817,12 @@ type queryView struct {
 }
 
 type clientView struct {
-	Client   string          `json:"client"`
-	Name     string          `json:"name,omitempty"`
-	Count    uint64          `json:"count"`
-	LastSeen string          `json:"last_seen"`
-	TopNames []nameCountView `json:"top_names,omitempty"` // this client's most-asked names
+	Client     string          `json:"client"`
+	Name       string          `json:"name,omitempty"`
+	Count      uint64          `json:"count"`
+	LastSeen   string          `json:"last_seen"`
+	TopNames   []nameCountView `json:"top_names,omitempty"`  // this client's most-asked names
+	Transports []nameCountView `json:"transports,omitempty"` // per-transport counts (upgrade debugging)
 }
 
 type nameCountView struct {
@@ -838,6 +951,9 @@ func (s *Server) build() page {
 	if s.workers != nil {
 		p.Workers = buildWorkers(s.workers())
 	}
+	if s.encStatus != nil {
+		p.Enc = s.encStatus()
+	}
 	if s.controlsActive {
 		p.Controls = &controlsView{
 			NeedPassword:  s.controls.Password != "",
@@ -849,6 +965,7 @@ func (s *Server) build() page {
 	}
 	p.SelfTest = s.selftest != nil
 	p.DDNSSim = s.ddnsSim != nil
+	p.TQuery = s.transportQuery != nil
 	return p
 }
 
@@ -872,9 +989,12 @@ func buildQueryStats(l *qlog.Log, nameFor func(netip.Addr) string) *queryStats {
 		return nameFor(a)
 	}
 	tot := l.Totals()
-	qs := &queryStats{Total: tot.Total, Clients: tot.Clients, ByDecision: map[string]uint64{}}
+	qs := &queryStats{Total: tot.Total, Clients: tot.Clients, ByDecision: map[string]uint64{}, ByTransport: map[string]uint64{}}
 	for d, n := range tot.ByDecision {
 		qs.ByDecision[string(d)] = n
+	}
+	for x, n := range tot.ByTransport {
+		qs.ByTransport[x] = n
 	}
 	for _, e := range l.Recent(recentQueryLimit) {
 		qs.Recent = append(qs.Recent, queryView{
@@ -882,6 +1002,7 @@ func buildQueryStats(l *qlog.Log, nameFor func(netip.Addr) string) *queryStats {
 			Time:       e.Time.Format("15:04:05"),
 			Client:     addrStr(e.Client),
 			ClientName: name(e.Client),
+			Transport:  e.Transport,
 			Name:       e.Name,
 			Type:       e.Qtype,
 			Decision:   string(e.Decision),
@@ -898,6 +1019,9 @@ func buildQueryStats(l *qlog.Log, nameFor func(netip.Addr) string) *queryStats {
 		}
 		for _, nc := range c.TopNames {
 			cv.TopNames = append(cv.TopNames, nameCountView{Name: nc.Name, Count: nc.Count})
+		}
+		for _, nc := range c.Transports {
+			cv.Transports = append(cv.Transports, nameCountView{Name: nc.Name, Count: nc.Count})
 		}
 		qs.Top = append(qs.Top, cv)
 	}
@@ -1134,12 +1258,14 @@ addr <input name="addr" size="16" placeholder="1.2.3.4 (public)">
 {{with .Cache}}<a class="chip" id="chip-cache" href="#cache"><span class="lbl">cache</span> <b>{{.HitRatio}}</b></a>{{end}}
 {{with .Workers}}<a class="chip" id="chip-workers" href="#workers"><span class="lbl">workers</span> <b>{{len .}}</b></a>{{end}}
 {{with .Queries}}<a class="chip" id="chip-queries" href="#queries"><span class="lbl">queries</span> <b>{{.Total}}</b></a>{{end}}
+{{if .Enc}}{{if .Enc.Enabled}}<a class="chip {{if and .Enc.CertValid .Enc.DDRReady}}ok{{else}}flag{{end}}" id="chip-encrypted" href="#encrypted"><span class="lbl">encrypted</span> {{if .Enc.DDRReady}}DDR{{else if .Enc.CertValid}}no-DDR{{else}}cert!{{end}}</a>{{end}}{{end}}
 {{if .Controls}}{{if .Controls.NeedPassword}}<a class="chip flag clickable" id="chip-controls" href="#controls" aria-label="Controls locked — activate to unlock"><span class="lbl">controls</span> locked</a>{{end}}{{end}}
 </div>
 <nav class="toc">
 {{if .Controls}}<a href="#controls">Controls</a>{{end}}
 {{if .Backends}}<a href="#upstreams">Upstreams</a>{{end}}
 {{if .Cache}}<a href="#cache">Cache</a>{{end}}
+{{if .Enc}}<a href="#encrypted">Encrypted</a>{{end}}
 {{if .Workers}}<a href="#workers">Workers</a>{{end}}
 {{if .Queries}}<a href="#queries">Queries</a>{{end}}
 <a href="#reference">Reference</a>
@@ -1203,6 +1329,39 @@ traffic onto another.{{end}}</p>
 </section>
 {{end}}
 
+{{with .Enc}}
+<section id="encrypted">
+<h2>Encrypted &amp; DDR <span class="muted">DoT / DoH / discovery</span></h2>
+<div data-live="encrypted">
+{{if .Enabled}}
+<table>
+<tr><th>ADN</th><td data-f="adn">{{.ADN}}</td><th>certificate</th><td data-f="cert" class="{{if .CertValid}}ok{{else}}flag{{end}}">{{if .CertValid}}valid{{else}}INVALID{{end}}{{if .Expiry}} — {{.Expiry}}{{end}}</td></tr>
+<tr><th>cert SANs</th><td data-f="sans" colspan="3" class="muted">{{range .SANs}}{{.}} {{end}}</td></tr>
+<tr><th>DoT</th><td data-f="dot">{{if .DoT}}{{range .DoT}}{{.}} {{end}}{{else}}&mdash;{{end}}</td><th>DoH</th><td data-f="doh">{{if .DoH}}{{range .DoH}}{{.}} {{end}}{{if .DoHPath}}<span class="muted">{{.DoHPath}}</span>{{end}}{{else}}&mdash;{{end}}</td></tr>
+<tr><th>DDR advertised</th><td data-f="ddr" class="{{if .DDRReady}}ok{{else}}flag{{end}}" colspan="3">{{if .DDRReady}}yes — serving the SVCB designation{{else}}no{{end}}</td></tr>
+</table>
+{{if .SVCB}}<details><summary>SVCB served at _dns.resolver.arpa</summary><pre data-f="svcb">{{range .SVCB}}{{.}}
+{{end}}</pre></details>{{end}}
+<h3>Upgrade readiness <span class="muted">(why clients do / don't upgrade)</span></h3>
+<table data-f="checks"><tbody>
+{{range .Checks}}<tr><td class="{{if .OK}}ok{{else}}flag{{end}}">{{if .OK}}OK{{else}}&#10007;{{end}}</td><td>{{.Name}}</td><td class="muted">{{.Detail}}</td></tr>{{end}}
+</tbody></table>
+{{else}}<p class="muted">Encrypted front-end is configured but not currently enabled.</p>{{end}}
+</div>
+</section>
+{{end}}
+
+{{if .TQuery}}
+<section id="tquery">
+<h2>Transport query <span class="muted">test Do53 / DoT / DoH at this resolver</span></h2>
+<form method="get" action="/tquery" style="margin:.3rem 0">
+name <input name="name" size="22" placeholder="example.com or _dns.resolver.arpa">
+type <select name="type"><option>A</option><option>AAAA</option><option>SVCB</option><option>HTTPS</option><option>PTR</option><option>TXT</option></select>
+transport <select name="transport"><option value="do53">Do53 (UDP)</option><option value="tcp">Do53 (TCP)</option><option value="dot">DoT</option><option value="doh">DoH</option></select>
+<button>Query &rarr;</button> <span class="muted">— shows the answer plus the TLS handshake (why a client can't upgrade)</span></form>
+</section>
+{{end}}
+
 {{with .Workers}}
 <section id="workers">
 <h2>Workers <span class="muted">supervisor</span></h2>
@@ -1221,13 +1380,14 @@ traffic onto another.{{end}}</p>
 <h2>Queries</h2>
 <div data-live="queries">
 <p><b data-f="total">{{.Total}}</b> total, <b data-f="clients">{{.Clients}}</b> clients</p>
-<p class="muted" data-f="by_decision">{{range $d, $n := .ByDecision}}{{$d}}={{$n}} {{end}}</p>
-<h3>Busiest clients <span class="muted">(recent activity — counts decay ~10&nbsp;min half-life; click a header to sort)</span></h3>
-<table class="sortable" data-rows="top_clients" data-defsort="2:num:desc"><thead><tr><th>client</th><th>name</th><th>queries</th><th>last seen</th><th>top names</th></tr></thead><tbody>
-{{range .Top}}<tr data-key="{{.Client}}"><td data-f="client">{{.Client}}</td><td data-f="name" class="muted">{{.Name}}</td><td data-f="count">{{.Count}}</td><td data-f="last_seen" class="muted">{{.LastSeen}}</td><td data-f="top_names" class="muted">{{range .TopNames}}{{.Name}} ({{.Count}}) {{end}}</td></tr>{{end}}</tbody></table>
+<p class="muted"><span data-f="by_decision">{{range $d, $n := .ByDecision}}{{$d}}={{$n}} {{end}}</span></p>
+<p class="muted">transport: <span data-f="by_transport">{{range $t, $n := .ByTransport}}{{$t}}={{$n}} {{end}}</span></p>
+<h3>Busiest clients <span class="muted">(recent activity — counts decay ~10&nbsp;min half-life; the transports column is lifetime, to see whether a client ever upgraded; click a header to sort)</span></h3>
+<table class="sortable" data-rows="top_clients" data-defsort="2:num:desc"><thead><tr><th>client</th><th>name</th><th>queries</th><th>last seen</th><th>top names</th><th>transports</th></tr></thead><tbody>
+{{range .Top}}<tr data-key="{{.Client}}"><td data-f="client">{{.Client}}</td><td data-f="name" class="muted">{{.Name}}</td><td data-f="count">{{.Count}}</td><td data-f="last_seen" class="muted">{{.LastSeen}}</td><td data-f="top_names" class="muted">{{range .TopNames}}{{.Name}} ({{.Count}}) {{end}}</td><td data-f="transports">{{range .Transports}}{{.Name}}:{{.Count}} {{end}}</td></tr>{{end}}</tbody></table>
 <h3>Recent queries <span class="muted">(click a header to sort)</span></h3>
-<table class="sortable" data-rows="recent" data-defsort="key:num:desc"><thead><tr><th>time</th><th>client</th><th>name</th><th>type</th><th>decision</th><th>rcode</th><th>ms</th></tr></thead><tbody>
-{{range .Recent}}<tr data-key="{{.Seq}}"><td data-f="time" class="muted">{{.Time}}</td><td data-f="client">{{.Client}}{{if .ClientName}} <span data-f="cname" class="muted">{{.ClientName}}</span>{{end}}</td><td data-f="name">{{.Name}}</td><td data-f="type">{{.Type}}</td>
+<table class="sortable" data-rows="recent" data-defsort="key:num:desc"><thead><tr><th>time</th><th>client</th><th>proto</th><th>name</th><th>type</th><th>decision</th><th>rcode</th><th>ms</th></tr></thead><tbody>
+{{range .Recent}}<tr data-key="{{.Seq}}"><td data-f="time" class="muted">{{.Time}}</td><td data-f="client">{{.Client}}{{if .ClientName}} <span data-f="cname" class="muted">{{.ClientName}}</span>{{end}}</td><td data-f="transport">{{.Transport}}</td><td data-f="name">{{.Name}}</td><td data-f="type">{{.Type}}</td>
 <td data-f="decision">{{.Decision}}</td><td data-f="rcode">{{.Rcode}}</td><td data-f="ms">{{printf "%.1f" .LatencyMS}}</td></tr>{{end}}</tbody></table>
 </div>
 </section>
@@ -1342,6 +1502,7 @@ traffic onto another.{{end}}</p>
     var tr = document.createElement('tr');
     tr.appendChild(td(x.time, 'muted'));
     tr.appendChild(td(x.client, null)); // client cell; the resolved name span is added by fillRecent
+    tr.appendChild(td(x.transport)); // proto (udp/tcp/dot/doh)
     tr.appendChild(td(x.name)); tr.appendChild(td(x.type)); tr.appendChild(td(x.decision)); tr.appendChild(td(x.rcode));
     tr.appendChild(td((x.latency_ms || 0).toFixed(1)));
     fillRecent(tr, x);
@@ -1389,14 +1550,31 @@ traffic onto another.{{end}}</p>
       patchText(fcell(root, 'total'), d.total); patchText(fcell(root, 'clients'), d.clients);
       var bd = ''; Object.keys(d.by_decision || {}).sort().forEach(function(k){ bd += k + '=' + d.by_decision[k] + ' '; });
       patchText(fcell(root, 'by_decision'), bd);
+      var bx = ''; Object.keys(d.by_transport || {}).sort().forEach(function(k){ bx += k + '=' + d.by_transport[k] + ' '; });
+      patchText(fcell(root, 'by_transport'), bx);
+      var xports = function(a){ return (a || []).map(function(n){ return n.name + ':' + n.count; }).join(' '); };
       var top = root.querySelector('table[data-rows="top_clients"]');
       reconcile(top.tBodies[0], d.top_clients || [], function(x){ return x.client; },
-        function(x){ var tr = document.createElement('tr'); tr.innerHTML = '<td data-f="client"></td><td data-f="name" class="muted"></td><td data-f="count"></td><td data-f="last_seen" class="muted"></td><td data-f="top_names" class="muted"></td>'; fcell(tr,'client').textContent = x.client; return tr; },
-        function(tr, x){ patchText(fcell(tr,'name'), x.name || ''); patchText(fcell(tr,'count'), x.count); patchText(fcell(tr,'last_seen'), x.last_seen || ''); patchText(fcell(tr,'top_names'), (x.top_names || []).map(function(n){ return n.name + ' (' + n.count + ')'; }).join(' ')); });
+        function(x){ var tr = document.createElement('tr'); tr.innerHTML = '<td data-f="client"></td><td data-f="name" class="muted"></td><td data-f="count"></td><td data-f="last_seen" class="muted"></td><td data-f="top_names" class="muted"></td><td data-f="transports"></td>'; fcell(tr,'client').textContent = x.client; return tr; },
+        function(tr, x){ patchText(fcell(tr,'name'), x.name || ''); patchText(fcell(tr,'count'), x.count); patchText(fcell(tr,'last_seen'), x.last_seen || ''); patchText(fcell(tr,'top_names'), (x.top_names || []).map(function(n){ return n.name + ' (' + n.count + ')'; }).join(' ')); patchText(fcell(tr,'transports'), xports(x.transports)); });
       applySort(top);
       var rec = root.querySelector('table[data-rows="recent"]');
       reconcile(rec.tBodies[0], d.recent || [], function(x){ return x.seq; }, makeRecent, fillRecent); // only the client name can change
       applySort(rec);
+    },
+    encrypted: function(root, d){
+      if(!d || !d.enabled) return;
+      patchText(fcell(root, 'adn'), d.adn || '');
+      var cert = fcell(root, 'cert'); if(cert){ cert.textContent = (d.cert_valid ? 'valid' : 'INVALID') + (d.expiry ? (' — ' + d.expiry) : ''); cert.className = d.cert_valid ? 'ok' : 'flag'; }
+      patchText(fcell(root, 'sans'), (d.sans || []).join(' '));
+      patchText(fcell(root, 'dot'), (d.dot && d.dot.length) ? d.dot.join(' ') : '—');
+      patchText(fcell(root, 'doh'), (d.doh && d.doh.length) ? (d.doh.join(' ') + (d.doh_path ? (' ' + d.doh_path) : '')) : '—');
+      var ddr = fcell(root, 'ddr'); if(ddr){ ddr.textContent = d.ddr_ready ? 'yes — serving the SVCB designation' : 'no'; ddr.className = d.ddr_ready ? 'ok' : 'flag'; }
+      var svcb = fcell(root, 'svcb'); if(svcb) svcb.textContent = (d.svcb || []).join('\n');
+      var checks = fcell(root, 'checks');
+      if(checks && checks.tBodies[0]){ var tb = checks.tBodies[0]; tb.textContent = '';
+        (d.checks || []).forEach(function(c){ var tr = document.createElement('tr'); tr.appendChild(td(c.ok ? 'OK' : '✗', c.ok ? 'ok' : 'flag')); tr.appendChild(td(c.name)); tr.appendChild(td(c.detail || '', 'muted')); tb.appendChild(tr); });
+      }
     },
     mdns_forward: mdnsPatch,
     mdns_reverse: mdnsPatch
@@ -1432,6 +1610,7 @@ traffic onto another.{{end}}</p>
     if(d.answer_cache) chip('cache', true, '<span class="lbl">cache</span> <b>'+d.answer_cache.hit_ratio+'</b>');
     if(d.workers){ var bad=0; d.workers.forEach(function(w){ bad+=(w.restarts||0)+(w.stalls||0)+(w.panics||0); }); chip('workers', bad===0, '<span class="lbl">workers</span> '+(bad?bad+' events':'OK')); }
     if(d.queries) chip('queries', true, '<span class="lbl">queries</span> <b>'+d.queries.total+'</b>');
+    if(d.encrypted && d.encrypted.enabled){ var e = d.encrypted; chip('encrypted', e.cert_valid && e.ddr_ready, '<span class="lbl">encrypted</span> '+(e.ddr_ready ? 'DDR' : (e.cert_valid ? 'no-DDR' : 'cert!'))); }
   }
 
   function patchSection(root, data){

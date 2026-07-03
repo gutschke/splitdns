@@ -41,6 +41,9 @@ NoNewPrivileges=true
 StateDirectory=splitdns
 RuntimeDirectory=splitdns
 ReadWritePaths=/var/lib/splitdns
+# ADN cert+key for the optional encrypted front-end (read-only; the operator's ACME
+# deploy-hook writes here out-of-band). Leading "-" => absent is fine (feature off).
+ReadOnlyPaths=-/etc/splitdns/tls
 
 # Sandboxing.
 ProtectSystem=strict
@@ -67,7 +70,9 @@ UMask=0077
 # Resource ceilings (design §3 item 11). MemoryMax is the real backstop; size the
 # inbound limiter so steady-state flood RSS sits comfortably below it.
 MemoryMax=512M
-TasksMax=512
+# 1024 (up from 512) leaves headroom for TLS/HTTP-2 goroutines when the encrypted
+# front-end is enabled; MemoryMax + the inbound limiter remain the real backstops.
+TasksMax=1024
 
 [Install]
 WantedBy=multi-user.target

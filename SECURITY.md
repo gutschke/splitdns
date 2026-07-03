@@ -23,6 +23,8 @@ coordinated disclosure will follow.
   non-empty eligibility allowlist (empty = deny-all), authenticated triggers, rate
   limits, and an audit log.
 - The packaged systemd unit runs unprivileged, capability-bounded, and sandboxed.
+- The optional encrypted client front-end (DoT/DoH) and DDR advertising are off by default
+  and fail closed to Do53-only if the certificate is missing or expired.
 
 Especially welcome: reports of a way to make the resolver answer a private/internal
 address to an untrusted client, to trigger a Cloudflare write without authorization,
@@ -34,6 +36,32 @@ API tokens are never stored in this repository or the published package — they
 operator-supplied files on the deployed host. If you find a credential committed
 anywhere in the project, please report it as above; treat any exposed token as
 compromised and roll it immediately.
+
+## Encrypted client front-end (DoT/DoH) and DDR
+
+Off by default. When enabled it terminates DNS-over-TLS/HTTPS for LAN clients and
+advertises itself via DDR (RFC 9462). Design points that must not be "simplified" away:
+
+- **The trust anchor is the ADN certificate, not the SVCB.** DDR data at
+  `_dns.resolver.arpa` is authoritative-local; a client MUST validate the presented cert
+  against the ADN before upgrading (RFC 9462 §4). So a forged SVCB cannot silently
+  redirect a client to a resolver lacking a valid ADN cert — the worst case is a failed
+  upgrade and fallback to Do53, never worse than plaintext Do53 already is.
+- **Fail closed.** A missing/unparsable/expired certificate disables the encrypted
+  listeners and withdraws the DDR advert (`_dns.resolver.arpa` returns NODATA), while Do53
+  keeps serving. `GetCertificate` refuses to hand out an expired cert, so a lapsed cert
+  fails the handshake rather than being trusted. `-check-config` hard-fails on a bad cert
+  at `ExecStartPre`.
+- **One access policy.** DoT/DoH reuse the same `ServeDNS` handler as Do53, so the
+  `[access]` allow/refuse list governs all three transports. The DoH bridge presents the
+  real TLS-peer address (a `*net.TCPAddr`); `X-Forwarded-For` is never trusted.
+- **DoH surface** runs on its own hardened `http.Server` (separate from diagnostics):
+  GET/POST only, `application/dns-message`, a 64 KiB body cap, a single `/dns-query` route,
+  and short timeouts.
+- **No OCSP stapling in v1** — the short-lived, publicly-trusted ADN cert is the substitute;
+  clients validate the chain directly. Keeping the daemon's hot path free of network I/O.
+- **DNR (RFC 9463) is operator configuration, not daemon code** — there is no on-the-wire
+  DNR surface in `splitdnsd`.
 
 ## Diagnostics control plane
 

@@ -6,11 +6,29 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Encrypted client front-end (DoT/DoH) + DDR — opt-in, off by default
+- Optional DNS-over-TLS (RFC 7858) and DNS-over-HTTPS (RFC 8484) listeners for LAN clients,
+  reusing the `:53` query pipeline (so `[access]`, the answer cache, and the rebind filter
+  apply unchanged) with no new dependencies. Configured under `[encrypted]`.
+- Discovery of Designated Resolvers (RFC 9462): synthesizes the SVCB designation at
+  `_dns.resolver.arpa` (and answers the ADN's A/AAAA via split-horizon) so ChromeOS/Chrome
+  auto-upgrade and Android uses opportunistic DoT — instead of defecting to a public
+  resolver that bypasses split-horizon. Advertised only while a valid certificate is loaded.
+- Operator-provided certificate for the Authentication Domain Name, hot-reloaded on SIGHUP
+  or file change (validate-before-swap; never serves an expired cert). Fail-closed: a bad
+  cert degrades to Do53-only without taking DNS down; `-check-config` hard-fails on it.
+- DNR (RFC 9463) documented as an operator DHCP/RA recipe (no daemon code). See
+  `guide/encrypted-dns.md`.
+- Diagnostics console gains an **Encrypted & DDR** panel (certificate ADN/expiry/SANs/
+  validity, DoT/DoH listeners, the SVCB actually served, and an upgrade-readiness
+  checklist that pinpoints *why* clients don't upgrade), a **transport query tool**
+  (issue a Do53/DoT/DoH query at the resolver and see the answer plus the TLS handshake),
+  and **per-query transport** — a `proto` column on recent queries, a transport rollup,
+  and per-client lifetime protocol counts (did this client ever upgrade?).
+
 ### Resolver
-- `resolver.arpa` (RFC 9462 special-use domain) is now answered locally as authoritative
-  NODATA and never forwarded upstream, so a client's Discovery of Designated Resolvers
-  probe (`SVCB _dns.resolver.arpa`) stays on the LAN. This is also the hook a future
-  encrypted-transport (DoT/DoH) feature would use to advertise a designated resolver.
+- `resolver.arpa` (RFC 9462 special-use domain) is answered locally: authoritative NODATA
+  when DDR is off, the synthesized SVCB designation when on — never forwarded upstream.
 
 ## [0.1.0] — 2026-06-25
 
