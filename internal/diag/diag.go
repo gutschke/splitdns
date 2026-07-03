@@ -1356,7 +1356,7 @@ traffic onto another.{{end}}</p>
 <h2>Transport query <span class="muted">test Do53 / DoT / DoH at this resolver</span></h2>
 <form method="get" action="/tquery" style="margin:.3rem 0">
 name <input name="name" size="22" placeholder="example.com or _dns.resolver.arpa">
-type <select name="type"><option>A</option><option>AAAA</option><option>SVCB</option><option>HTTPS</option><option>PTR</option><option>TXT</option></select>
+type <select name="type"><option>A</option><option>AAAA</option><option>ANY</option><option>SVCB</option><option>HTTPS</option><option>PTR</option><option>TXT</option><option>MX</option></select>
 transport <select name="transport"><option value="do53">Do53 (UDP)</option><option value="tcp">Do53 (TCP)</option><option value="dot">DoT</option><option value="doh">DoH</option></select>
 <button>Query &rarr;</button> <span class="muted">— shows the answer plus the TLS handshake (why a client can't upgrade)</span></form>
 </section>

@@ -93,8 +93,8 @@ const ddrTTL = 300
 func resolverArpa(snap *model.Snapshot, req *dns.Msg, name string, qtype uint16) *dns.Msg {
 	resp := reply(req)
 	resp.Authoritative = true
-	if snap.DDR == nil || name != "_dns.resolver.arpa." || qtype != dns.TypeSVCB {
-		return resp // NODATA
+	if snap.DDR == nil || name != "_dns.resolver.arpa." || (qtype != dns.TypeSVCB && qtype != dns.TypeANY) {
+		return resp // NODATA (ANY enumerates the SVCB, like the rest of the local horizon)
 	}
 	prio := uint16(1)
 	if e := snap.DDR.DoT; e != nil {
@@ -136,8 +136,8 @@ func ddrSVCB(d *model.DDRAdvert, priority uint16, alpn []string, port uint16, do
 func ddrADNReply(d *model.DDRAdvert, req *dns.Msg, name string, qtype uint16) *dns.Msg {
 	resp := reply(req)
 	resp.Authoritative = true
-	switch qtype {
-	case dns.TypeA:
+	any := qtype == dns.TypeANY // ANY enumerates both families (functional local ANY)
+	if qtype == dns.TypeA || any {
 		for _, a := range d.V4Hints {
 			if a.Is4() {
 				resp.Answer = append(resp.Answer, &dns.A{
@@ -146,7 +146,8 @@ func ddrADNReply(d *model.DDRAdvert, req *dns.Msg, name string, qtype uint16) *d
 				})
 			}
 		}
-	case dns.TypeAAAA:
+	}
+	if qtype == dns.TypeAAAA || any {
 		for _, a := range d.V6Hints {
 			if a.Is6() {
 				resp.Answer = append(resp.Answer, &dns.AAAA{

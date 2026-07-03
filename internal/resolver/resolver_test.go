@@ -403,13 +403,12 @@ func TestDDRSynthesis(t *testing.T) {
 		t.Errorf("DoH dohpath = %+v, want /dns-query{?dns}", dp)
 	}
 
-	// Non-SVCB and other names in the space stay NODATA even when DDR is live.
+	// Non-SVCB names/qtypes in the space stay NODATA even when DDR is live.
 	for _, tc := range []struct {
 		name  string
 		qtype uint16
 	}{
 		{"_dns.resolver.arpa", dns.TypeA},
-		{"_dns.resolver.arpa", dns.TypeANY},
 		{"resolver.arpa", dns.TypeSVCB},
 		{"foo.resolver.arpa", dns.TypeSVCB},
 	} {
@@ -418,6 +417,10 @@ func TestDDRSynthesis(t *testing.T) {
 			t.Errorf("%s/%d: want authoritative NODATA, got %+v", tc.name, tc.qtype, m)
 		}
 	}
+	// ANY at _dns.resolver.arpa enumerates the SVCB designation (functional local ANY).
+	if _, m := ask(t, snap, view, "_dns.resolver.arpa", dns.TypeANY); len(m.Answer) != 2 {
+		t.Errorf("_dns.resolver.arpa ANY = %d answers, want 2 SVCB", len(m.Answer))
+	}
 
 	// The ADN resolves to the LAN hints (split-horizon), consistent with the SVCB hints.
 	if _, m := ask(t, snap, view, "dns.example.net", dns.TypeA); len(m.Answer) != 1 || m.Answer[0].(*dns.A).A.String() != "192.0.2.53" {
@@ -425,5 +428,50 @@ func TestDDRSynthesis(t *testing.T) {
 	}
 	if _, m := ask(t, snap, view, "dns.example.net", dns.TypeAAAA); len(m.Answer) != 1 || m.Answer[0].(*dns.AAAA).AAAA.String() != "2001:db8::53" {
 		t.Errorf("ADN AAAA = %+v, want 2001:db8::53", m.Answer)
+	}
+	// ANY on the ADN enumerates both families.
+	if _, m := ask(t, snap, view, "dns.example.net", dns.TypeANY); len(m.Answer) != 2 {
+		t.Errorf("ADN ANY = %d answers, want 2 (A+AAAA)", len(m.Answer))
+	}
+}
+
+// Functional ANY on the local horizon: authoritative names enumerate every RRset, while
+// forwarded/public names keep the RFC 8482 minimal response (anti-amplification).
+func TestFunctionalLocalANY(t *testing.T) {
+	snap, view := buildSnap()
+	answerTypes := func(m *dns.Msg) map[uint16]bool {
+		s := map[uint16]bool{}
+		for _, rr := range m.Answer {
+			s[rr.Header().Rrtype] = true
+		}
+		return s
+	}
+	// CF-mirrored zone owner (not vhost-redirected): ANY enumerates every RRset — here the
+	// flattened tunnel A + AAAA.
+	_, m := ask(t, snap, view, "excluded.test.", dns.TypeANY)
+	if !m.Authoritative {
+		t.Error("zone ANY should be authoritative")
+	}
+	types := answerTypes(m)
+	for _, want := range []uint16{dns.TypeA, dns.TypeAAAA} {
+		if !types[want] {
+			t.Errorf("zone ANY missing %s (got %v)", dns.TypeToString[want], m.Answer)
+		}
+	}
+	// Static host: ANY returns its record(s).
+	if _, ms := ask(t, snap, view, "gw.example.test.", dns.TypeANY); len(ms.Answer) == 0 {
+		t.Error("static ANY should return the host's records")
+	}
+	// mDNS *.local host: ANY returns its address records.
+	if _, ml := ask(t, snap, view, "edge.local.", dns.TypeANY); len(ml.Answer) == 0 {
+		t.Error("*.local ANY should return the host's records")
+	}
+	// Forwarded/public name: ANY stays minimal (a single HINFO RFC8482), never enumerated.
+	_, mf := ask(t, snap, view, "notlocal.example.org.", dns.TypeANY)
+	if len(mf.Answer) != 1 {
+		t.Fatalf("forwarded ANY = %d answers, want 1 (minimal)", len(mf.Answer))
+	}
+	if h, ok := mf.Answer[0].(*dns.HINFO); !ok || h.Cpu != "RFC8482" {
+		t.Errorf("forwarded ANY should be minimal HINFO, got %v", mf.Answer[0])
 	}
 }
