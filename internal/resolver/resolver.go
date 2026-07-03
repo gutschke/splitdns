@@ -8,6 +8,8 @@
 package resolver
 
 import (
+	"net"
+	"net/netip"
 	"strings"
 
 	"github.com/miekg/dns"
@@ -35,16 +37,19 @@ func Resolve(snap *model.Snapshot, view *model.MDNSView, req *dns.Msg) Outcome {
 	qtype := q.Qtype
 
 	// Step 1b — resolver.arpa is a special-use domain (RFC 9462 §6.4) that MUST be
-	// answered locally and never forwarded to the public root. With Discovery of
-	// Designated Resolvers unconfigured, we return authoritative NODATA (NOERROR, no
-	// records) for the whole space — the correct "no designated encrypted resolver"
-	// signal — so a client's DDR probe (SVCB _dns.resolver.arpa) stays on the LAN
-	// instead of leaking upstream. (This is also the hook where a future DDR feature
-	// would synthesize the SVCB pointing at splitdnsd's own encrypted endpoint.)
+	// answered locally and never forwarded to the public root. When DDR is configured
+	// and the encrypted plane is up (snap.DDR != nil), synthesize the SVCB designation at
+	// _dns.resolver.arpa; otherwise (and for every other name/qtype in the space) return
+	// authoritative NODATA — the correct "no designated encrypted resolver" signal — so a
+	// DDR probe stays on the LAN instead of leaking upstream.
 	if name == "resolver.arpa." || strings.HasSuffix(name, ".resolver.arpa.") {
-		resp := reply(req)
-		resp.Authoritative = true
-		return Outcome{Msg: resp}
+		return Outcome{Msg: resolverArpa(snap, req, name, qtype)}
+	}
+	// Step 1c — the DDR Authentication Domain Name resolves to the resolver's own LAN IPs
+	// (split-horizon), so a client following the SVCB TargetName reaches us and the cert
+	// validates. Drawn from the same address slices as the SVCB hints (never disagree).
+	if snap.DDR != nil && snap.DDR.ADN != "" && name == snap.DDR.ADN {
+		return Outcome{Msg: ddrADNReply(snap.DDR, req, name, qtype)}
 	}
 
 	// Step 2 — static specials / seeded hosts (R5), exact match wins.
@@ -74,6 +79,95 @@ func Resolve(snap *model.Snapshot, view *model.MDNSView, req *dns.Msg) Outcome {
 		return Outcome{Msg: minimalANY(req, name)}
 	}
 	return Outcome{Forward: true}
+}
+
+// ddrTTL is the TTL on synthesized DDR records. Short so a fail-closed transition (cert
+// expiry -> DDR cleared) is reflected quickly and clients re-probe.
+const ddrTTL = 300
+
+// resolverArpa answers the resolver.arpa special-use space (RFC 9462). It synthesizes the
+// two-RR SVCB designation ONLY for a ServiceMode query at _dns.resolver.arpa when DDR is
+// live; every other name/qtype (apex, other subnames, non-SVCB, ANY) — and the whole space
+// when DDR is nil — is authoritative NODATA. Answers are unsigned: DDR trust is the ADN
+// certificate, not DNSSEC (RFC 9462 §5), so no AD bit is ever set.
+func resolverArpa(snap *model.Snapshot, req *dns.Msg, name string, qtype uint16) *dns.Msg {
+	resp := reply(req)
+	resp.Authoritative = true
+	if snap.DDR == nil || name != "_dns.resolver.arpa." || qtype != dns.TypeSVCB {
+		return resp // NODATA
+	}
+	prio := uint16(1)
+	if e := snap.DDR.DoT; e != nil {
+		resp.Answer = append(resp.Answer, ddrSVCB(snap.DDR, prio, []string{"dot"}, e.Port, ""))
+		prio++
+	}
+	if e := snap.DDR.DoH; e != nil {
+		resp.Answer = append(resp.Answer, ddrSVCB(snap.DDR, prio, []string{"h2"}, e.Port, e.Path+"{?dns}"))
+		prio++
+	}
+	return resp
+}
+
+// ddrSVCB builds one ServiceMode SVCB RR at _dns.resolver.arpa targeting the ADN, with the
+// transport's ALPN + explicit port, an optional dohpath, and the resolver's LAN address
+// hints (RFC 9460/9461). Hint keys are emitted only for a family that has an address.
+func ddrSVCB(d *model.DDRAdvert, priority uint16, alpn []string, port uint16, dohpath string) dns.RR {
+	svcb := &dns.SVCB{
+		Hdr:      dns.RR_Header{Name: "_dns.resolver.arpa.", Rrtype: dns.TypeSVCB, Class: dns.ClassINET, Ttl: ddrTTL},
+		Priority: priority,
+		Target:   d.ADN,
+		Value:    []dns.SVCBKeyValue{&dns.SVCBAlpn{Alpn: alpn}, &dns.SVCBPort{Port: port}},
+	}
+	if dohpath != "" {
+		svcb.Value = append(svcb.Value, &dns.SVCBDoHPath{Template: dohpath})
+	}
+	if ips := toIPs(d.V4Hints); len(ips) > 0 {
+		svcb.Value = append(svcb.Value, &dns.SVCBIPv4Hint{Hint: ips})
+	}
+	if ips := toIPs(d.V6Hints); len(ips) > 0 {
+		svcb.Value = append(svcb.Value, &dns.SVCBIPv6Hint{Hint: ips})
+	}
+	return svcb
+}
+
+// ddrADNReply answers the ADN's own A/AAAA from the resolver's LAN address slices (the
+// same source as the SVCB hints), so a DDR client reaches the local box. Authoritative,
+// NODATA for any other qtype.
+func ddrADNReply(d *model.DDRAdvert, req *dns.Msg, name string, qtype uint16) *dns.Msg {
+	resp := reply(req)
+	resp.Authoritative = true
+	switch qtype {
+	case dns.TypeA:
+		for _, a := range d.V4Hints {
+			if a.Is4() {
+				resp.Answer = append(resp.Answer, &dns.A{
+					Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: ddrTTL},
+					A:   net.IP(a.AsSlice()),
+				})
+			}
+		}
+	case dns.TypeAAAA:
+		for _, a := range d.V6Hints {
+			if a.Is6() {
+				resp.Answer = append(resp.Answer, &dns.AAAA{
+					Hdr:  dns.RR_Header{Name: name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: ddrTTL},
+					AAAA: net.IP(a.AsSlice()),
+				})
+			}
+		}
+	}
+	return resp
+}
+
+// toIPs converts the valid addresses of one family to []net.IP for SVCB hints.
+func toIPs(addrs []netip.Addr) []net.IP {
+	out := make([]net.IP, 0, len(addrs))
+	for _, a := range addrs {
+		if a.IsValid() {
+			out = append(out, net.IP(a.AsSlice()))
+		}
+	}
+	return out
 }
 
 // minimalANY builds the RFC 8482 minimal response: a single HINFO RR naming the

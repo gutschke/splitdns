@@ -343,3 +343,87 @@ func TestResolverArpaSpecialUse(t *testing.T) {
 		t.Errorf("resolver.arpa.example.com should forward, got %+v", out)
 	}
 }
+
+// svcbParam finds the SvcParam of the given key in an SVCB RR (nil if absent).
+func svcbParam(rr dns.RR, key dns.SVCBKey) dns.SVCBKeyValue {
+	s, ok := rr.(*dns.SVCB)
+	if !ok {
+		return nil
+	}
+	for _, kv := range s.Value {
+		if kv.Key() == key {
+			return kv
+		}
+	}
+	return nil
+}
+
+// DDR synthesis (RFC 9462): when snap.DDR is live, _dns.resolver.arpa/SVCB yields two
+// ServiceMode RRs (DoT then DoH) targeting the ADN, and the ADN resolves to the LAN hints.
+func TestDDRSynthesis(t *testing.T) {
+	snap := &model.Snapshot{DDR: &model.DDRAdvert{
+		ADN:     "dns.example.net.",
+		V4Hints: []netip.Addr{netip.MustParseAddr("192.0.2.53")},
+		V6Hints: []netip.Addr{netip.MustParseAddr("2001:db8::53")},
+		DoT:     &model.DDREndpoint{Port: 853},
+		DoH:     &model.DDREndpoint{Port: 443, Path: "/dns-query"},
+	}}
+	view := &model.MDNSView{}
+
+	out, msg := ask(t, snap, view, "_dns.resolver.arpa", dns.TypeSVCB)
+	if out.Forward || len(out.Stub) > 0 || msg == nil || !msg.Authoritative {
+		t.Fatalf("SVCB probe: out=%+v authoritative=%v", out, msg != nil && msg.Authoritative)
+	}
+	if len(msg.Answer) != 2 {
+		t.Fatalf("want 2 SVCB RRs, got %d", len(msg.Answer))
+	}
+	dot, doh := msg.Answer[0].(*dns.SVCB), msg.Answer[1].(*dns.SVCB)
+	if dot.Priority != 1 || dot.Target != "dns.example.net." {
+		t.Errorf("DoT RR = prio %d target %q, want 1 / dns.example.net.", dot.Priority, dot.Target)
+	}
+	if a := svcbParam(dot, dns.SVCB_ALPN).(*dns.SVCBAlpn); a == nil || len(a.Alpn) != 1 || a.Alpn[0] != "dot" {
+		t.Errorf("DoT alpn = %+v, want [dot]", a)
+	}
+	if p := svcbParam(dot, dns.SVCB_PORT).(*dns.SVCBPort); p == nil || p.Port != 853 {
+		t.Errorf("DoT port = %+v, want 853", p)
+	}
+	if svcbParam(dot, dns.SVCB_IPV4HINT) == nil || svcbParam(dot, dns.SVCB_IPV6HINT) == nil {
+		t.Errorf("DoT RR missing address hints")
+	}
+	if svcbParam(dot, dns.SVCB_DOHPATH) != nil {
+		t.Errorf("DoT RR must not carry a dohpath")
+	}
+	if doh.Priority != 2 {
+		t.Errorf("DoH priority = %d, want 2", doh.Priority)
+	}
+	if a := svcbParam(doh, dns.SVCB_ALPN).(*dns.SVCBAlpn); a == nil || a.Alpn[0] != "h2" {
+		t.Errorf("DoH alpn = %+v, want [h2]", a)
+	}
+	if dp := svcbParam(doh, dns.SVCB_DOHPATH).(*dns.SVCBDoHPath); dp == nil || dp.Template != "/dns-query{?dns}" {
+		t.Errorf("DoH dohpath = %+v, want /dns-query{?dns}", dp)
+	}
+
+	// Non-SVCB and other names in the space stay NODATA even when DDR is live.
+	for _, tc := range []struct {
+		name  string
+		qtype uint16
+	}{
+		{"_dns.resolver.arpa", dns.TypeA},
+		{"_dns.resolver.arpa", dns.TypeANY},
+		{"resolver.arpa", dns.TypeSVCB},
+		{"foo.resolver.arpa", dns.TypeSVCB},
+	} {
+		_, m := ask(t, snap, view, tc.name, tc.qtype)
+		if m == nil || m.Rcode != dns.RcodeSuccess || len(m.Answer) != 0 || !m.Authoritative {
+			t.Errorf("%s/%d: want authoritative NODATA, got %+v", tc.name, tc.qtype, m)
+		}
+	}
+
+	// The ADN resolves to the LAN hints (split-horizon), consistent with the SVCB hints.
+	if _, m := ask(t, snap, view, "dns.example.net", dns.TypeA); len(m.Answer) != 1 || m.Answer[0].(*dns.A).A.String() != "192.0.2.53" {
+		t.Errorf("ADN A = %+v, want 192.0.2.53", m.Answer)
+	}
+	if _, m := ask(t, snap, view, "dns.example.net", dns.TypeAAAA); len(m.Answer) != 1 || m.Answer[0].(*dns.AAAA).AAAA.String() != "2001:db8::53" {
+		t.Errorf("ADN AAAA = %+v, want 2001:db8::53", m.Answer)
+	}
+}

@@ -31,6 +31,7 @@ type Builder struct {
 	cache   *Cache
 	fetcher SerialFetcher
 	now     func() time.Time
+	ddr     func() *model.DDRAdvert // nil-safe; the DDR advert folded into every publish
 
 	mu   sync.Mutex
 	last *model.Snapshot
@@ -87,6 +88,7 @@ func (b *Builder) refresh(ctx context.Context, observed map[string]uint32) error
 	// Publish under the lock so a concurrent ApplyVHosts() cannot interleave and
 	// overwrite a newer published snapshot with an older vhost set (D6).
 	b.mu.Lock()
+	snap.DDR = b.currentDDR()
 	b.last = snap
 	b.publish(snap)
 	b.mu.Unlock()
@@ -98,10 +100,34 @@ func (b *Builder) refresh(ctx context.Context, observed map[string]uint32) error
 	return nil
 }
 
-// ApplyVHosts cheaply republishes the last snapshot with the current vhost set,
-// WITHOUT re-fetching from Cloudflare (zones are immutable, so a shallow copy is
+// SetDDRProvider wires a provider for the DDR advertisement (RFC 9462), folded into every
+// published snapshot. nil (the default) means no DDR — the resolver returns resolver.arpa
+// NODATA. Set by the daemon after the encrypted listeners bind; call Republish to push a
+// change (e.g. cert expiry withdrawing the advert).
+func (b *Builder) SetDDRProvider(fn func() *model.DDRAdvert) {
+	b.mu.Lock()
+	b.ddr = fn
+	b.mu.Unlock()
+}
+
+// currentDDR returns the DDR advert from the provider (nil-safe). Caller may hold b.mu.
+func (b *Builder) currentDDR() *model.DDRAdvert {
+	if b.ddr == nil {
+		return nil
+	}
+	return b.ddr()
+}
+
+// ApplyVHosts cheaply republishes the last snapshot with the current vhost set (and DDR
+// advert), WITHOUT re-fetching from Cloudflare (zones are immutable, so a shallow copy is
 // safe). Called by the vhost feed worker when its set changes.
-func (b *Builder) ApplyVHosts() {
+func (b *Builder) ApplyVHosts() { b.republish() }
+
+// Republish re-emits the last snapshot with the current providers (vhosts + DDR). Used
+// when the DDR advert changes (listeners bound, cert reloaded/expired).
+func (b *Builder) Republish() { b.republish() }
+
+func (b *Builder) republish() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.last == nil {
@@ -109,6 +135,7 @@ func (b *Builder) ApplyVHosts() {
 	}
 	clone := *b.last // shallow copy; zone maps are immutable and shared
 	clone.VHosts = b.vhosts()
+	clone.DDR = b.currentDDR()
 	b.last = &clone
 	b.publish(&clone)
 }
@@ -138,6 +165,7 @@ func (b *Builder) Run(ctx context.Context, progress func()) {
 			}
 			snap.VHosts = b.vhosts()
 			b.mu.Lock()
+			snap.DDR = b.currentDDR()
 			b.last = snap
 			b.publish(snap)
 			b.mu.Unlock()

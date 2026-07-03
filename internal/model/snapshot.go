@@ -23,6 +23,32 @@ type Snapshot struct {
 	// answers with (design §2.4 step 6). Zero value => that family is NODATA.
 	VHostV4 netip.Addr
 	VHostV6 netip.Addr
+
+	// DDR is the Discovery of Designated Resolvers advertisement (RFC 9462). A nil DDR
+	// means "no designated encrypted resolver": the resolver answers resolver.arpa with
+	// authoritative NODATA (unchanged pre-feature behavior). It is published by the daemon
+	// ONLY after the encrypted (DoT/DoH) listeners bind and the ADN certificate validates,
+	// and cleared on cert expiry — so a client is never pointed at a dead endpoint.
+	DDR *DDRAdvert
+}
+
+// DDRAdvert is what the resolver synthesizes at _dns.resolver.arpa (SVCB) and uses to
+// answer the ADN's own A/AAAA (split-horizon). DoT/DoH are non-nil only for a transport
+// that is actually ready. Hints and the ADN address answer draw from the SAME slices, so
+// the SVCB hints and the ADN A/AAAA can never disagree.
+type DDRAdvert struct {
+	ADN     string       // Authentication Domain Name (cert SAN), lowercased FQDN, trailing dot
+	V4Hints []netip.Addr // resolver's own LAN IPv4 (SVCB ipv4hint + ADN A)
+	V6Hints []netip.Addr // resolver's own LAN IPv6 (SVCB ipv6hint + ADN AAAA)
+	DoT     *DDREndpoint // non-nil => advertise DoT
+	DoH     *DDREndpoint // non-nil => advertise DoH
+}
+
+// DDREndpoint is one ready encrypted endpoint. Path is the DoH URI-template base
+// (e.g. "/dns-query"); it is empty for DoT.
+type DDREndpoint struct {
+	Port uint16
+	Path string
 }
 
 // Zone is a Cloudflare-mirrored authoritative zone.
