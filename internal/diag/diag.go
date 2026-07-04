@@ -250,15 +250,26 @@ type EncCheck struct {
 // specific transport (Do53/DoT/DoH) — including TLS handshake details, which is exactly
 // what tells you why a client fails to upgrade.
 type TransportResult struct {
-	Transport string   `json:"transport"`
-	Target    string   `json:"target,omitempty"`
-	Query     string   `json:"query"`
-	OK        bool     `json:"ok"`
-	Rcode     string   `json:"rcode,omitempty"`
-	Answer    []string `json:"answer,omitempty"`
-	TLS       string   `json:"tls,omitempty"` // negotiated version + ALPN + peer cert
-	LatencyMS float64  `json:"latency_ms"`
-	Err       string   `json:"error,omitempty"`
+	Transport string        `json:"transport"`
+	Target    string        `json:"target,omitempty"`
+	Query     string        `json:"query"`
+	OK        bool          `json:"ok"`
+	Rcode     string        `json:"rcode,omitempty"`
+	Answer    []string      `json:"answer,omitempty"`
+	Services  []ServiceLine `json:"services,omitempty"` // DNS-SD services the queried host advertises
+	TLS       string        `json:"tls,omitempty"`      // negotiated version + ALPN + peer cert
+	LatencyMS float64       `json:"latency_ms"`
+	Err       string        `json:"error,omitempty"`
+}
+
+// ServiceLine is one DNS-SD service the queried local host advertises. The data lives at a
+// separate DNS-SD name (host._type._proto.<domain>), so the query tool surfaces it here as a
+// convenience — with that name, so the admin knows where to query for the SRV/TXT itself.
+type ServiceLine struct {
+	Label string   `json:"label"` // friendly label, e.g. "AirScan (eSCL)"
+	Name  string   `json:"name"`  // the DNS-SD instance name to query
+	Port  uint16   `json:"port,omitempty"`
+	Text  []string `json:"text,omitempty"`
 }
 
 // WithTransportQuery wires the transport tester (GET /tquery): it runs a query at the
@@ -489,7 +500,48 @@ var controlMinInterval = map[string]time.Duration{
 	"restart":        10 * time.Second,
 	"selftest":       2 * time.Second, // active probes; don't let a client hammer them
 	"ddns-simulate":  1 * time.Second,
-	"tquery":         1 * time.Second, // issues a real query (incl. a TLS handshake)
+	"tquery":         250 * time.Millisecond, // interactive query tool; keep snappy for retries
+}
+
+// lookupHostServices returns the DNS-SD services the queried name's host advertises (from the
+// mDNS view), each with the DNS-SD name to query for its SRV/TXT. Empty (no clutter) when the
+// name isn't a local host or has no captured services.
+func (s *Server) lookupHostServices(name string) []ServiceLine {
+	if s.view == nil {
+		return nil
+	}
+	view := s.view()
+	if view == nil || len(view.Services) == 0 {
+		return nil
+	}
+	fqdn := strings.ToLower(dns.Fqdn(strings.TrimSpace(name)))
+	var label, suffix string
+	if l := strings.TrimSuffix(fqdn, ".local."); l != fqdn {
+		label, suffix = l, ".local."
+	} else if snap := s.snapshot(); snap != nil && snap.LocalDomain != "" {
+		if l := strings.TrimSuffix(fqdn, "."+snap.LocalDomain+"."); l != fqdn {
+			label, suffix = l, "."+snap.LocalDomain+"."
+		}
+	}
+	if label == "" {
+		return nil
+	}
+	svcs := view.Services[label]
+	if len(svcs) == 0 {
+		return nil
+	}
+	dom := strings.Trim(suffix, ".") // "lan" / "local" — no trailing dot, easy to copy
+	out := make([]ServiceLine, 0, len(svcs))
+	for _, sv := range svcs {
+		out = append(out, ServiceLine{
+			Label: serviceLabel(sv.Type),
+			Name:  label + "." + sv.Type + "." + dom,
+			Port:  sv.Port,
+			Text:  sv.Text,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
 }
 
 // handleSelfTest runs the on-demand self-tests (GET) under a bounded context and renders
@@ -582,6 +634,7 @@ func (s *Server) handleTransportQuery(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 6*time.Second)
 	defer cancel()
 	res := s.transportQuery(ctx, transport, name, qtype)
+	res.Services = s.lookupHostServices(name) // surface the host's DNS-SD services, if any
 	if strings.Contains(r.Header.Get("Accept"), "text/html") {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if err := tqueryTmpl.Execute(w, res); err != nil {
@@ -599,6 +652,8 @@ var tqueryTmpl = template.Must(template.New("tquery").Parse(`<!doctype html>
 <html><head><meta charset="utf-8"><title>Transport query</title>
 <style>body{font:14px/1.4 system-ui,sans-serif;margin:1.5rem;color:#222}
 .ok{color:#161} .flag{color:#c00} .muted{color:#777}
+h2{font-size:1rem;margin:1.2rem 0 .3rem}
+table{border-collapse:collapse}td{padding:.15rem .6rem;text-align:left;vertical-align:top}
 pre{background:#f6f8fa;padding:.6rem;border-radius:4px;overflow:auto}</style>
 </head><body>
 <h1>Transport query <span class="muted">{{.Transport}}</span></h1><p><a href="/" onclick="if(history.length>1){history.back();return false}">&larr; back</a></p>
@@ -610,6 +665,8 @@ pre{background:#f6f8fa;padding:.6rem;border-radius:4px;overflow:auto}</style>
 {{if .Rcode}}<p>rcode: <b>{{.Rcode}}</b></p>{{end}}
 {{if .Answer}}<pre>{{range .Answer}}{{.}}
 {{end}}</pre>{{end}}
+{{if .Services}}<h2>DNS-SD services <span class="muted">(this host advertises &mdash; query the listed name for its SRV/TXT)</span></h2>
+<table>{{range .Services}}<tr><td><b>{{.Label}}</b>{{if .Port}}:{{.Port}}{{end}}</td><td class="muted">{{.Name}}</td><td class="muted">{{range .Text}}{{.}} {{end}}</td></tr>{{end}}</table>{{end}}
 </body></html>`))
 
 var ddnsSimTmpl = template.Must(template.New("ddnssim").Funcs(template.FuncMap{
