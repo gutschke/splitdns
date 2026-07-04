@@ -20,9 +20,10 @@ The page **updates itself live** (polls `/diag.json` every few seconds) without 
 reloading or scrolling — and it pauses an update for any table you're actively selecting
 text in or typing into, so a copy/paste is never yanked out from under you. The live
 regions include the cache stats, queries, backends, workers, and the **mDNS
-forward/reverse** tables; opportunistic client **host-name** annotations refresh as mDNS
-(and, later, DHCP) learns them. Rarely-changing sections (zone inventory, reverse zones,
-stub, vhost) refresh on a manual page reload.
+forward/reverse** tables (with per-host vendor, services, and model); opportunistic client
+**host-name** annotations refresh as mDNS (and, later, DHCP) learns them. Rarely-changing
+sections (zone inventory, reverse zones, stub, vhost, the redacted config, and the
+encrypted/DDR panel) refresh on a manual page reload.
 
 Configure the bind address with `[diag] addr` (see [configuration.md](configuration.md)
 and `splitdns.conf(5)`). The read-only views are **always available**; the mutating
@@ -117,6 +118,44 @@ backend while debugging. A disable lasts until you re-enable it or the daemon re
 ### Workers (supervisor)
 Per-worker **restarts**, **stalls**, **panics**, and time since last progress. Non-zero
 restart/stall/panic counts are flagged — a quick way to spot a misbehaving subsystem.
+
+### mDNS (forward and reverse)
+The live LAN view learned from mDNS: the **forward** table (local name → address) and the
+**reverse** table (address → canonical name). Each host row folds in what the daemon has
+learned about the device:
+
+- **hardware vendor** — resolved from the MAC OUI (needs the optional `ieee-data` package;
+  without it the raw MAC shows instead).
+- **Bonjour services** — the DNS-SD service types captured from the device (e.g. AirPlay,
+  IPP printing), with the SRV port.
+- **model / friendly name** — pulled from the service TXT records.
+
+Hover a host row for the full detail (curated TXT fields, per-service ports). These tables
+update live as mDNS (and, later, DHCP) learns hosts. On-demand resolution and DNS-SD
+counters appear here too, so you can see how often the daemon queried and what it found.
+
+### Encrypted & DDR
+Shown when `[encrypted]` is enabled. It surfaces the **certificate** (ADN, SANs, expiry,
+validity), the **DoT/DoH listeners**, the **exact SVCB** served at `_dns.resolver.arpa`,
+and an **upgrade-readiness checklist** (enabled / cert valid / ADN matches a SAN /
+listeners up / DDR advertising / ADN resolves to LAN hints) — so "why won't clients
+upgrade?" is answered at a glance. See [encrypted-dns.md](encrypted-dns.md).
+
+The **recent queries** table also carries a **`proto` column** (Do53 / DoT / DoH), a
+transport rollup, and per-client lifetime protocol counts, so you can tell which clients
+have actually moved off plaintext.
+
+### Config
+The resolved configuration as the daemon is running it, with **all secrets redacted**
+(token file paths shown, never contents; passwords and TSIG secrets masked). A quick way
+to confirm the effective policy without shelling in.
+
+## Transport query tool
+
+Issue a query **at the resolver** over Do53, DoT, or DoH and see the answer plus, for the
+encrypted transports, the **TLS handshake** (negotiated version, ALPN, presented peer
+cert). A certificate or SNI problem shows up here immediately. It queries the resolver
+itself (no arbitrary destinations) and is rate-limited.
 
 ## Self-tests
 

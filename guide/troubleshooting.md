@@ -6,9 +6,10 @@
 `[diag].addr`):
 
 - **`/healthz`** — liveness/readiness (also what the systemd watchdog uses internally).
-- **`/diag.json`** — current snapshot summary: mirrored zones, reverse/stub zones, the
-  vhost set, mDNS view, build time, and whether Cloudflare is currently healthy.
-- **`/`** — a human-readable overview.
+- **`/diag.json`** — machine-readable snapshot: mirrored zones, reverse/stub zones, the
+  vhost set, the mDNS view, recent queries, cache/backend/worker health, and whether
+  Cloudflare is currently healthy.
+- **`/`** — the live diagnostics console (see [diagnostics.md](diagnostics.md)).
 
 ```sh
 curl -s localhost:8080/diag.json | jq .
@@ -49,9 +50,12 @@ design — the daemon forwards rather than NXDOMAIN.
 subject to the vhost redirect. Add it to `[vhost].exclude_zones` to serve it
 authoritatively.
 
-**`*.local` names do not resolve.** mDNS is best-effort: the listener may have failed to
-bind `:5353` (another responder like avahi), or no announcement has been seen. `*.local`
-is never forwarded.
+**Local (`.lan` / `.local`) names do not resolve.** mDNS is best-effort: the listener may
+have failed to bind `:5353` (another responder like avahi), or no announcement has been
+seen — check the mDNS view on the [diagnostics console](diagnostics.md). A quiet device is
+normally found on the first query via on-demand resolution; if you disabled it
+(`[mdns] resolve_on_demand = false`), an un-announced host stays NXDOMAIN. A just-booted
+host may NXDOMAIN for up to ~30s until it announces itself. Local names are never forwarded.
 
 **Dynamic-DNS makes no changes.** Expected unless fully armed: `enabled=true`,
 `dry_run=false`, a **non-empty** `eligible` allowlist (empty = deny-all → forced

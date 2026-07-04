@@ -63,6 +63,31 @@ advertises itself via DDR (RFC 9462). Design points that must not be "simplified
 - **DNR (RFC 9463) is operator configuration, not daemon code** — there is no on-the-wire
   DNR surface in `splitdnsd`.
 
+## On-demand mDNS resolution and DNS-SD
+
+The LAN plane serves `.lan` / `.local` names, on-demand mDNS resolution, and unicast
+DNS-SD from **passive, unauthenticated** mDNS on the local segment. mDNS has no origin
+authentication, so these answers are lower-assurance than a managed record. The design
+bounds the blast radius rather than pretending otherwise:
+
+- **Managed names are never overridden.** On-demand resolution never queries — and a
+  solicited mDNS reply can never move — a vhost, a mirrored-zone, or a DDNS-eligible name.
+  A LAN device cannot hijack a name you manage; the worst case is a wrong answer for a name
+  that only ever lived in mDNS, which self-heals within ~120s.
+- **On-demand querying is bounded.** An unknown local host triggers at most one targeted
+  multicast, under a global outbound rate limit (10/s, burst 20), a per-client limit (5/s),
+  an in-flight cap, and recently-queried suppression — so a flood of distinct unknown names
+  cannot be amplified into unbounded multicast.
+- **It discloses looked-up names.** An unresolved local lookup is multicast to the segment
+  (and any mDNS reflector). On a shared or untrusted segment that is a recon concern; set
+  `[mdns] resolve_on_demand = false` to keep the pure "unknown → NXDOMAIN" behavior with no
+  active queries.
+- **DNS-SD serving is read-only.** `serve_dnssd` projects the passively captured service
+  cache to unicast SRV/TXT/PTR; it never sends a query and adds no new trust surface.
+
+None of the LAN plane writes anywhere external: mDNS-learned data updates the in-memory
+view only and is never written to Cloudflare (see the DDNS gates above).
+
 ## Diagnostics control plane
 
 The diagnostics console's mutating actions (cache flush, mirror refresh, restart, backend

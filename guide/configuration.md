@@ -96,6 +96,51 @@ reverse_detect = "off"                             # off | private | global | al
 - **`[zones.stub]`** forwards a delegated subtree to a specific resolver over plain
   UDP/TCP (these are trusted LAN resolvers, not DoT, and are not rebind-filtered).
 
+## `[mdns]`
+
+The LAN plane: local names served from a passive mDNS view, how long records survive,
+and whether the daemon actively resolves and browses services.
+
+```toml
+[mdns]
+local_domain   = "lan"     # unicast local domain served alongside *.local; "" = *.local only
+stale_grace    = "30m"     # keep serving past the announced TTL; "0" disables
+goodbye_grace  = "5m"      # cushion after an mDNS goodbye (reflector/avahi bounce)
+resolve_on_demand = true   # query a targeted mDNS name on first ask for an unknown host
+resolve_on_demand_wait = "300ms"   # how long to wait for a reply (clamped 50ms..2s)
+serve_dnssd       = true   # answer SRV/TXT/PTR for local services over unicast
+service_discovery = true   # actively browse services (only while the console is open)
+```
+
+- **`local_domain`** (default `lan`) serves `host.lan` from the same mDNS view as
+  `host.local`, so a client that accepts only a single search domain can still reach LAN
+  hosts by a real name. A reverse (PTR) query for a LAN address returns one canonical name
+  under this domain. Set `""` to serve `*.local` only.
+- **`stale_grace`** / **`goodbye_grace`** — the mDNS cache is a *passive* listener that
+  expires a record at its announced TTL. If an announcer (or a mDNS reflector) re-broadcasts
+  more slowly than that TTL, `stale_grace` keeps serving the last value so hosts don't blink
+  out; `goodbye_grace` cushions a transient goodbye (a sleeping device, an avahi restart) so
+  a bounce-then-reannounce is seamless. If you run `splitdns-notify`, keep its `-ttl` above
+  its re-announce interval.
+- **`resolve_on_demand`** (default on) — when a client asks for an *unknown* local host,
+  the daemon multicasts a targeted mDNS query and waits `resolve_on_demand_wait`, so a quiet
+  device (a printer or NAS not currently announcing) is found on the first ask instead of
+  returning NXDOMAIN. It is heavily bounded — global and per-client rate limits, an in-flight
+  cap, and recently-queried suppression — and **never queries a managed name** (a vhost, a
+  mirrored, or a DDNS-eligible name), so a solicited reply can never move a Cloudflare
+  record. Set `false` to keep the pure "unknown → NXDOMAIN" behavior with no active queries.
+  See the [trust model](../SECURITY.md#on-demand-mdns-resolution-and-dns-sd) before relying
+  on it on a shared segment.
+- **`serve_dnssd`** (default on) — local names also answer SRV/TXT/PTR synthesized from the
+  passively captured mDNS services, so a LAN client can resolve or browse services (e.g.
+  printers) by **unicast**, including across VLANs where multicast doesn't reach. It is a
+  read-only projection of the cache and never sends a query. Set `false` to serve only
+  A/AAAA on the local domain.
+- **`service_discovery`** (default on) — actively browse the LAN with the standard Bonjour
+  service-discovery query so quiet devices and their services surface. Querying is
+  **on-demand**: it runs only while the diagnostics console is open, so there is zero active
+  multicast when nobody is watching. Set `false` to stay a pure passive listener.
+
 ## `[vhost]`
 
 Redirect bare-domain / `www` / known virtual-host names at an internal reverse proxy.
@@ -224,6 +269,37 @@ When `allow_control` is set, the actions are POST-only and authorized by a match
 bind. Enabling it on a non-loopback bind with no password is refused. The endpoint is
 plain HTTP, so a password guards against casual/CSRF misuse, not an eavesdropper — see the
 [security notes](diagnostics.md#enabling-and-authorizing).
+
+## `[encrypted]` — optional, off by default
+
+Opt-in **DNS-over-TLS** (RFC 7858) and **DNS-over-HTTPS** (RFC 8484) listeners for LAN
+clients, plus **DDR** (RFC 9462) advertising so capable clients auto-upgrade to *this*
+resolver instead of defecting to a public one. Full walkthrough (certificate, DNR recipe,
+verification): **[encrypted-dns.md](encrypted-dns.md)**.
+
+```toml
+[encrypted]
+enabled   = true
+cert_file = "/etc/splitdns/tls/adn.crt"    # PEM chain for the ADN
+key_file  = "/etc/splitdns/tls/adn.key"    # 0400 splitdns:splitdns
+adn       = "dns.example.net"              # Authentication Domain Name (a cert SAN)
+# advertise_ddr = true                     # synthesize _dns.resolver.arpa SVCB
+[encrypted.dot]
+enabled = true
+port    = 853
+[encrypted.doh]
+enabled = true
+port    = 443
+path    = "/dns-query"
+```
+
+The encrypted listeners reuse the exact `:53` pipeline, so `[access]`, the answer cache,
+and the rebinding filter apply unchanged. `mode`/`addresses` mirror `[listen]` (empty
+inherits it). A missing, unparsable, or expired certificate degrades to **Do53-only**
+rather than taking DNS down, and withdraws the DDR advert. The cert is hot-reloaded on
+`SIGHUP` or file change, and `-check-config` hard-fails on a bad one. The **ADN must
+resolve to this resolver's LAN addresses** — `splitdnsd` answers it authoritatively via
+split-horizon.
 
 ---
 

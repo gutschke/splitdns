@@ -8,7 +8,7 @@ resolver so nothing on your network is at risk.
 
 | Mode | Needs | Gives |
 |------|-------|-------|
-| 1. Forwarder + LAN names | nothing external | DoT forwarding, access control, `*.local` (mDNS), reverse zones, stub zones, rebind protection |
+| 1. Forwarder + LAN names | nothing external | DoT forwarding, access control, local names (`.lan` / `.local` via mDNS) with on-demand resolution and unicast DNS-SD, reverse zones, stub zones, rebind protection |
 | 2. + Cloudflare mirror | a read-only scoped token | your CF-hosted zones served authoritatively on the LAN with direct/internal addresses; tunnel/proxy flattening; vhost redirect |
 | 3. + Dynamic-DNS write-back | a `DNS:Edit` token | push a changing WAN address into specific CF records |
 

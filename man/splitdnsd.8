@@ -10,10 +10,11 @@ splitdnsd \- lightweight split-horizon DNS resolver for the local LAN
 .SH DESCRIPTION
 .B splitdnsd
 is a standalone authoritative/forwarding DNS server for a trusted LAN. It
-resolves
-.I *.local
-hosts via mDNS, answers reverse (PTR) queries for the site's locally managed
-address spaces, and forwards everything else to upstream public resolvers over DoT.
+resolves local hosts
+.RI ( .lan " and " .local )
+from a passive mDNS view \(em with on-demand resolution and unicast DNS-SD service
+browsing \(em answers reverse (PTR) queries for the site's locally managed address
+spaces, and forwards everything else to upstream public resolvers over DoT.
 Optionally, it mirrors zones hosted on Cloudflare and serves them authoritatively on
 the LAN, preferring direct internal addresses over proxy/tunnel/SSO indirection; the
 Cloudflare integration is not required for the forwarding and local-name features.
