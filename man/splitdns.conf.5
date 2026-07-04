@@ -117,6 +117,14 @@ short while stale. See also \fBsplitdns\-notify\fR(8) \fB\-ttl\fR.
 Cushion kept after an explicit mDNS goodbye (Go duration, default \fB30s\fR) instead of
 removing the host instantly, so an avahi restart immediately followed by a re-announce
 is seamless.
+.TP
+.B service_discovery
+Active DNS-SD discovery (boolean, default \fBtrue\fR). When on, splitdnsd periodically
+multicasts the standard Bonjour service-discovery query so quiet devices (printers,
+casts, home speakers) and their service types are captured reliably instead of aging out
+of the passive view. Set \fBfalse\fR to remain a pure passive listener and emit no query
+traffic; \fBsplitdns\-notify\fR-proxied hosts (which advertise no services) are unaffected
+either way.
 .SH "[vhost]"
 .TP
 .B feed

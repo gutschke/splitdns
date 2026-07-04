@@ -173,11 +173,16 @@ func main() {
 
 	// mDNS source: maintains the *.local view and turns host announcements into DDNS
 	// changes. Listener best-effort (port 5353 may already be held / unprivileged).
+	var discoveryEvery time.Duration
+	if cfg.MDNS.ServiceDiscovery {
+		discoveryEvery = 2 * time.Minute // paced DNS-SD queries (reflector-friendly)
+	}
 	src := mdns.NewSource(func(host string, addrs []netip.Addr) {
 		if writer != nil {
 			writer.Submit(ddns.Change{Host: host, Addrs: addrs})
 		}
-	}, nil, mdns.WithServeStale(cfg.MDNS.StaleGraceDuration(), cfg.MDNS.GoodbyeGraceDuration()))
+	}, nil, mdns.WithServeStale(cfg.MDNS.StaleGraceDuration(), cfg.MDNS.GoodbyeGraceDuration()),
+		mdns.WithServiceDiscovery(discoveryEvery))
 	workers = append(workers, supervisor.Worker{Name: "mdns", Ceiling: 5 * time.Minute, Run: src.Run})
 
 	// D7: an announcement may trigger write-back via a valid TSIG signature (source-IP

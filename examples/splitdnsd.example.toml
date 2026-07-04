@@ -72,6 +72,12 @@ stale_grace = "10m"
 # After an explicit mDNS goodbye (a host leaving), keep it this brief cushion instead of
 # dropping instantly, so a mere avahi restart followed by a re-announce is seamless.
 goodbye_grace = "30s"
+# Active DNS-SD discovery (default true): periodically multicast the standard Bonjour
+# service-discovery query so quiet devices (printers, casts, home speakers) and their
+# service types surface reliably instead of aging out of the passive view. Set false to
+# stay a pure passive listener (e.g. to add zero query traffic where an mDNS reflector is
+# fussy) — proxied hosts (splitdns-notify) are unaffected either way.
+service_discovery = true
 
 [vhost]
 # Reverse-proxy redirect (any product: nginx, Caddy, Traefik, ...): naked domain / www / vhosts.

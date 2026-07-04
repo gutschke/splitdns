@@ -90,6 +90,12 @@ type MDNSConfig struct {
 	LocalDomain  string `toml:"local_domain"`  // unicast local domain, default "lan"; "" = *.local only
 	StaleGrace   string `toml:"stale_grace"`   // serve past the announced TTL, default "10m"; "0" disables
 	GoodbyeGrace string `toml:"goodbye_grace"` // retain after an mDNS goodbye (avahi bounce cushion), default "30s"
+	// ServiceDiscovery enables active DNS-SD querying (default on): splitdnsd periodically
+	// multicasts the standard Bonjour service-discovery query so quiet devices (printers,
+	// casts, home speakers) and their services surface reliably instead of aging out. Set
+	// false to stay a pure passive listener (e.g. to add zero query traffic on a segment
+	// with a fussy mDNS reflector).
+	ServiceDiscovery bool `toml:"service_discovery"`
 }
 
 // LocalDomainLabel returns the normalized bare local-domain label (lowercased, no dots),
@@ -421,7 +427,7 @@ func Default() Config {
 		// LAN plane: serve host.lan (a single-search-domain-friendly local name) alongside
 		// *.local, and keep records ~10m past their announced TTL (serve-stale) with a short
 		// cushion after an mDNS goodbye so an avahi bounce doesn't blink hosts out.
-		MDNS:       MDNSConfig{LocalDomain: "lan", StaleGrace: "10m", GoodbyeGrace: "30s"},
+		MDNS:       MDNSConfig{LocalDomain: "lan", StaleGrace: "10m", GoodbyeGrace: "30s", ServiceDiscovery: true},
 		Cloudflare: CFConfig{ReadTokenFile: "/etc/splitdns/cloudflare-read.token"},
 		DDNS:       DDNSConfig{Enabled: false, DryRun: true, Rate: "10m", NotifySocket: "/run/splitdns/notify.sock"},
 		Diag:       DiagConfig{Addr: "127.0.0.1:8080"},

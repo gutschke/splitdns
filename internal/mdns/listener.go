@@ -30,6 +30,8 @@ type Listener struct {
 	verify     *SigVerifier
 	requireSig bool
 	conns      []*net.UDPConn
+	send4      *ipv4.PacketConn // for outbound active-discovery queries (nil if no v4)
+	send6      *ipv6.PacketConn
 }
 
 // Listen starts the receiver on the given port (5353 for real mDNS; a test may pass
@@ -51,19 +53,41 @@ func Listen(src *Source, port int, trusted func(netip.Addr) bool, verify *SigVer
 	lc := net.ListenConfig{Control: reuseControl}
 
 	if uc := bind(lc, "udp4", "0.0.0.0", port, log); uc != nil {
-		joinV4(uc, log)
+		l.send4 = joinV4(uc, log)
 		l.conns = append(l.conns, uc)
 		go l.readLoop(uc)
 	}
 	if uc := bind(lc, "udp6", "::", port, log); uc != nil {
-		joinV6(uc, log)
+		l.send6 = joinV6(uc, log)
 		l.conns = append(l.conns, uc)
 		go l.readLoop(uc)
 	}
 	if len(l.conns) == 0 {
 		return nil, fmt.Errorf("mdns: no usable UDP listener")
 	}
+	// Wire outbound queries; the Source only uses this when active discovery is enabled.
+	src.SetSender(l.sendAll)
 	return l, nil
+}
+
+// sendAll multicasts one query out every multicast-capable interface, both families — so a
+// query reaches every LAN segment the resolver sits on. Best-effort per interface/family.
+func (l *Listener) sendAll(pkt []byte) {
+	g4 := &net.UDPAddr{IP: net.ParseIP(mcast4), Port: 5353}
+	g6 := &net.UDPAddr{IP: net.ParseIP(mcast6), Port: 5353}
+	for _, ifi := range multicastIfaces() {
+		ifi := ifi
+		if l.send4 != nil {
+			if err := l.send4.SetMulticastInterface(&ifi); err == nil {
+				_, _ = l.send4.WriteTo(pkt, nil, g4)
+			}
+		}
+		if l.send6 != nil {
+			if err := l.send6.SetMulticastInterface(&ifi); err == nil {
+				_, _ = l.send6.WriteTo(pkt, nil, g6)
+			}
+		}
+	}
 }
 
 func bind(lc net.ListenConfig, network, host string, port int, log func(string)) *net.UDPConn {
@@ -81,7 +105,7 @@ func bind(lc net.ListenConfig, network, host string, port int, log func(string))
 	return uc
 }
 
-func joinV4(uc *net.UDPConn, log func(string)) {
+func joinV4(uc *net.UDPConn, log func(string)) *ipv4.PacketConn {
 	p := ipv4.NewPacketConn(uc)
 	group := &net.UDPAddr{IP: net.ParseIP(mcast4)}
 	joined := 0
@@ -94,9 +118,10 @@ func joinV4(uc *net.UDPConn, log func(string)) {
 	if joined == 0 {
 		log("mdns: joined no IPv4 multicast interfaces (unicast still active)")
 	}
+	return p
 }
 
-func joinV6(uc *net.UDPConn, log func(string)) {
+func joinV6(uc *net.UDPConn, log func(string)) *ipv6.PacketConn {
 	p := ipv6.NewPacketConn(uc)
 	group := &net.UDPAddr{IP: net.ParseIP(mcast6)}
 	joined := 0
@@ -109,6 +134,7 @@ func joinV6(uc *net.UDPConn, log func(string)) {
 	if joined == 0 {
 		log("mdns: joined no IPv6 multicast interfaces (unicast still active)")
 	}
+	return p
 }
 
 func multicastIfaces() []net.Interface {
