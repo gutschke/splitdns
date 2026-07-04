@@ -24,7 +24,7 @@ GO=$("$root/scripts/select-go.sh" | head -1)
 export GOTOOLCHAIN=local CGO_ENABLED=0
 gover=$(GOTOOLCHAIN=local "$GO" version | sed -n 's/.*go\([0-9.]*\).*/\1/p')   # 1.24.4 (for -X main.version)
 
-BASE_VERSION=${BASE_VERSION:-0.1.0}
+BASE_VERSION=${BASE_VERSION:-0.2.0}
 ARCH=$(dpkg --print-architecture 2>/dev/null || echo amd64)
 # Version-forwarding (design §11.3) is computed in scripts/pkg-version.sh so the builder
 # and the self-build autobuild agree byte-for-byte (the autobuild compares this against

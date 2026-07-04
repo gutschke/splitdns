@@ -1,3 +1,12 @@
+splitdnsd (0.2.0) unstable; urgency=medium
+
+  * Encrypted client DNS (DoT/DoH) with DDR auto-upgrade advertising (opt-in).
+  * Local plane: .lan/.local names from mDNS, on-demand resolution, unicast DNS-SD.
+  * Diagnostics console: mDNS host enrichment, Encrypted & DDR panel, transport query tool.
+  * Security hardening: diagnostics control CSRF header, TSIG replay protection.
+
+ -- gutschke <gutschke@users.noreply.github.com>  Fri, 03 Jul 2026 00:00:00 -0700
+
 splitdnsd (0.1.0) unstable; urgency=medium
 
   * Initial release.

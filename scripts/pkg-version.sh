@@ -15,7 +15,7 @@
 #       Built-Using value.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
-: "${BASE_VERSION:=0.1.0}"
+: "${BASE_VERSION:=0.2.0}"
 : "${GO:=$("$here/select-go.sh" | head -1)}"
 
 gover=$(GOTOOLCHAIN=local "$GO" version | sed -n 's/.*go\([0-9.]*\).*/\1/p')   # 1.24.4
