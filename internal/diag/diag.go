@@ -27,7 +27,6 @@ import (
 	"github.com/gutschke/splitdns/internal/anscache"
 	"github.com/gutschke/splitdns/internal/ddns"
 	"github.com/gutschke/splitdns/internal/forwarder"
-	"github.com/gutschke/splitdns/internal/hostinfo"
 	"github.com/gutschke/splitdns/internal/model"
 	"github.com/gutschke/splitdns/internal/netmatch"
 	"github.com/gutschke/splitdns/internal/qlog"
@@ -58,8 +57,8 @@ type Server struct {
 	controlsActive bool // set at Start: controls enabled AND (password set OR loopback)
 	log            func(string)
 	version        string
-	configFile     string                                  // path shown (redacted) in the config panel; "" => panel omitted
-	hostInfo       func(name string) (hostinfo.Info, bool) // lazy per-host enrichment; nil => omitted
+	configFile     string       // path shown (redacted) in the config panel; "" => panel omitted
+	mdnsEnrich     mdnsEnrichFn // eager per-host enrichment for the mDNS panel; nil => omitted
 
 	now func() time.Time // injectable clock for rate-limit/backoff tests (default time.Now)
 
@@ -90,31 +89,17 @@ func New(addr string, snapshot func() *model.Snapshot, view func() *model.MDNSVi
 // the panel.
 func (s *Server) WithConfigFile(path string) *Server { s.configFile = path; return s }
 
-// WithHostInfo wires lazy per-host enrichment (vendor/MAC/scope), served from GET
-// /host?name=<label> only for hosts present in the mDNS view. The provider returns
-// (info, true) for a known host and (_, false) otherwise.
-func (s *Server) WithHostInfo(fn func(name string) (hostinfo.Info, bool)) *Server {
-	s.hostInfo = fn
-	return s
-}
+// mdnsEnrichFn returns the hardware vendor, DNS-SD service types, and a detail string
+// (MAC/families/scopes, shown on hover) for an mDNS host given its addresses. The result is
+// rendered inline in the mDNS-forward panel — no click needed.
+type mdnsEnrichFn func(name string, addrs []netip.Addr) (vendor string, services []string, detail string)
 
-// handleHostInfo serves enrichment for a single mDNS host. Lazy (only on demand), bounded to
-// known hosts (unknown names are 404, so it can't be driven for arbitrary work), and cached
-// by the provider. All data is local; nothing is sent off the box.
-func (s *Server) handleHostInfo(w http.ResponseWriter, r *http.Request) {
-	name := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("name")))
-	if name == "" || len(name) > 253 {
-		http.Error(w, "usage: /host?name=<mdns-label>", http.StatusBadRequest)
-		return
-	}
-	info, ok := s.hostInfo(name)
-	if !ok {
-		http.NotFound(w, r)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "no-store")
-	_ = json.NewEncoder(w).Encode(info)
+// WithMDNSEnrich wires eager per-host enrichment shown inline in the mDNS-forward panel
+// (vendor + services + a hover detail). Cheap: the provider's OUI and neighbor tables are
+// cached, so it runs in the poll like the client-device column. Nil omits the columns.
+func (s *Server) WithMDNSEnrich(fn mdnsEnrichFn) *Server {
+	s.mdnsEnrich = fn
+	return s
 }
 
 const secretKeyAlt = `secret|tsig_secret|control_password|password|passwd|token|api_key|apikey`
@@ -392,9 +377,6 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 	if s.configFile != "" {
 		mux.HandleFunc("/config", s.handleConfig)
-	}
-	if s.hostInfo != nil {
-		mux.HandleFunc("/host", s.handleHostInfo)
 	}
 	if s.controlsActive {
 		mux.HandleFunc("/control/", s.handleControl)
@@ -860,28 +842,28 @@ func (s *Server) snap() *model.Snapshot {
 // --- redacted view model (NO ZoneID/RecordID, NO token) ---
 
 type page struct {
-	Version     string        `json:"version"`
-	BuiltAt     time.Time     `json:"built_at"`
-	CFHealthy   bool          `json:"cf_healthy"`
-	Zones       []zoneView    `json:"zones"`
-	Reverse     []string      `json:"reverse_zones"`
-	Stub        []stubView    `json:"stub_zones"`
-	VHosts      []string      `json:"vhosts"`
-	VHostV4     string        `json:"vhost_v4,omitempty"`
-	VHostV6     string        `json:"vhost_v6,omitempty"`
-	MDNSFwd     []hostView    `json:"mdns_forward"`
-	MDNSRev     []hostView    `json:"mdns_reverse"`
-	HasConfig   bool          `json:"-"` // config panel available (rendered lazily via /config)
-	HasHostInfo bool          `json:"-"` // per-host enrichment available (lazy via /host)
-	Cache       *cacheView    `json:"answer_cache,omitempty"`
-	Queries     *queryStats   `json:"queries,omitempty"`
-	Backends    []backendView `json:"backends,omitempty"`
-	Workers     []workerView  `json:"workers,omitempty"`
-	Enc         *EncStatus    `json:"encrypted,omitempty"`
-	Controls    *controlsView `json:"-"` // HTML-only (the JSON view stays purely read-only)
-	SelfTest    bool          `json:"-"` // HTML-only: render the self-tests link
-	DDNSSim     bool          `json:"-"` // HTML-only: render the DDNS-simulate form
-	TQuery      bool          `json:"-"` // HTML-only: render the transport-query tool form
+	Version   string        `json:"version"`
+	BuiltAt   time.Time     `json:"built_at"`
+	CFHealthy bool          `json:"cf_healthy"`
+	Zones     []zoneView    `json:"zones"`
+	Reverse   []string      `json:"reverse_zones"`
+	Stub      []stubView    `json:"stub_zones"`
+	VHosts    []string      `json:"vhosts"`
+	VHostV4   string        `json:"vhost_v4,omitempty"`
+	VHostV6   string        `json:"vhost_v6,omitempty"`
+	MDNSFwd   []hostView    `json:"mdns_forward"`
+	MDNSRev   []hostView    `json:"mdns_reverse"`
+	HasConfig bool          `json:"-"` // config panel available (rendered lazily via /config)
+	HasEnrich bool          `json:"-"` // mDNS-forward vendor/services columns available
+	Cache     *cacheView    `json:"answer_cache,omitempty"`
+	Queries   *queryStats   `json:"queries,omitempty"`
+	Backends  []backendView `json:"backends,omitempty"`
+	Workers   []workerView  `json:"workers,omitempty"`
+	Enc       *EncStatus    `json:"encrypted,omitempty"`
+	Controls  *controlsView `json:"-"` // HTML-only (the JSON view stays purely read-only)
+	SelfTest  bool          `json:"-"` // HTML-only: render the self-tests link
+	DDNSSim   bool          `json:"-"` // HTML-only: render the DDNS-simulate form
+	TQuery    bool          `json:"-"` // HTML-only: render the transport-query tool form
 }
 
 // controlsView drives the HTML control panel; it lists which actions are wired and
@@ -1001,9 +983,12 @@ type stubView struct {
 }
 
 type hostView struct {
-	Name    string   `json:"name"`
-	Records []string `json:"records"`
-	Kind    string   `json:"kind,omitempty"` // "" for a normal host; "id" for a machine/instance id
+	Name     string   `json:"name"`
+	Records  []string `json:"records"`
+	Kind     string   `json:"kind,omitempty"`     // "" for a normal host; "id" for a machine/instance id
+	Vendor   string   `json:"vendor,omitempty"`   // hardware vendor guess (OUI); "" if unknown
+	Services []string `json:"services,omitempty"` // DNS-SD service types (e.g. _ipp._tcp)
+	Detail   string   `json:"detail,omitempty"`   // MAC/families/scopes, shown as a hover title
 }
 
 // classifyHost labels an mDNS host name so the UI can flag machine/instance ids (container,
@@ -1076,10 +1061,10 @@ func (s *Server) build() page {
 	}
 	sort.Strings(p.VHosts)
 
-	p.MDNSFwd = hostViews(view.Forward)
+	p.MDNSFwd = hostViews(view.Forward, s.mdnsEnrich)
 	p.MDNSRev = reverseHostViews(view.Reverse, snap.LocalDomain)
 	p.HasConfig = s.configFile != ""
-	p.HasHostInfo = s.hostInfo != nil
+	p.HasEnrich = s.mdnsEnrich != nil
 	// mDNS reverse keys are in-addr/ip6.arpa names; order them by address, not alphabet.
 	sort.Slice(p.MDNSRev, func(i, j int) bool { return lessReverseDNS(p.MDNSRev[i].Name, p.MDNSRev[j].Name) })
 
@@ -1295,7 +1280,7 @@ func ownerRecords(z *model.Zone) []rrView {
 // panel matches what the resolver actually answers over unicast. Empty/"local" local domain
 // leaves *.local unchanged.
 func reverseHostViews(m map[string][]model.RR, localDomain string) []hostView {
-	hv := hostViews(m)
+	hv := hostViews(m, nil) // reverse rows stay record-only (no vendor/services)
 	if localDomain == "" || localDomain == "local" {
 		return hv
 	}
@@ -1310,14 +1295,24 @@ func reverseHostViews(m map[string][]model.RR, localDomain string) []hostView {
 	return hv
 }
 
-func hostViews(m map[string][]model.RR) []hostView {
+func hostViews(m map[string][]model.RR, enrich mdnsEnrichFn) []hostView {
 	var out []hostView
 	for name, rrs := range m {
 		hv := hostView{Name: name, Kind: classifyHost(name)}
+		var addrs []netip.Addr
 		for _, rr := range rrs {
 			hv.Records = append(hv.Records, dns.TypeToString[rr.Type]+" "+rr.RDATA())
+			if rr.Type == dns.TypeA || rr.Type == dns.TypeAAAA {
+				if ip, err := netip.ParseAddr(rr.RDATA()); err == nil {
+					addrs = append(addrs, ip)
+				}
+			}
 		}
 		sort.Strings(hv.Records)
+		if enrich != nil {
+			hv.Vendor, hv.Services, hv.Detail = enrich(name, addrs)
+			sort.Strings(hv.Services)
+		}
 		out = append(out, hv)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
@@ -1399,7 +1394,7 @@ table.sortable thead th{position:sticky;top:calc(var(--topbar-h) + 1.9rem);backg
 .chip.ok{border-color:#9c9} .chip.flag{border-color:#e88;background:#fdeaea}
 .chip.clickable{cursor:pointer}
 .badge{font-size:.7rem;padding:0 .35rem;border-radius:.35rem;background:#e6e6e6;color:#555;vertical-align:middle}
-#cfgtext{max-height:22rem;overflow:auto;background:#f6f6f6;padding:.6rem;border-radius:4px;white-space:pre;font:12px/1.35 ui-monospace,monospace;color:#333}
+#cfgtext{background:#f6f6f6;padding:.6rem;border-radius:4px;white-space:pre;font:12px/1.35 ui-monospace,monospace;color:#333}
 /* control-action feedback + lock affordances (see the control JS) */
 .ctl-msg{font-size:.85rem;margin-left:.4rem;font-variant-numeric:tabular-nums}
 .ctl-msg.ok{color:#161} .ctl-msg.flag{color:#c00} .ctl-msg.muted{color:#777}
@@ -1591,8 +1586,8 @@ transport <select name="transport"><option value="do53">Do53 (UDP)</option><opti
 <table>{{range .VHosts}}<tr><td>{{.}}</td></tr>{{end}}</table></details>
 <details><summary>mDNS forward</summary>
 <p class="muted">badge <span class="badge">id</span> marks a machine/instance id (container, VM, or a device with no friendly hostname).</p>
-<div data-live="mdns_forward"><table><tbody>
-{{range .MDNSFwd}}<tr data-key="{{.Name}}"><td data-f="name">{{.Name}}{{if .Kind}} <span class="badge">{{.Kind}}</span>{{end}}</td><td data-f="records">{{range $i, $r := .Records}}{{if $i}}; {{end}}{{$r}}{{end}}</td><td data-f="info" class="muted">{{if $.HasHostInfo}}<a class="hi" data-h="{{.Name}}" href="#" title="identify this host (vendor/scope)">identify</a>{{end}}</td></tr>{{end}}
+<div data-live="mdns_forward"><table><thead><tr><th>host</th><th>records</th>{{if .HasEnrich}}<th>vendor</th><th>services</th>{{end}}</tr></thead><tbody>
+{{range .MDNSFwd}}<tr data-key="{{.Name}}"><td data-f="name">{{.Name}}{{if .Kind}} <span class="badge">{{.Kind}}</span>{{end}}</td><td data-f="records">{{range $i, $r := .Records}}{{if $i}}; {{end}}{{$r}}{{end}}</td>{{if $.HasEnrich}}<td data-f="vendor" class="muted"{{if .Detail}} title="{{.Detail}}"{{end}}>{{.Vendor}}</td><td data-f="services" class="muted">{{range $i, $s := .Services}}{{if $i}} {{end}}{{$s}}{{end}}</td>{{end}}</tr>{{end}}
 </tbody></table></div></details>
 <details><summary>mDNS reverse</summary><div data-live="mdns_reverse"><table><tbody>
 {{range .MDNSRev}}<tr data-key="{{.Name}}"><td data-f="name">{{.Name}}</td><td data-f="records">{{range $i, $r := .Records}}{{if $i}}; {{end}}{{$r}}{{end}}</td></tr>{{end}}
@@ -1708,10 +1703,20 @@ transport <select name="transport"><option value="do53">Do53 (UDP)</option><opti
     } else if(dev){ dev.remove(); }
   }
 
-  // mDNS forward/reverse: keyed by host/arpa name; only the records cell changes.
+  // mDNS forward/reverse: keyed by host/arpa name. Forward rows also carry live vendor +
+  // service cells (eager enrichment); reverse rows are name + records only.
   function mdnsRecords(tr, x){ patchText(fcell(tr, 'records'), (x.records || []).join('; ')); }
-  function makeMDNS(x){ var tr = document.createElement('tr'); tr.innerHTML = '<td data-f="name"></td><td data-f="records"></td><td data-f="info" class="muted"></td>'; var nc = fcell(tr, 'name'); nc.textContent = x.name; if(x.kind){ nc.appendChild(document.createTextNode(' ')); var b = document.createElement('span'); b.className = 'badge'; b.textContent = x.kind; nc.appendChild(b); } if(hasHostInfo){ var a = document.createElement('a'); a.className = 'hi'; a.href = '#'; a.dataset.h = x.name; a.textContent = 'identify'; fcell(tr, 'info').appendChild(a); } mdnsRecords(tr, x); return tr; }
-  function mdnsPatch(root, d){ reconcile(root.querySelector('tbody'), d || [], function(x){ return x.name; }, makeMDNS, mdnsRecords); }
+  function nameCell(nc, x){ nc.textContent = x.name; if(x.kind){ nc.appendChild(document.createTextNode(' ')); var b = document.createElement('span'); b.className = 'badge'; b.textContent = x.kind; nc.appendChild(b); } }
+  function fillMDNSFwd(tr, x){
+    mdnsRecords(tr, x);
+    if(!hasEnrich) return;
+    var v = fcell(tr, 'vendor'); if(v){ patchText(v, x.vendor || ''); if(x.detail) v.title = x.detail; else v.removeAttribute('title'); }
+    patchText(fcell(tr, 'services'), (x.services || []).join(' '));
+  }
+  function makeMDNSFwd(x){ var tr = document.createElement('tr'); tr.innerHTML = '<td data-f="name"></td><td data-f="records"></td>' + (hasEnrich ? '<td data-f="vendor" class="muted"></td><td data-f="services" class="muted"></td>' : ''); nameCell(fcell(tr, 'name'), x); fillMDNSFwd(tr, x); return tr; }
+  function makeMDNSRev(x){ var tr = document.createElement('tr'); tr.innerHTML = '<td data-f="name"></td><td data-f="records"></td>'; nameCell(fcell(tr, 'name'), x); mdnsRecords(tr, x); return tr; }
+  function mdnsFwdPatch(root, d){ reconcile(root.querySelector('tbody'), d || [], function(x){ return x.name; }, makeMDNSFwd, fillMDNSFwd); }
+  function mdnsRevPatch(root, d){ reconcile(root.querySelector('tbody'), d || [], function(x){ return x.name; }, makeMDNSRev, mdnsRecords); }
 
   // ---- per-section patchers (key === data-live === /diag.json field) ----
   var patchers = {
@@ -1769,8 +1774,8 @@ transport <select name="transport"><option value="do53">Do53 (UDP)</option><opti
         (d.checks || []).forEach(function(c){ var tr = document.createElement('tr'); tr.appendChild(td(c.ok ? 'OK' : '✗', c.ok ? 'ok' : 'flag')); tr.appendChild(td(c.name)); tr.appendChild(td(c.detail || '', 'muted')); tb.appendChild(tr); });
       }
     },
-    mdns_forward: mdnsPatch,
-    mdns_reverse: mdnsPatch
+    mdns_forward: mdnsFwdPatch,
+    mdns_reverse: mdnsRevPatch
   };
 
   // ---- column-width ratchet: columns only ever WIDEN on live update; reset on reload ----
@@ -1916,26 +1921,8 @@ transport <select name="transport"><option value="do53">Do53 (UDP)</option><opti
   document.querySelectorAll('[data-live] table').forEach(ratchet); // seed widths from server-rendered content
   setTopbarH();
 
-  // Host enrichment: fetch vendor/scope for one mDNS host on demand (lazy, cached server-side).
-  var hasHostInfo = {{if .HasHostInfo}}true{{else}}false{{end}};
-  function fmtHostInfo(d){
-    var parts = [];
-    if(d.vendors && d.vendors.length) parts.push(d.vendors.join(', '));
-    if(d.services && d.services.length) parts.push(d.services.join(' '));
-    if(d.families) parts.push(d.families);
-    if(d.scopes && d.scopes.length) parts.push(d.scopes.join('/'));
-    return parts.length ? parts.join(' — ') : 'unidentified';
-  }
-  document.addEventListener('click', function(ev){
-    var a = ev.target && ev.target.closest ? ev.target.closest('a.hi') : null;
-    if(!a) return;
-    ev.preventDefault();
-    var cell = a.parentNode; cell.textContent = '…';
-    fetch('/host?name=' + encodeURIComponent(a.dataset.h), { cache: 'no-store' })
-      .then(function(r){ return r.ok ? r.json() : Promise.reject(r.status); })
-      .then(function(d){ cell.textContent = fmtHostInfo(d); })
-      .catch(function(e){ cell.textContent = (e === 404) ? 'no longer in view' : 'n/a'; });
-  });
+  // The mDNS-forward panel carries eager vendor + service columns when the provider is wired.
+  var hasEnrich = {{if .HasEnrich}}true{{else}}false{{end}};
 
   // Config panel: fetch the redacted config lazily on first expand (never in the poll).
   var cfgP = document.getElementById('cfgpanel');

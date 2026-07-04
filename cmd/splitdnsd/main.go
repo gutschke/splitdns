@@ -386,27 +386,25 @@ func main() {
 	// Read-only diagnostics HTTP (R10), localhost-only by default.
 	oui := hostinfo.NewOUIDB()
 	go oui.Warm()                                               // parse the OUI DB off the request path
-	hostRes := hostinfo.New(oui, hostinfo.Options{Probe: true}) // /host panel
+	hostRes := hostinfo.New(oui, hostinfo.Options{Probe: true}) // mDNS-forward panel enrichment
 	// The client/poll path probes too: async (never blocks the poll) + rate-limited, so a
 	// privacy IPv6 client not yet in the ND cache gets nudged and identified on a later poll.
 	clientRes := hostinfo.New(oui, hostinfo.Options{Probe: true})
 	diagSrv := diag.New(cfg.Diag.Addr, st.snapshot.Load, src.View, version, func(m string) { slog.Warn(m) }).
 		WithConfigFile(*configPath).
-		WithHostInfo(func(name string) (hostinfo.Info, bool) {
-			view := src.View()
-			recs, ok := view.Forward[name]
-			if !ok {
-				return hostinfo.Info{}, false
-			}
-			addrs := make([]netip.Addr, 0, len(recs))
-			for _, rr := range recs {
-				if ip, err := netip.ParseAddr(rr.Content); err == nil {
-					addrs = append(addrs, ip)
-				}
-			}
+		// Eager mDNS-forward enrichment shown inline (vendor + DNS-SD services), no click.
+		// Cheap: hostRes caches OUI + the neighbor table; the async probe never blocks.
+		WithMDNSEnrich(func(name string, addrs []netip.Addr) (string, []string, string) {
 			info := hostRes.Lookup(name, addrs)
-			info.Services = view.Services[name] // passive DNS-SD fingerprint
-			return info, true
+			var detail []string
+			if len(info.MACs) > 0 {
+				detail = append(detail, strings.Join(info.MACs, ", "))
+			}
+			if info.Families != "" {
+				detail = append(detail, info.Families)
+			}
+			detail = append(detail, info.Scopes...)
+			return strings.Join(info.Vendors, ", "), src.View().Services[name], strings.Join(detail, " · ")
 		})
 	diagSrv.WithCacheStats(func() (anscache.Stats, bool) {
 		if ansCache == nil {
