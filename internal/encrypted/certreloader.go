@@ -95,6 +95,15 @@ func (r *CertReloader) CertInfo() (notAfter time.Time, dnsNames []string, ok boo
 	return c.Leaf.NotAfter, c.Leaf.DNSNames, true
 }
 
+// Leaf returns the current leaf certificate for the diagnostics detail view, or nil if none
+// is loaded.
+func (r *CertReloader) Leaf() *x509.Certificate {
+	if c := r.cur.Load(); c != nil {
+		return c.Leaf
+	}
+	return nil
+}
+
 // Run watches the cert file's mtime and reloads on change until ctx is done, invoking
 // onReloaded after each reload attempt (so the daemon can re-sync DDR readiness). A cheap
 // stat poll avoids an fsnotify dependency.

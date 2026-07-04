@@ -204,18 +204,26 @@ func (s *Server) WithEncrypted(fn func() *EncStatus) *Server { s.encStatus = fn;
 // EncStatus is the encrypted-front-end (DoT/DoH) and DDR advertising status the console
 // renders, so an operator can see the certificate and debug why clients don't upgrade.
 type EncStatus struct {
-	Enabled      bool       `json:"enabled"`
-	ADN          string     `json:"adn,omitempty"`
-	CertValid    bool       `json:"cert_valid"`
-	Expiry       string     `json:"expiry,omitempty"` // pre-rendered, e.g. "in 41d (2026-…)" / "EXPIRED"
-	SANs         []string   `json:"sans,omitempty"`   // certificate SAN DNS names
-	DoT          []string   `json:"dot,omitempty"`    // bound DoT listener addresses
-	DoH          []string   `json:"doh,omitempty"`    // bound DoH listener addresses
-	DoHPath      string     `json:"doh_path,omitempty"`
-	AdvertiseDDR bool       `json:"advertise_ddr"`
-	DDRReady     bool       `json:"ddr_ready"`      // the SVCB designation is currently served
-	SVCB         []string   `json:"svcb,omitempty"` // the SVCB RRs actually served at _dns.resolver.arpa
-	Checks       []EncCheck `json:"checks,omitempty"`
+	Enabled      bool        `json:"enabled"`
+	ADN          string      `json:"adn,omitempty"`
+	CertValid    bool        `json:"cert_valid"`
+	Expiry       string      `json:"expiry,omitempty"` // pre-rendered, e.g. "in 41d (2026-…)" / "EXPIRED"
+	SANs         []string    `json:"sans,omitempty"`   // certificate SAN DNS names
+	DoT          []string    `json:"dot,omitempty"`    // bound DoT listener addresses
+	DoH          []string    `json:"doh,omitempty"`    // bound DoH listener addresses
+	DoHPath      string      `json:"doh_path,omitempty"`
+	AdvertiseDDR bool        `json:"advertise_ddr"`
+	DDRReady     bool        `json:"ddr_ready"`             // the SVCB designation is currently served
+	SVCB         []string    `json:"svcb,omitempty"`        // the SVCB RRs actually served at _dns.resolver.arpa
+	CertDetail   []CertField `json:"cert_detail,omitempty"` // full cert attributes (hover/expand)
+	Checks       []EncCheck  `json:"checks,omitempty"`
+}
+
+// CertField is one labeled certificate attribute for the hover tooltip + expandable detail
+// (subject, issuer, serial, validity, key, fingerprint, …).
+type CertField struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
 }
 
 // EncCheck is one precondition for DDR upgrade (the "why won't clients upgrade" list).
@@ -1506,11 +1514,14 @@ traffic onto another.{{end}}</p>
 <div data-live="encrypted">
 {{if .Enabled}}
 <table>
-<tr><th>ADN</th><td data-f="adn">{{.ADN}}</td><th>certificate</th><td data-f="cert" class="{{if .CertValid}}ok{{else}}flag{{end}}">{{if .CertValid}}valid{{else}}INVALID{{end}}{{if .Expiry}} — {{.Expiry}}{{end}}</td></tr>
+<tr><th>ADN</th><td data-f="adn">{{.ADN}}</td><th>certificate</th><td data-f="cert" title="{{range .CertDetail}}{{.Name}}: {{.Value}}&#10;{{end}}" class="{{if .CertValid}}ok{{else}}flag{{end}}">{{if .CertValid}}valid{{else}}INVALID{{end}}{{if .Expiry}} — {{.Expiry}}{{end}}</td></tr>
 <tr><th>cert SANs</th><td data-f="sans" colspan="3" class="muted">{{range .SANs}}{{.}} {{end}}</td></tr>
 <tr><th>DoT</th><td data-f="dot">{{if .DoT}}{{range .DoT}}{{.}} {{end}}{{else}}&mdash;{{end}}</td><th>DoH</th><td data-f="doh">{{if .DoH}}{{range .DoH}}{{.}} {{end}}{{if .DoHPath}}<span class="muted">{{.DoHPath}}</span>{{end}}{{else}}&mdash;{{end}}</td></tr>
 <tr><th>DDR advertised</th><td data-f="ddr" class="{{if .DDRReady}}ok{{else}}flag{{end}}" colspan="3">{{if .DDRReady}}yes — serving the SVCB designation{{else}}no{{end}}</td></tr>
 </table>
+{{if .CertDetail}}<details><summary>certificate details <span class="muted">(also on hover)</span></summary><table data-f="certdetail"><tbody>
+{{range .CertDetail}}<tr><th>{{.Name}}</th><td class="muted">{{.Value}}</td></tr>{{end}}
+</tbody></table></details>{{end}}
 {{if .SVCB}}<details><summary>SVCB served at _dns.resolver.arpa</summary><pre data-f="svcb">{{range .SVCB}}{{.}}
 {{end}}</pre></details>{{end}}
 <h3>Upgrade readiness <span class="muted">(why clients do / don't upgrade)</span></h3>
@@ -1744,7 +1755,10 @@ transport <select name="transport"><option value="do53">Do53 (UDP)</option><opti
     encrypted: function(root, d){
       if(!d || !d.enabled) return;
       patchText(fcell(root, 'adn'), d.adn || '');
-      var cert = fcell(root, 'cert'); if(cert){ cert.textContent = (d.cert_valid ? 'valid' : 'INVALID') + (d.expiry ? (' — ' + d.expiry) : ''); cert.className = d.cert_valid ? 'ok' : 'flag'; }
+      var cert = fcell(root, 'cert'); if(cert){ cert.textContent = (d.cert_valid ? 'valid' : 'INVALID') + (d.expiry ? (' — ' + d.expiry) : ''); cert.className = d.cert_valid ? 'ok' : 'flag'; cert.title = (d.cert_detail || []).map(function(f){ return f.name + ': ' + f.value; }).join('\n'); }
+      var cd = fcell(root, 'certdetail'); if(cd && cd.tBodies[0]){ var cb = cd.tBodies[0]; cb.textContent = '';
+        (d.cert_detail || []).forEach(function(f){ var tr = document.createElement('tr'); var th = document.createElement('th'); th.textContent = f.name; tr.appendChild(th); tr.appendChild(td(f.value, 'muted')); cb.appendChild(tr); });
+      }
       patchText(fcell(root, 'sans'), (d.sans || []).join(' '));
       patchText(fcell(root, 'dot'), (d.dot && d.dot.length) ? d.dot.join(' ') : '—');
       patchText(fcell(root, 'doh'), (d.doh && d.doh.length) ? (d.doh.join(' ') + (d.doh_path ? (' ' + d.doh_path) : '')) : '—');

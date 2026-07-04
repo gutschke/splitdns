@@ -7,7 +7,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"fmt"
 	"io"
@@ -701,8 +706,11 @@ func buildEncStatus(cfg config.Config, rel *encrypted.CertReloader, mgr *encrypt
 		if d := time.Until(notAfter); d < 0 {
 			es.Expiry = "EXPIRED " + notAfter.Format("2006-01-02")
 		} else {
-			es.Expiry = fmt.Sprintf("in %dd (%s)", int(d.Hours()/24), notAfter.Format("2006-01-02"))
+			es.Expiry = fmt.Sprintf("expires in %dd (%s)", int(d.Hours()/24), notAfter.Format("2006-01-02"))
 		}
+	}
+	if leaf := rel.Leaf(); leaf != nil {
+		es.CertDetail = certFields(leaf)
 	}
 	for _, a := range mgr.DoTAddrs() {
 		es.DoT = append(es.DoT, a.String())
@@ -733,6 +741,51 @@ func buildEncStatus(cfg config.Config, rel *encrypted.CertReloader, mgr *encrypt
 		{Name: "ADN resolves to LAN address hints", OK: hints},
 	}
 	return es
+}
+
+// certFields renders the leaf certificate as labeled attributes for the diagnostics
+// hover/expand view — everything useful when debugging a TLS/DDR problem.
+func certFields(c *x509.Certificate) []diag.CertField {
+	sum := sha256.Sum256(c.Raw)
+	fp := make([]string, len(sum))
+	for i, b := range sum {
+		fp[i] = fmt.Sprintf("%02X", b)
+	}
+	f := []diag.CertField{
+		{Name: "Subject", Value: c.Subject.String()},
+		{Name: "Issuer", Value: c.Issuer.String()},
+		{Name: "Serial", Value: c.SerialNumber.Text(16)},
+		{Name: "Valid from", Value: c.NotBefore.Format(time.RFC3339)},
+		{Name: "Valid to", Value: c.NotAfter.Format(time.RFC3339)},
+	}
+	if len(c.DNSNames) > 0 {
+		f = append(f, diag.CertField{Name: "DNS SANs", Value: strings.Join(c.DNSNames, ", ")})
+	}
+	if len(c.IPAddresses) > 0 {
+		ips := make([]string, len(c.IPAddresses))
+		for i, ip := range c.IPAddresses {
+			ips[i] = ip.String()
+		}
+		f = append(f, diag.CertField{Name: "IP SANs", Value: strings.Join(ips, ", ")})
+	}
+	return append(f,
+		diag.CertField{Name: "Key", Value: pubKeyDesc(c)},
+		diag.CertField{Name: "Signature", Value: c.SignatureAlgorithm.String()},
+		diag.CertField{Name: "SHA-256", Value: strings.Join(fp, ":")},
+	)
+}
+
+func pubKeyDesc(c *x509.Certificate) string {
+	switch k := c.PublicKey.(type) {
+	case *rsa.PublicKey:
+		return fmt.Sprintf("RSA %d", k.N.BitLen())
+	case *ecdsa.PublicKey:
+		return "ECDSA " + k.Curve.Params().Name
+	case ed25519.PublicKey:
+		return "Ed25519"
+	default:
+		return c.PublicKeyAlgorithm.String()
+	}
 }
 
 // makeTransportQuery returns the diagnostics transport tester: it issues a query at THIS
