@@ -1,0 +1,16 @@
+[Unit]
+Description=splitdns-notify lease-relay socket
+Documentation=man:splitdns-notify(8)
+
+[Socket]
+# An unprivileged writer (e.g. a DHCP lease hook) sends "<host> <addr>..." datagrams here;
+# splitdns-notify-relay.service reads them and announces, so the TSIG key stays in that one
+# service and never in the writer's context. systemd owns the socket path and permissions.
+ListenDatagram=/run/splitdns-notify/lease-relay.sock
+DirectoryMode=0750
+SocketMode=0660
+SocketGroup=splitdns-notify
+ReceiveBuffer=256K
+
+[Install]
+WantedBy=sockets.target

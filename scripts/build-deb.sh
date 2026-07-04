@@ -45,14 +45,18 @@ OUT=${OUT:-"$root/dist"}
 mkdir -p "$OUT"
 
 # ----------------------------------------------------------------------------
-# Package 1: splitdns-notify — the standalone helper.
-# A single static binary + its man page. No maintainer scripts: it creates no
-# user, ships no service, and owns no config — nothing to set up or tear down.
+# Package 1: splitdns-notify — the standalone helper + an optional socket-activated
+# lease relay. The relay (splitdns-notify --listen) lets an UNPRIVILEGED local caller
+# (e.g. a Kea DHCP lease hook) trigger a signed announce by sending one datagram, so the
+# TSIG key stays in the relay and never in the caller's context.
 # ----------------------------------------------------------------------------
 N="$STAGE/notify"
 install -D -m 0755 "$STAGE/splitdns-notify" "$N/usr/bin/splitdns-notify"
 install -D -m 0644 man/splitdns-notify.8    "$N/usr/share/man/man8/splitdns-notify.8"
 install -D -m 0644 examples/notify.example.toml "$N/usr/share/doc/splitdns-notify/notify.example.toml"
+install -D -m 0644 examples/kea-notify-hook.sh  "$N/usr/share/doc/splitdns-notify/kea-notify-hook.sh"
+install -D -m 0644 packaging/splitdns-notify-relay.socket  "$N/lib/systemd/system/splitdns-notify-relay.socket"
+install -D -m 0644 packaging/splitdns-notify-relay.service "$N/lib/systemd/system/splitdns-notify-relay.service"
 gzip -9 -f "$N/usr/share/man/man8/splitdns-notify.8"
 
 mkdir -p "$N/DEBIAN"
@@ -63,6 +67,7 @@ Architecture: ${ARCH}
 Maintainer: gutschke <gutschke@users.noreply.github.com>
 Section: net
 Priority: optional
+Depends: adduser, init-system-helpers (>= 1.54~)
 Built-Using: ${BUILT_USING}
 Homepage: https://github.com/gutschke/splitdns
 Description: mDNS hostname announcer for splitdnsd
@@ -70,10 +75,62 @@ Description: mDNS hostname announcer for splitdnsd
  host's name and addresses, prompting a splitdnsd resolver to refresh its view
  of the LAN (and, where enabled, its guarded dynamic-DNS write-back).
  .
- It is a small static helper with no runtime dependencies and ships neither the
- server binary nor any service, so it is safe to install on hosts that should
- announce themselves to — but never run — splitdnsd. See splitdns-notify(8).
+ It also ships an optional socket-activated relay (splitdns-notify-relay.socket):
+ an unprivileged local process sends "<host> <addr>" datagrams and the relay
+ performs the signed announce, so e.g. a Kea DHCP lease hook needs no TSIG key of
+ its own. See splitdns-notify(8) and the shipped kea-notify-hook.sh example.
+ .
+ A small static helper with no runtime dependencies; it ships neither the server
+ binary nor any always-on service, so it is safe on hosts that should announce
+ themselves to — but never run — splitdnsd.
 EOF
+
+cat > "$N/DEBIAN/postinst" <<'POSTINST'
+#!/bin/sh
+set -e
+if [ "$1" = "configure" ]; then
+  # Group that gates who may write to the relay socket. Add your DHCP hook's service user
+  # to it (e.g. `usermod -aG splitdns-notify _kea`). Harmless on announce-only hosts.
+  if ! getent group splitdns-notify >/dev/null; then
+    addgroup --system splitdns-notify
+  fi
+fi
+# Enable the relay socket. It is socket-activated and inert until something writes to it,
+# so it is safe everywhere; `systemctl disable --now splitdns-notify-relay.socket` removes it.
+if command -v deb-systemd-helper >/dev/null 2>&1; then
+  deb-systemd-helper enable splitdns-notify-relay.socket >/dev/null || true
+fi
+if [ -d /run/systemd/system ]; then
+  systemctl --system daemon-reload >/dev/null || true
+  if command -v deb-systemd-invoke >/dev/null 2>&1; then
+    deb-systemd-invoke start splitdns-notify-relay.socket >/dev/null || true
+  fi
+fi
+POSTINST
+
+cat > "$N/DEBIAN/prerm" <<'PRERM'
+#!/bin/sh
+set -e
+if [ -d /run/systemd/system ] && command -v deb-systemd-invoke >/dev/null 2>&1; then
+  deb-systemd-invoke stop splitdns-notify-relay.socket splitdns-notify-relay.service >/dev/null || true
+fi
+PRERM
+
+cat > "$N/DEBIAN/postrm" <<'POSTRM'
+#!/bin/sh
+set -e
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+  if command -v deb-systemd-helper >/dev/null 2>&1; then
+    deb-systemd-helper disable splitdns-notify-relay.socket >/dev/null || true
+  fi
+  [ -d /run/systemd/system ] && systemctl --system daemon-reload >/dev/null 2>&1 || true
+fi
+if [ "$1" = "purge" ] && command -v deb-systemd-helper >/dev/null 2>&1; then
+  deb-systemd-helper purge splitdns-notify-relay.socket >/dev/null || true
+fi
+POSTRM
+
+chmod 0755 "$N/DEBIAN/postinst" "$N/DEBIAN/prerm" "$N/DEBIAN/postrm"
 
 DEB_N="$OUT/splitdns-notify_${PKGVER}_${ARCH}.deb"
 dpkg-deb --build --root-owner-group "$N" "$DEB_N"

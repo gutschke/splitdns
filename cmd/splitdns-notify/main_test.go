@@ -272,3 +272,110 @@ func TestSignVerifyRoundTrip(t *testing.T) {
 		t.Error("verify must fail under the wrong secret")
 	}
 }
+
+// TestAnnouncerSend builds+delivers via the announcer to a mock UDP target and verifies
+// the received announcement (the path shared by one-shot and relay modes).
+func TestAnnouncerSend(t *testing.T) {
+	pc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer pc.Close()
+	tgt := pc.LocalAddr().(*net.UDPAddr)
+	ann := &announcer{ttl: 120, targets: []target{{addr: tgt, label: tgt.String()}}}
+	res, signed, err := ann.send("host.local.", []netip.Addr{netip.MustParseAddr("192.0.2.11")})
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if signed || len(res) != 1 || res[0].err != nil {
+		t.Fatalf("results=%+v signed=%v, want 1 clean unsigned delivery", res, signed)
+	}
+	assertReceivedA(t, pc, "host.local.", "192.0.2.11")
+}
+
+// TestRelayLoop drives the relay end to end: a "<host> <addr>" datagram to the relay
+// socket must produce an announcement at the mock target. Also checks a malformed line is
+// skipped without stopping the loop.
+func TestRelayLoop(t *testing.T) {
+	pc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer pc.Close()
+	tgt := pc.LocalAddr().(*net.UDPAddr)
+	ann := &announcer{ttl: 120, targets: []target{{addr: tgt, label: tgt.String()}}}
+
+	sockPath := filepath.Join(t.TempDir(), "relay.sock")
+	lpc, err := net.ListenPacket("unixgram", sockPath)
+	if err != nil {
+		t.Fatalf("listen relay: %v", err)
+	}
+	done := make(chan int, 1)
+	go func() { done <- relayLoop(lpc, ann, func(string, ...any) {}) }()
+
+	send := func(msg string) {
+		c, err := net.Dial("unixgram", sockPath)
+		if err != nil {
+			t.Fatalf("dial relay: %v", err)
+		}
+		defer c.Close()
+		if _, err := c.Write([]byte(msg)); err != nil {
+			t.Fatalf("write relay: %v", err)
+		}
+	}
+	send("garbage-with-no-address") // must be skipped, loop survives
+	send("relayhost 192.0.2.7")     // must be announced
+	assertReceivedA(t, pc, "relayhost.local.", "192.0.2.7")
+
+	lpc.Close() // stop the loop
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("relayLoop did not exit after socket close")
+	}
+}
+
+func assertReceivedA(t *testing.T, pc *net.UDPConn, name, ip string) {
+	t.Helper()
+	pc.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 1500)
+	n, _, err := pc.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("no announcement received: %v", err)
+	}
+	var m dns.Msg
+	if err := m.Unpack(buf[:n]); err != nil {
+		t.Fatalf("unpack: %v", err)
+	}
+	if len(m.Answer) != 1 {
+		t.Fatalf("got %d answers, want 1", len(m.Answer))
+	}
+	a, ok := m.Answer[0].(*dns.A)
+	if !ok || a.Hdr.Name != name || a.A.String() != ip {
+		t.Errorf("got %v, want %s -> %s", m.Answer[0], name, ip)
+	}
+}
+
+// TestRelayClient exercises the client mode (--relay) into a live relayLoop: run() must
+// forward the args as a datagram that the relay announces to the mock target.
+func TestRelayClient(t *testing.T) {
+	pc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer pc.Close()
+	tgt := pc.LocalAddr().(*net.UDPAddr)
+	ann := &announcer{ttl: 120, targets: []target{{addr: tgt, label: tgt.String()}}}
+	sockPath := filepath.Join(t.TempDir(), "relay.sock")
+	lpc, err := net.ListenPacket("unixgram", sockPath)
+	if err != nil {
+		t.Fatalf("listen relay: %v", err)
+	}
+	defer lpc.Close()
+	go relayLoop(lpc, ann, func(string, ...any) {})
+
+	if rc := run([]string{"--relay", sockPath, "clienthost", "10.0.0.3"}, os.Stderr, os.Stderr); rc != 0 {
+		t.Fatalf("relay client exit=%d, want 0", rc)
+	}
+	assertReceivedA(t, pc, "clienthost.local.", "10.0.0.3")
+}

@@ -9,6 +9,12 @@ splitdns\-notify \- announce a public\-IP change to the splitdns resolver
 .br
 .B splitdns\-notify \-\-genkey
 .RI [ name ]
+.br
+.B splitdns\-notify \-\-listen
+.br
+.B splitdns\-notify \-\-relay
+.I socket hostname
+.IR addr " ..."
 .SH DESCRIPTION
 .B splitdns\-notify
 sends a one\-shot multicast\-DNS announcement that
@@ -154,6 +160,56 @@ defaults to
 The secret is printed once and never written to disk, so the operator places it
 deliberately (ideally a mode\-0400 file referenced by
 .BR tsig_secret_file ).
+.TP
+.B \-\-listen
+Run as a relay daemon instead of announcing once: read
+.RI \(dq hostname " " addr ...\(dq
+lines (one datagram each) from a unix socket and announce each, reusing the signing and
+delivery configuration above. The socket comes from systemd socket activation when present
+(the packaged
+.B splitdns\-notify\-relay.socket
+unit), otherwise from
+.BR \-\-listen\-socket .
+See
+.BR "RELAY MODE" .
+.TP
+.BI \-\-listen\-socket " path"
+With
+.B \-\-listen
+and no systemd socket activation, create and read a unixgram socket at
+.IR path .
+.TP
+.BI \-\-relay " socket"
+Client mode: send the
+.RI \(dq hostname " " addr ...\(dq
+arguments as one datagram to a relay
+.I socket
+and exit. Uses no configuration or keys and never touches the network, so an unprivileged
+process (a DHCP lease hook) can trigger a signed announce without holding any credentials
+and without a
+.BR socat (1)
+dependency.
+.SH "RELAY MODE"
+With
+.B \-\-listen
+the helper becomes a small socket\-activated relay: it reads
+.RI \(dq hostname " " addr ...\(dq
+datagrams and performs the signed announce for each. An unprivileged local process reaches
+it with
+.B splitdns\-notify \-\-relay
+.IR socket " " hostname " " addr ...,
+so the announce credential (the TSIG key) lives only in the relay, never in the caller.
+.PP
+The package ships this as
+.B splitdns\-notify\-relay.socket
+(a datagram socket at
+.IR /run/splitdns\-notify/lease\-relay.sock ", mode 0660, group " splitdns\-notify )
+and
+.BR splitdns\-notify\-relay.service .
+Add a writer's service user to the
+.B splitdns\-notify
+group to authorize it. A ready\-to\-edit Kea DHCP lease hook using this path is installed at
+.IR /usr/share/doc/splitdns\-notify/kea\-notify\-hook.sh .
 .SH "EXIT STATUS"
 .TP
 .B 0

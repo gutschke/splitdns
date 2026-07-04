@@ -1,1 +1,3 @@
 splitdns-notify usr/bin/
+packaging/splitdns-notify-relay.socket lib/systemd/system/
+packaging/splitdns-notify-relay.service lib/systemd/system/

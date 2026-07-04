@@ -1,0 +1,33 @@
+[Unit]
+Description=splitdns-notify lease relay
+Documentation=man:splitdns-notify(8)
+Requires=splitdns-notify-relay.socket
+After=splitdns-notify-relay.socket network.target
+
+# Socket-activated: started on the first datagram, then reads in a loop. No [Install] here;
+# enabling the .socket is what makes it available.
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/bin/splitdns-notify --listen
+Restart=on-failure
+RestartSec=2
+
+# Least privilege. Runs as root only to read the TSIG secret under /etc/splitdns and to
+# send UDP/multicast + the local resolver socket; everything else is locked down.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadOnlyPaths=/etc/splitdns
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM

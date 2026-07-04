@@ -6,6 +6,16 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### splitdns-notify relay
+- `splitdns-notify --listen` runs as a small socket-activated relay: it reads
+  `<host> <addr>...` datagrams from a unix socket and performs the signed announce for each,
+  so the TSIG key lives in one service and an unprivileged caller needs none. `--relay
+  <socket>` is the matching built-in client (no `socat`/`nc` dependency).
+- The `splitdns-notify` package ships and enables `splitdns-notify-relay.socket`
+  (`/run/splitdns-notify/lease-relay.sock`, group `splitdns-notify`) + its hardened service,
+  and installs a ready-to-edit Kea DHCP lease hook (`kea-notify-hook.sh`) so a dynamic host
+  resolves promptly. Add the DHCP hook's user to the `splitdns-notify` group to authorize it.
+
 ## [0.2.0] — 2026-07-03
 
 ### Encrypted client front-end (DoT/DoH) + DDR — opt-in, off by default

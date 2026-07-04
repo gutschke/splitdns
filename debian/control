@@ -26,7 +26,7 @@ Description: split-horizon DNS resolver with optional Cloudflare mirror
 
 Package: splitdns-notify
 Architecture: any
-Depends: ${misc:Depends}
+Depends: ${misc:Depends}, adduser
 Description: mDNS hostname announcer for splitdnsd
  splitdns-notify sends authoritative multicast-DNS responses to announce a
  host's name and addresses, prompting a splitdnsd resolver to refresh its view

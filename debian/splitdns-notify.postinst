@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+if [ "$1" = "configure" ]; then
+  # Group that gates who may write to the relay socket (add your DHCP hook's user to it,
+  # e.g. `usermod -aG splitdns-notify _kea`). Harmless on announce-only hosts.
+  if ! getent group splitdns-notify >/dev/null; then
+    addgroup --system splitdns-notify
+  fi
+fi
+#DEBHELPER#
