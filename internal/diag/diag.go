@@ -1295,6 +1295,44 @@ func reverseHostViews(m map[string][]model.RR, localDomain string) []hostView {
 	return hv
 }
 
+// serviceLabels maps DNS-SD service types to a human-readable name, so the panel reads
+// "AirScan (eSCL) · IPP/AirPrint" instead of "_uscan._tcp _ipp._tcp". Unknown types fall
+// through to the raw type (still informative for debugging).
+var serviceLabels = map[string]string{
+	"_ipp._tcp": "IPP/AirPrint", "_ipps._tcp": "IPP (TLS)", "_printer._tcp": "LPD print",
+	"_pdl-datastream._tcp": "JetDirect print", "_scanner._tcp": "scanner",
+	"_uscan._tcp": "AirScan (eSCL)", "_uscans._tcp": "AirScan (TLS)",
+	"_googlecast._tcp": "Chromecast", "_googlezone._tcp": "Cast group",
+	"_airplay._tcp": "AirPlay", "_raop._tcp": "AirPlay audio", "_spotify-connect._tcp": "Spotify Connect",
+	"_homekit._tcp": "HomeKit", "_hap._tcp": "HomeKit accessory", "_matter._tcp": "Matter", "_matterc._udp": "Matter setup",
+	"_http._tcp": "HTTP", "_https._tcp": "HTTPS", "_ssh._tcp": "SSH", "_sftp-ssh._tcp": "SFTP",
+	"_smb._tcp": "SMB", "_afpovertcp._tcp": "AFP", "_nfs._tcp": "NFS", "_webdav._tcp": "WebDAV",
+	"_rfb._tcp": "VNC", "_daap._tcp": "iTunes share", "_raop._udp": "AirPlay audio",
+	"_workstation._tcp": "workstation", "_device-info._tcp": "device-info", "_companion-link._tcp": "Companion",
+	"_cros_p2p._tcp": "ChromeOS P2P", "_pvs6._tcp": "SunPower PVS", "_sonos._tcp": "Sonos",
+}
+
+func serviceLabel(t string) string {
+	if l, ok := serviceLabels[t]; ok {
+		return l
+	}
+	return t
+}
+
+// friendlyServices maps raw service types to friendly labels, de-duplicated and sorted.
+func friendlyServices(types []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, t := range types {
+		if l := serviceLabel(t); !seen[l] {
+			seen[l] = true
+			out = append(out, l)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 func hostViews(m map[string][]model.RR, enrich mdnsEnrichFn) []hostView {
 	var out []hostView
 	for name, rrs := range m {
@@ -1310,8 +1348,9 @@ func hostViews(m map[string][]model.RR, enrich mdnsEnrichFn) []hostView {
 		}
 		sort.Strings(hv.Records)
 		if enrich != nil {
-			hv.Vendor, hv.Services, hv.Detail = enrich(name, addrs)
-			sort.Strings(hv.Services)
+			var raw []string
+			hv.Vendor, raw, hv.Detail = enrich(name, addrs)
+			hv.Services = friendlyServices(raw)
 		}
 		out = append(out, hv)
 	}
@@ -1394,6 +1433,7 @@ table.sortable thead th{position:sticky;top:calc(var(--topbar-h) + 1.9rem);backg
 .chip.ok{border-color:#9c9} .chip.flag{border-color:#e88;background:#fdeaea}
 .chip.clickable{cursor:pointer}
 .badge{font-size:.7rem;padding:0 .35rem;border-radius:.35rem;background:#e6e6e6;color:#555;vertical-align:middle}
+.hostmeta{display:block;white-space:normal;font-size:.82rem;color:#8a8a8a;margin-top:.1rem;font-weight:normal} /* vendor+services sub-line under an mDNS host name */
 #cfgtext{background:#f6f6f6;padding:.6rem;border-radius:4px;white-space:pre;font:12px/1.35 ui-monospace,monospace;color:#333}
 /* control-action feedback + lock affordances (see the control JS) */
 .ctl-msg{font-size:.85rem;margin-left:.4rem;font-variant-numeric:tabular-nums}
@@ -1585,9 +1625,9 @@ transport <select name="transport"><option value="do53">Do53 (UDP)</option><opti
 <details><summary>VHosts</summary><p>reverse proxy {{.VHostV4}} {{.VHostV6}}</p>
 <table>{{range .VHosts}}<tr><td>{{.}}</td></tr>{{end}}</table></details>
 <details><summary>mDNS forward</summary>
-<p class="muted">badge <span class="badge">id</span> marks a machine/instance id (container, VM, or a device with no friendly hostname).</p>
-<div data-live="mdns_forward"><table><thead><tr><th>host</th><th>records</th>{{if .HasEnrich}}<th>vendor</th><th>services</th>{{end}}</tr></thead><tbody>
-{{range .MDNSFwd}}<tr data-key="{{.Name}}"><td data-f="name">{{.Name}}{{if .Kind}} <span class="badge">{{.Kind}}</span>{{end}}</td><td data-f="records">{{range $i, $r := .Records}}{{if $i}}; {{end}}{{$r}}{{end}}</td>{{if $.HasEnrich}}<td data-f="vendor" class="muted"{{if .Detail}} title="{{.Detail}}"{{end}}>{{.Vendor}}</td><td data-f="services" class="muted">{{range $i, $s := .Services}}{{if $i}} {{end}}{{$s}}{{end}}</td>{{end}}</tr>{{end}}
+<p class="muted">badge <span class="badge">id</span> marks a machine/instance id (container, VM, or a device with no friendly hostname). The muted line under a host shows its hardware vendor and Bonjour/DNS-SD services (hover for MAC/scope).</p>
+<div data-live="mdns_forward"><table><tbody>
+{{range .MDNSFwd}}<tr data-key="{{.Name}}"><td data-f="name">{{.Name}}{{if .Kind}} <span class="badge">{{.Kind}}</span>{{end}}{{if and $.HasEnrich (or .Vendor .Services)}}<div class="hostmeta"{{if .Detail}} title="{{.Detail}}"{{end}}>{{if .Vendor}}{{.Vendor}}{{if .Services}} — {{end}}{{end}}{{range $i, $s := .Services}}{{if $i}} · {{end}}{{$s}}{{end}}</div>{{end}}</td><td data-f="records">{{range $i, $r := .Records}}{{if $i}}; {{end}}{{$r}}{{end}}</td></tr>{{end}}
 </tbody></table></div></details>
 <details><summary>mDNS reverse</summary><div data-live="mdns_reverse"><table><tbody>
 {{range .MDNSRev}}<tr data-key="{{.Name}}"><td data-f="name">{{.Name}}</td><td data-f="records">{{range $i, $r := .Records}}{{if $i}}; {{end}}{{$r}}{{end}}</td></tr>{{end}}
@@ -1707,13 +1747,21 @@ transport <select name="transport"><option value="do53">Do53 (UDP)</option><opti
   // service cells (eager enrichment); reverse rows are name + records only.
   function mdnsRecords(tr, x){ patchText(fcell(tr, 'records'), (x.records || []).join('; ')); }
   function nameCell(nc, x){ nc.textContent = x.name; if(x.kind){ nc.appendChild(document.createTextNode(' ')); var b = document.createElement('span'); b.className = 'badge'; b.textContent = x.kind; nc.appendChild(b); } }
+  // vendor + services fold into a muted sub-line under the host name (adjacent, wraps, no
+  // extra columns) — so the info is where the user reads and never scrolls off-screen.
+  function hostMetaText(x){ var s = x.services || []; return (x.vendor ? x.vendor + (s.length ? ' — ' : '') : '') + s.join(' · '); }
   function fillMDNSFwd(tr, x){
     mdnsRecords(tr, x);
     if(!hasEnrich) return;
-    var v = fcell(tr, 'vendor'); if(v){ patchText(v, x.vendor || ''); if(x.detail) v.title = x.detail; else v.removeAttribute('title'); }
-    patchText(fcell(tr, 'services'), (x.services || []).join(' '));
+    var nc = fcell(tr, 'name'); if(!nc) return;
+    var meta = nc.querySelector('.hostmeta'), txt = hostMetaText(x);
+    if(txt){
+      if(!meta){ meta = document.createElement('div'); meta.className = 'hostmeta'; nc.appendChild(meta); }
+      patchText(meta, txt);
+      if(x.detail) meta.title = x.detail; else meta.removeAttribute('title');
+    } else if(meta){ meta.remove(); }
   }
-  function makeMDNSFwd(x){ var tr = document.createElement('tr'); tr.innerHTML = '<td data-f="name"></td><td data-f="records"></td>' + (hasEnrich ? '<td data-f="vendor" class="muted"></td><td data-f="services" class="muted"></td>' : ''); nameCell(fcell(tr, 'name'), x); fillMDNSFwd(tr, x); return tr; }
+  function makeMDNSFwd(x){ var tr = document.createElement('tr'); tr.innerHTML = '<td data-f="name"></td><td data-f="records"></td>'; nameCell(fcell(tr, 'name'), x); fillMDNSFwd(tr, x); return tr; }
   function makeMDNSRev(x){ var tr = document.createElement('tr'); tr.innerHTML = '<td data-f="name"></td><td data-f="records"></td>'; nameCell(fcell(tr, 'name'), x); mdnsRecords(tr, x); return tr; }
   function mdnsFwdPatch(root, d){ reconcile(root.querySelector('tbody'), d || [], function(x){ return x.name; }, makeMDNSFwd, fillMDNSFwd); }
   function mdnsRevPatch(root, d){ reconcile(root.querySelector('tbody'), d || [], function(x){ return x.name; }, makeMDNSRev, mdnsRecords); }

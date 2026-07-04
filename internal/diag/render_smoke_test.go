@@ -28,13 +28,13 @@ func TestRootRendersConfigPanelAndBadge(t *testing.T) {
 	}
 }
 
-// The mDNS-forward panel shows vendor + services inline (no click), and the old lazy
-// "identify" link is gone.
+// The mDNS-forward panel folds vendor + friendly service labels into a sub-line under the
+// host name (no separate columns, no lazy "identify"), with MAC/scope on hover.
 func TestMDNSForwardEnrichmentInline(t *testing.T) {
 	snap := &model.Snapshot{LocalDomain: "lan"}
 	view := &model.MDNSView{
 		Forward:  map[string][]model.RR{"printer": {{Type: dns.TypeA, Content: "192.0.2.9"}}},
-		Services: map[string][]string{"printer": {"_ipp._tcp"}},
+		Services: map[string][]string{"printer": {"_ipp._tcp", "_uscan._tcp"}},
 	}
 	s := New("127.0.0.1:0", func() *model.Snapshot { return snap }, func() *model.MDNSView { return view }, "t", nil).
 		WithMDNSEnrich(func(name string, addrs []netip.Addr) (string, []string, string) {
@@ -46,12 +46,16 @@ func TestMDNSForwardEnrichmentInline(t *testing.T) {
 		t.Fatalf("code = %d", rec.Code)
 	}
 	body := rec.Body.String()
-	for _, want := range []string{`data-f="vendor"`, ">HP<", `data-f="services"`, "_ipp._tcp", "aa:bb:cc:dd:ee:ff"} {
+	// vendor + FRIENDLY labels (not raw types) in a hostmeta sub-line, detail on hover.
+	for _, want := range []string{`class="hostmeta"`, "HP", "IPP/AirPrint", "AirScan (eSCL)", `title="aa:bb:cc:dd:ee:ff`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("mDNS-forward render missing %q", want)
 		}
 	}
-	if strings.Contains(body, `class="hi"`) || strings.Contains(body, ">identify<") {
-		t.Error("the lazy identify link should be gone")
+	// raw service types and the old separate columns / identify link must be gone.
+	for _, gone := range []string{"_ipp._tcp", "_uscan._tcp", `data-f="services"`, `data-f="vendor"`, `class="hi"`, ">identify<"} {
+		if strings.Contains(body, gone) {
+			t.Errorf("mDNS-forward render should not contain %q", gone)
+		}
 	}
 }
