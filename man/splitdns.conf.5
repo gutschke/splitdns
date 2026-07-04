@@ -107,16 +107,16 @@ preferring a real hostname over a machine id when several claim the address. Emp
 serves \fI*.local\fR only.
 .TP
 .B stale_grace
-Serve-stale window (Go duration, default \fB10m\fR; \fB0\fR disables). The cache is a
+Serve-stale window (Go duration, default \fB30m\fR; \fB0\fR disables). The cache is a
 passive listener that expires a record at its announced mDNS TTL; if an announcer
 re-broadcasts more slowly than that TTL, the last value keeps being served for this
 long so hosts do not blink out between announcements. The served DNS TTL is capped
 short while stale. See also \fBsplitdns\-notify\fR(8) \fB\-ttl\fR.
 .TP
 .B goodbye_grace
-Cushion kept after an explicit mDNS goodbye (Go duration, default \fB30s\fR) instead of
-removing the host instantly, so an avahi restart immediately followed by a re-announce
-is seamless.
+Cushion kept after an explicit mDNS goodbye (Go duration, default \fB5m\fR) instead of
+removing the host instantly, so a transient bounce \(em an avahi restart, or an mDNS
+reflector that briefly loses a sleeping device \(em followed by a re-announce is seamless.
 .TP
 .B service_discovery
 Active DNS-SD discovery (boolean, default \fBtrue\fR). When on, splitdnsd multicasts the

@@ -88,8 +88,8 @@ type ZonesConfig struct {
 // local_domain serves *.local only.
 type MDNSConfig struct {
 	LocalDomain  string `toml:"local_domain"`  // unicast local domain, default "lan"; "" = *.local only
-	StaleGrace   string `toml:"stale_grace"`   // serve past the announced TTL, default "10m"; "0" disables
-	GoodbyeGrace string `toml:"goodbye_grace"` // retain after an mDNS goodbye (avahi bounce cushion), default "30s"
+	StaleGrace   string `toml:"stale_grace"`   // serve past the announced TTL, default "30m"; "0" disables
+	GoodbyeGrace string `toml:"goodbye_grace"` // retain after an mDNS goodbye (avahi/reflector bounce cushion), default "5m"
 	// ServiceDiscovery enables active DNS-SD querying (default on): splitdnsd periodically
 	// multicasts the standard Bonjour service-discovery query so quiet devices (printers,
 	// casts, home speakers) and their services surface reliably instead of aging out. Set
@@ -115,14 +115,17 @@ func (m MDNSConfig) LocalDomainLabel() string {
 	return strings.Trim(strings.ToLower(strings.TrimSpace(m.LocalDomain)), ".")
 }
 
-// StaleGraceDuration resolves stale_grace (default 10m; unparsable => default).
+// StaleGraceDuration resolves stale_grace (default 30m; unparsable => default). The generous
+// default backstops an mDNS reflector that re-announces slower than the record's TTL.
 func (m MDNSConfig) StaleGraceDuration() time.Duration {
-	return parseDurOr(m.StaleGrace, 10*time.Minute)
+	return parseDurOr(m.StaleGrace, 30*time.Minute)
 }
 
-// GoodbyeGraceDuration resolves goodbye_grace (default 30s; unparsable => default).
+// GoodbyeGraceDuration resolves goodbye_grace (default 5m; unparsable => default). The
+// default cushions a reflector's transient goodbye (a device that merely went to sleep)
+// rather than blinking the host out of the view.
 func (m MDNSConfig) GoodbyeGraceDuration() time.Duration {
-	return parseDurOr(m.GoodbyeGrace, 30*time.Second)
+	return parseDurOr(m.GoodbyeGrace, 5*time.Minute)
 }
 
 // ResolveOnDemandWaitDuration resolves resolve_on_demand_wait (default 300ms; clamped to a
@@ -452,7 +455,7 @@ func Default() Config {
 		// *.local, and keep records ~10m past their announced TTL (serve-stale) with a short
 		// cushion after an mDNS goodbye so an avahi bounce doesn't blink hosts out.
 		MDNS: MDNSConfig{
-			LocalDomain: "lan", StaleGrace: "10m", GoodbyeGrace: "30s", ServiceDiscovery: true,
+			LocalDomain: "lan", StaleGrace: "30m", GoodbyeGrace: "5m", ServiceDiscovery: true,
 			ResolveOnDemand: true, ResolveOnDemandWait: "300ms", ServeDNSSD: true,
 		},
 		Cloudflare: CFConfig{ReadTokenFile: "/etc/splitdns/cloudflare-read.token"},

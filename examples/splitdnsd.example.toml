@@ -68,10 +68,12 @@ local_domain = "lan"
 # mDNS TTL. If your announcer re-broadcasts slower than that TTL, keep serving the last
 # value for this grace window so hosts do not blink out between announcements. "0"
 # disables. (Also raise splitdns-notify's -ttl above its re-announce interval.)
-stale_grace = "10m"
-# After an explicit mDNS goodbye (a host leaving), keep it this brief cushion instead of
-# dropping instantly, so a mere avahi restart followed by a re-announce is seamless.
-goodbye_grace = "30s"
+stale_grace = "30m"
+# After an explicit mDNS goodbye, keep the host this long instead of dropping instantly, so a
+# transient bounce (an avahi restart, or an mDNS reflector that briefly loses a sleeping
+# device) followed by a re-announce is seamless. Bumped from 30s so a sleeping device behind
+# a reflector doesn't blink out.
+goodbye_grace = "5m"
 # Active DNS-SD discovery (default true): multicast the standard Bonjour service-discovery
 # query so quiet devices (printers, casts, home speakers), their services (type+port) and
 # TXT model/name surface in the diagnostics console. ON-DEMAND — it runs only while the
