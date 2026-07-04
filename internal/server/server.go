@@ -40,12 +40,29 @@ type Config struct {
 	IdleTimeout time.Duration   // TCP idle timeout (default 5s)
 	Context     context.Context // daemon lifetime; per-request forwards derive from it (default Background)
 	QueryBudget time.Duration   // per-request forward deadline (default 2s, design §3 SLO; D4)
+	// OnDemand (nil = disabled) solicits an unknown local host over mDNS on a LocalMiss and
+	// waits briefly, then the handler re-resolves against the reloaded view. It is bounded by
+	// its own small waiter semaphore (odSem) — NEVER the main inbound limiter — so a miss
+	// storm can't starve normal query processing.
+	OnDemand OnDemandResolver
 }
+
+// OnDemandResolver solicits an unknown local host (bare mDNS label) over multicast and blocks
+// briefly for a reply. The bool is advisory (metrics); the caller re-resolves against the
+// reloaded view regardless, so the answer is always the view's truth.
+type OnDemandResolver interface {
+	Resolve(ctx context.Context, label string, client netip.Addr) bool
+}
+
+// odWaiters bounds concurrent on-demand waits (decoupled from MaxInflight). At cap, a miss
+// degrades to the plain NXDOMAIN with no query — graceful, never queued.
+const odWaiters = 64
 
 // Server holds listeners and the shared handler state.
 type Server struct {
 	cfg     Config
 	sem     chan struct{}
+	odSem   chan struct{} // bounds concurrent on-demand mDNS waits (nil if OnDemand disabled)
 	log     func(string)
 	baseCtx context.Context
 	budget  time.Duration
@@ -78,7 +95,11 @@ func New(cfg Config) *Server {
 		// callers); every real forward still derives a WithTimeout deadline from it.
 		baseCtx = context.Background() //nolint:forbidigo // sanctioned request-tree root
 	}
-	return &Server{cfg: cfg, sem: make(chan struct{}, cfg.MaxInflight), log: cfg.Log, baseCtx: baseCtx, budget: cfg.QueryBudget}
+	var odSem chan struct{}
+	if cfg.OnDemand != nil {
+		odSem = make(chan struct{}, odWaiters)
+	}
+	return &Server{cfg: cfg, sem: make(chan struct{}, cfg.MaxInflight), odSem: odSem, log: cfg.Log, baseCtx: baseCtx, budget: cfg.QueryBudget}
 }
 
 // result carries the decision/rcode for one request so ServeDNS can record telemetry
@@ -107,9 +128,14 @@ func (s *Server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 
 	// Inbound concurrency limiter: never grow unbounded under flood. On overflow,
 	// drop UDP (no reply) and SERVFAIL TCP, rather than spawning more work.
+	holdSem := true
 	select {
 	case s.sem <- struct{}{}:
-		defer func() { <-s.sem }()
+		defer func() {
+			if holdSem {
+				<-s.sem
+			}
+		}()
 	default:
 		res.decision = qlog.Dropped
 		if isTCP(w) {
@@ -128,6 +154,32 @@ func (s *Server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	}
 
 	out := resolver.Resolve(snap, view, req)
+
+	// On-demand mDNS: an UNMANAGED local miss (the only case that sets LocalMiss) may be a
+	// quiet host we can solicit. Do it OFF the main limiter — release the slot first so the
+	// wait can't starve normal processing — under the small odSem waiter cap, then re-resolve
+	// against the reloaded view UNCONDITIONALLY (the view is the source of truth, which erases
+	// any wake/timeout race and picks up a host that raced in during the miss).
+	if out.LocalMiss && s.cfg.OnDemand != nil {
+		<-s.sem // drop the main slot before waiting
+		holdSem = false
+		select {
+		case s.odSem <- struct{}{}:
+			// Release deferred so a panic in Resolve can't leak the waiter slot (belt-and-
+			// suspenders: a ServeDNS panic currently kills the process, but a future
+			// handler-level recover must not slow-drain odSem into permanent degradation).
+			func() {
+				defer func() { <-s.odSem }()
+				s.cfg.OnDemand.Resolve(s.baseCtx, out.LocalLabel, ip)
+			}()
+		default: // waiter cap reached — degrade to the plain miss, emit no query
+		}
+		if view = s.cfg.View(); view == nil {
+			view = &model.MDNSView{}
+		}
+		out = resolver.Resolve(snap, view, req)
+	}
+
 	switch {
 	case out.Msg != nil:
 		res = result{qlog.Local, out.Msg.Rcode}

@@ -57,9 +57,10 @@ type Server struct {
 	controlsActive bool // set at Start: controls enabled AND (password set OR loopback)
 	log            func(string)
 	version        string
-	configFile     string       // path shown (redacted) in the config panel; "" => panel omitted
-	mdnsEnrich     mdnsEnrichFn // eager per-host enrichment for the mDNS panel; nil => omitted
-	pollHook       func()       // called on each /diag.json poll (drives on-demand discovery); nil => none
+	configFile     string              // path shown (redacted) in the config panel; "" => panel omitted
+	mdnsEnrich     mdnsEnrichFn        // eager per-host enrichment for the mDNS panel; nil => omitted
+	pollHook       func()              // called on each /diag.json poll (drives on-demand discovery); nil => none
+	onDemandStats  func() OnDemandInfo // on-demand mDNS resolution counters; nil => omitted
 
 	now func() time.Time // injectable clock for rate-limit/backoff tests (default time.Now)
 
@@ -108,6 +109,24 @@ func (s *Server) WithMDNSEnrich(fn mdnsEnrichFn) *Server {
 // is the "screen is open" signal. Throttling is the callee's responsibility.
 func (s *Server) WithPollHook(fn func()) *Server {
 	s.pollHook = fn
+	return s
+}
+
+// OnDemandInfo is the diagnostics view of on-demand mDNS resolution activity, so an operator
+// can see the (default-on) feature firing and being rate-limited.
+type OnDemandInfo struct {
+	Enabled     bool   `json:"enabled"`
+	Emitted     uint64 `json:"emitted"`      // targeted queries multicast
+	Hits        uint64 `json:"hits"`         // host appeared within the wait
+	Suppressed  uint64 `json:"suppressed"`   // repeat within the suppression window (no query)
+	RateLimited uint64 `json:"rate_limited"` // dropped by global/per-client rate limit
+	CapFull     uint64 `json:"cap_full"`     // dropped by the in-flight cap
+	InFlight    int    `json:"in_flight"`
+}
+
+// WithOnDemandStats wires the on-demand resolution counters into the console. Nil omits them.
+func (s *Server) WithOnDemandStats(fn func() OnDemandInfo) *Server {
+	s.onDemandStats = fn
 	return s
 }
 
@@ -865,6 +884,7 @@ type page struct {
 	VHostV6   string        `json:"vhost_v6,omitempty"`
 	MDNSFwd   []hostView    `json:"mdns_forward"`
 	MDNSRev   []hostView    `json:"mdns_reverse"`
+	OnDemand  *OnDemandInfo `json:"on_demand,omitempty"`
 	HasConfig bool          `json:"-"` // config panel available (rendered lazily via /config)
 	HasEnrich bool          `json:"-"` // mDNS-forward vendor/services columns available
 	Cache     *cacheView    `json:"answer_cache,omitempty"`
@@ -1072,6 +1092,12 @@ func (s *Server) build() page {
 	}
 	sort.Strings(p.VHosts)
 
+	if s.onDemandStats != nil {
+		od := s.onDemandStats()
+		if od.Enabled {
+			p.OnDemand = &od
+		}
+	}
 	p.MDNSFwd = hostViews(view.Forward, s.mdnsEnrich)
 	p.MDNSRev = reverseHostViews(view.Reverse, snap.LocalDomain)
 	p.HasConfig = s.configFile != ""
@@ -1683,6 +1709,7 @@ transport <select name="transport"><option value="do53">Do53 (UDP)</option><opti
 <table>{{range .VHosts}}<tr><td>{{.}}</td></tr>{{end}}</table></details>
 <details><summary>mDNS forward</summary>
 <p class="muted">badge <span class="badge">id</span> marks a machine/instance id (container, VM, or a device with no friendly hostname). The muted line under a host shows its hardware vendor and Bonjour/DNS-SD services (hover for MAC/scope).</p>
+{{if .OnDemand}}<p class="muted" data-live="on_demand"><span data-f="od">on-demand mDNS: {{.OnDemand.Emitted}} emitted · {{.OnDemand.Hits}} found · {{.OnDemand.Suppressed}} suppressed · {{.OnDemand.RateLimited}} rate-limited · {{.OnDemand.CapFull}} cap-full · {{.OnDemand.InFlight}} in-flight</span></p>{{end}}
 <div data-live="mdns_forward"><table><tbody>
 {{range .MDNSFwd}}<tr data-key="{{.Name}}" class="hostrow"{{if .Detail}} title="{{.Detail}}"{{end}}><td data-f="name">{{.Name}}{{if .Kind}} <span class="badge">{{.Kind}}</span>{{end}}</td><td data-f="records">{{range $i, $r := .Records}}{{if $i}}; {{end}}{{$r}}{{end}}</td></tr>{{if and $.HasEnrich .Meta}}<tr data-key="{{.Name}}#meta" class="hostrow metarow"{{if .Detail}} title="{{.Detail}}"{{end}}><td class="hostmeta" data-f="meta" colspan="2">{{.Meta}}</td></tr>{{end}}{{end}}
 </tbody></table></div></details>
@@ -1884,6 +1911,7 @@ transport <select name="transport"><option value="do53">Do53 (UDP)</option><opti
         (d.checks || []).forEach(function(c){ var tr = document.createElement('tr'); tr.appendChild(td(c.ok ? 'OK' : '✗', c.ok ? 'ok' : 'flag')); tr.appendChild(td(c.name)); tr.appendChild(td(c.detail || '', 'muted')); tb.appendChild(tr); });
       }
     },
+    on_demand: function(root, d){ if(!d) return; patchText(fcell(root, 'od'), 'on-demand mDNS: ' + d.emitted + ' emitted · ' + d.hits + ' found · ' + d.suppressed + ' suppressed · ' + d.rate_limited + ' rate-limited · ' + d.cap_full + ' cap-full · ' + d.in_flight + ' in-flight'); },
     mdns_forward: mdnsFwdPatch,
     mdns_reverse: mdnsRevPatch
   };

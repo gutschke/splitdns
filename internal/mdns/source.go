@@ -2,6 +2,7 @@ package mdns
 
 import (
 	"context"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,6 +33,17 @@ type Source struct {
 	typeMu     sync.Mutex
 	discovered map[string]struct{} // service types learned from enumeration responses
 	instances  map[string]struct{} // service instances learned from type responses (→ SRV)
+
+	// On-demand resolution (opt-in via WithOnDemand). odPending==nil keeps it off. All maps
+	// are guarded by odMu; the counters are atomic. See resolve.go.
+	onDemandWait time.Duration
+	odMu         sync.Mutex
+	odPending    map[string]*odInflight
+	odRecent     map[string]time.Time
+	odGlobal     *odBucket
+	odClients    map[netip.Addr]*odBucket
+
+	odEmitted, odHits, odSuppressed, odLimited, odCapFull atomic.Uint64
 }
 
 // Option customizes a Source at construction.
@@ -51,6 +63,18 @@ func WithServeStale(stale, goodbye time.Duration) Option {
 // A sender must also be wired (the Listener does this via SetSender) for queries to go out.
 func WithServiceDiscovery(every time.Duration) Option {
 	return func(s *Source) { s.queryEvery = every }
+}
+
+// WithOnDemand enables on-demand resolution (Source.Resolve) with the given per-query wait.
+// A sender must also be wired for queries to go out. Off when not set.
+func WithOnDemand(wait time.Duration) Option {
+	return func(s *Source) {
+		s.onDemandWait = wait
+		s.odPending = map[string]*odInflight{}
+		s.odRecent = map[string]time.Time{}
+		s.odGlobal = &odBucket{}
+		s.odClients = map[netip.Addr]*odBucket{}
+	}
 }
 
 // NewSource builds a Source. onChange/now may be nil (now defaults to time.Now).
@@ -151,9 +175,14 @@ func (s *Source) PokeDiscovery() {
 func (s *Source) HandlePacket(b []byte, trusted bool) {
 	now := s.now()
 	changed := false
+	var hosts []string
 	for _, a := range ParsePacket(b) {
 		if s.cache.Apply(a, now, trusted) {
 			changed = true
+			// Wake an on-demand waiter ONLY for a host that genuinely landed in the view
+			// (Apply==true) — never on a no-op re-announcement, so a waiter can't be woken
+			// into an early NXDOMAIN. The unconditional server-side re-resolve is the backstop.
+			hosts = append(hosts, a.Host)
 		}
 	}
 	// DNS-SD service types (diagnostic fingerprint) attach to known hosts; parsed after
@@ -179,6 +208,7 @@ func (s *Source) HandlePacket(b []byte, trusted bool) {
 	}
 	if changed {
 		s.publish()
+		s.completeInflight(hosts) // MUST be after publish so waiters observe the new view
 	}
 }
 

@@ -126,6 +126,32 @@ Querying is \fBon-demand\fR: it runs only while the diagnostics console is open 
 pokes it, throttled to the discovery interval), so there is zero active multicast when
 nobody is watching. Set \fBfalse\fR to remain a pure passive listener and never query;
 \fBsplitdns\-notify\fR-proxied hosts (which advertise no services) are unaffected either way.
+.TP
+.B resolve_on_demand
+On-demand resolution (boolean, default \fBtrue\fR). When a client asks for an unknown local
+host, splitdnsd sends a targeted mDNS query and waits briefly, so a quiet device (not
+currently announcing) is found on first ask instead of returning NXDOMAIN. Heavily bounded:
+a global outbound rate limit (10/s, burst 20), a per-client limit (5/s), an in-flight cap
+(64), and recently-queried suppression; it \fBnever\fR queries a managed name (vhost / CF /
+DDNS-eligible), so a solicited reply can never move a Cloudflare record. Counters are shown
+in the diagnostics console. Trade-offs to be aware of: an unresolved lookup is multicast to
+the LAN (and any mDNS reflector), disclosing looked-up names; mDNS answers are
+unauthenticated, so an on-demand result is lower-assurance than a managed record (it
+self-heals within \(<=120s and never overrides a managed name); under a flood of distinct
+unknown names the daemon still emits up to the rate cap; and a just-booted host may return
+NXDOMAIN for up to ~30s (the negative window) unless it announces itself first. Set
+\fBfalse\fR to keep the pure "unknown \(-> NXDOMAIN" behavior with no active queries.
+.TP
+.B resolve_on_demand_wait
+How long to wait for an on-demand reply (Go duration, default \fB300ms\fR; clamped to
+50ms..2s). Longer catches a slower responder at the cost of a slower NXDOMAIN.
+.TP
+.B serve_dnssd
+Serve DNS-SD over unicast (boolean, default \fBtrue\fR). Local names also answer
+\fBSRV\fR/\fBTXT\fR/\fBPTR\fR synthesized from the passively-captured mDNS services, so a LAN
+client can resolve or browse services (e.g. printers) by unicast \(em including across VLANs
+where multicast does not reach. It is a read-only projection of the cache and \fBnever\fR
+sends a query. Set \fBfalse\fR to serve only A/AAAA on the local domain.
 .SH "[vhost]"
 .TP
 .B feed

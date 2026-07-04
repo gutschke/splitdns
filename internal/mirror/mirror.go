@@ -188,6 +188,7 @@ func BaseSnapshot(cfg config.Config, revZones []string) *model.Snapshot {
 		snap.DDNSEligible[dns.Fqdn(strings.ToLower(strings.TrimSpace(e)))] = true
 	}
 	snap.LocalDomain = cfg.MDNS.LocalDomainLabel()
+	snap.ServeDNSSD = cfg.MDNS.ServeDNSSD
 	var allow []string
 	for _, z := range revZones {
 		apex := dns.Fqdn(z)

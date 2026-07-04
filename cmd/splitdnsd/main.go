@@ -182,12 +182,22 @@ func main() {
 	if cfg.MDNS.ServiceDiscovery {
 		discoveryEvery = 2 * time.Minute // paced DNS-SD queries (reflector-friendly)
 	}
+	srcOpts := []mdns.Option{
+		mdns.WithServeStale(cfg.MDNS.StaleGraceDuration(), cfg.MDNS.GoodbyeGraceDuration()),
+		mdns.WithServiceDiscovery(discoveryEvery),
+	}
+	if cfg.MDNS.ResolveOnDemand {
+		srcOpts = append(srcOpts, mdns.WithOnDemand(cfg.MDNS.ResolveOnDemandWaitDuration()))
+		slog.Info("mdns on-demand resolution enabled", "wait", cfg.MDNS.ResolveOnDemandWaitDuration())
+	}
+	if cfg.MDNS.ServeDNSSD {
+		slog.Info("mdns unicast DNS-SD serving enabled (serve_dnssd)")
+	}
 	src := mdns.NewSource(func(host string, addrs []netip.Addr) {
 		if writer != nil {
 			writer.Submit(ddns.Change{Host: host, Addrs: addrs})
 		}
-	}, nil, mdns.WithServeStale(cfg.MDNS.StaleGraceDuration(), cfg.MDNS.GoodbyeGraceDuration()),
-		mdns.WithServiceDiscovery(discoveryEvery))
+	}, nil, srcOpts...)
 	workers = append(workers, supervisor.Worker{Name: "mdns", Ceiling: 5 * time.Minute, Run: src.Run})
 
 	// D7: an announcement may trigger write-back via a valid TSIG signature (source-IP
@@ -351,7 +361,7 @@ func main() {
 	queryLog := qlog.New(1024, 4096)
 
 	// :53 front end.
-	srv := server.New(server.Config{
+	scfg := server.Config{
 		Access:    access,
 		Snapshot:  st.snapshot.Load,
 		View:      src.View,
@@ -360,7 +370,11 @@ func main() {
 		QueryLog:  queryLog,
 		Context:   ctx, // per-request forwards cancel on shutdown; 2s budget (D4)
 		Log:       func(m string) { slog.Warn(m) },
-	})
+	}
+	if cfg.MDNS.ResolveOnDemand {
+		scfg.OnDemand = src // the handler solicits unknown local hosts over mDNS on a miss
+	}
+	srv := server.New(scfg)
 	if err := srv.Start(listen, cfg.Listen.UDP, cfg.Listen.TCP); err != nil {
 		slog.Error("listener start failed", "err", err)
 		os.Exit(2)
@@ -459,6 +473,14 @@ func main() {
 	// Active DNS-SD discovery runs only while the console is open: each diag poll pokes it
 	// (throttled to the discovery interval), so there is zero active multicast when idle.
 	diagSrv.WithPollHook(src.PokeDiscovery)
+	// Surface on-demand resolution counters so the (default-on) feature is visible/auditable.
+	diagSrv.WithOnDemandStats(func() diag.OnDemandInfo {
+		st := src.OnDemandStats()
+		return diag.OnDemandInfo{
+			Enabled: st.Enabled, Emitted: st.Emitted, Hits: st.Hits, Suppressed: st.Suppressed,
+			RateLimited: st.RateLimited, CapFull: st.CapFull, InFlight: st.InFlight,
+		}
+	})
 	if cfg.Diag.SocketMode != "" {
 		// Non-fatal: a bad diag.socket_mode must not stop DNS — warn and keep the default.
 		if m, merr := strconv.ParseUint(cfg.Diag.SocketMode, 8, 32); merr != nil {

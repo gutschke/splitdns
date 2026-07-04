@@ -78,6 +78,24 @@ goodbye_grace = "30s"
 # console is open (zero active multicast when idle). Set false to stay a pure passive
 # listener and never query; proxied hosts (splitdns-notify) are unaffected either way.
 service_discovery = true
+# On-demand resolution (default true): when a client asks for an unknown local host, send a
+# targeted mDNS query and wait briefly, so a quiet device (printer/NAS not currently
+# announcing) is found on first ask instead of returning NXDOMAIN. Heavily bounded — global
+# + per-client rate limits, an in-flight cap, and recently-queried suppression — and it never
+# queries a managed name, so a solicited reply can never move a Cloudflare record.
+# Trade-offs to know: (1) an unresolved lookup is multicast to the LAN (and any mDNS
+# reflector), disclosing looked-up names; (2) mDNS is unauthenticated, so a solicited answer
+# is lower-assurance than a managed/CF record — it self-heals in <=120s and never overrides a
+# managed name; (3) under a flood of distinct unknown names the daemon still emits up to its
+# rate cap; (4) a just-booted host may NXDOMAIN for up to ~30s (the negative window) unless it
+# announces itself first. Set false to keep the pure "unknown => NXDOMAIN" behavior.
+resolve_on_demand = true
+resolve_on_demand_wait = "300ms"   # how long to wait for a reply (clamped 50ms..2s)
+# Serve DNS-SD over unicast (default true): answer SRV/TXT/PTR for local names from the
+# passively-captured services, so a LAN client can resolve/browse services (e.g. printers)
+# by unicast, including across VLANs where multicast doesn't reach. Read-only projection of
+# the cache — it never sends a query. Set false to serve only A/AAAA on the local domain.
+serve_dnssd = true
 
 [vhost]
 # Reverse-proxy redirect (any product: nginx, Caddy, Traefik, ...): naked domain / www / vhosts.

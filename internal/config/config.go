@@ -96,6 +96,17 @@ type MDNSConfig struct {
 	// false to stay a pure passive listener (e.g. to add zero query traffic on a segment
 	// with a fussy mDNS reflector).
 	ServiceDiscovery bool `toml:"service_discovery"`
+	// ResolveOnDemand (default on): when a client asks for an unknown local host, multicast a
+	// targeted mDNS query and wait briefly so a quiet device (that isn't currently announcing)
+	// is found on first ask. Heavily bounded — global+per-client rate limits, in-flight cap,
+	// recently-queried suppression, never a managed name, solicited answers never move a CF
+	// record. Set false to keep the pure "unknown => NXDOMAIN" behavior (no active queries).
+	ResolveOnDemand     bool   `toml:"resolve_on_demand"`
+	ResolveOnDemandWait string `toml:"resolve_on_demand_wait"` // how long to wait for a reply, default "300ms"
+	// ServeDNSSD (default on): answer DNS-SD SRV/TXT/PTR for local names from the passively
+	// captured services, so LAN clients can resolve/browse services over unicast (across VLANs
+	// where multicast doesn't reach). Read-only projection of the cache; never queries.
+	ServeDNSSD bool `toml:"serve_dnssd"`
 }
 
 // LocalDomainLabel returns the normalized bare local-domain label (lowercased, no dots),
@@ -112,6 +123,19 @@ func (m MDNSConfig) StaleGraceDuration() time.Duration {
 // GoodbyeGraceDuration resolves goodbye_grace (default 30s; unparsable => default).
 func (m MDNSConfig) GoodbyeGraceDuration() time.Duration {
 	return parseDurOr(m.GoodbyeGrace, 30*time.Second)
+}
+
+// ResolveOnDemandWaitDuration resolves resolve_on_demand_wait (default 300ms; clamped to a
+// sane 50ms..2s so a misconfig can't stall the hot path or make the feature useless).
+func (m MDNSConfig) ResolveOnDemandWaitDuration() time.Duration {
+	d := parseDurOr(m.ResolveOnDemandWait, 300*time.Millisecond)
+	if d < 50*time.Millisecond {
+		d = 50 * time.Millisecond
+	}
+	if d > 2*time.Second {
+		d = 2 * time.Second
+	}
+	return d
 }
 
 func parseDurOr(s string, def time.Duration) time.Duration {
@@ -427,7 +451,10 @@ func Default() Config {
 		// LAN plane: serve host.lan (a single-search-domain-friendly local name) alongside
 		// *.local, and keep records ~10m past their announced TTL (serve-stale) with a short
 		// cushion after an mDNS goodbye so an avahi bounce doesn't blink hosts out.
-		MDNS:       MDNSConfig{LocalDomain: "lan", StaleGrace: "10m", GoodbyeGrace: "30s", ServiceDiscovery: true},
+		MDNS: MDNSConfig{
+			LocalDomain: "lan", StaleGrace: "10m", GoodbyeGrace: "30s", ServiceDiscovery: true,
+			ResolveOnDemand: true, ResolveOnDemandWait: "300ms", ServeDNSSD: true,
+		},
 		Cloudflare: CFConfig{ReadTokenFile: "/etc/splitdns/cloudflare-read.token"},
 		DDNS:       DDNSConfig{Enabled: false, DryRun: true, Rate: "10m", NotifySocket: "/run/splitdns/notify.sock"},
 		Diag:       DiagConfig{Addr: "127.0.0.1:8080"},
@@ -518,6 +545,11 @@ func (c Config) Validate() error {
 	}
 	if _, err := c.DDNS.RateDuration(); err != nil {
 		return fmt.Errorf("ddns.rate: %w", err)
+	}
+	if s := c.MDNS.ResolveOnDemandWait; s != "" {
+		if _, err := time.ParseDuration(s); err != nil {
+			return fmt.Errorf("mdns.resolve_on_demand_wait %q: %w (use e.g. \"300ms\")", s, err)
+		}
 	}
 	if _, err := c.DDNS.TrustedSourceSet(); err != nil {
 		return fmt.Errorf("ddns.trusted_sources: %w", err)

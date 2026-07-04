@@ -25,6 +25,13 @@ type Outcome struct {
 	Msg     *dns.Msg
 	Forward bool
 	Stub    []string
+	// LocalMiss is set when Msg is an NXDOMAIN for an UNMANAGED local host (a bare
+	// *.local/*.<local-domain> A/AAAA/ANY that isn't in the mDNS view). It is the sole,
+	// authoritative signal the server uses to (optionally) fire an on-demand mDNS query and
+	// re-resolve; every managed/static/reverse/vhost/CF path is intercepted earlier and never
+	// sets it. LocalLabel is the bare mDNS key to query.
+	LocalMiss  bool
+	LocalLabel string
 }
 
 // Resolve classifies req and returns the Outcome. snap/view must be non-nil.
@@ -64,7 +71,7 @@ func Resolve(snap *model.Snapshot, view *model.MDNSView, req *dns.Msg) Outcome {
 	// forwarded. The configurable local domain (e.g. .lan) lets single-search-domain clients
 	// reach LAN hosts by a real name.
 	if lbl, ok := localLabel(snap, name); ok {
-		return answerLocal(view, req, name, lbl, qtype)
+		return answerLocal(snap, view, req, name, lbl, qtype)
 	}
 	// Step 5 — stub/forward zones take precedence over the parent CF zone.
 	if tgt := stubMatch(snap, name); len(tgt) > 0 {
@@ -301,14 +308,28 @@ func looksLikeID(s string) bool {
 	return hex >= 16
 }
 
-func answerLocal(view *model.MDNSView, req *dns.Msg, name, label string, qtype uint16) Outcome {
+func answerLocal(snap *model.Snapshot, view *model.MDNSView, req *dns.Msg, name, label string, qtype uint16) Outcome {
 	resp := reply(req)
 	resp.Authoritative = true
+	// DNS-SD nodes (_services._dns-sd._udp, a service type, or an instance) are served from
+	// the passively-captured services when enabled — a read-only projection, NEVER an
+	// on-demand trigger (so browsing can't provoke active multicast).
+	if snap.ServeDNSSD {
+		if out, ok := answerDNSSD(view, resp, name, label, qtype); ok {
+			return out
+		}
+	}
 	recs, exists := view.Forward[label]
 	if !exists {
 		// Unknown LAN host: NXDOMAIN (mDNS carries no SOA, so none in AUTHORITY).
 		resp.Rcode = dns.RcodeNameError
-		return Outcome{Msg: resp}
+		out := Outcome{Msg: resp}
+		// Signal the server it MAY solicit this host over mDNS — but only for a plausible
+		// bare hostname (not a service-type/underscore label) and an address query.
+		if !strings.HasPrefix(label, "_") && (qtype == dns.TypeA || qtype == dns.TypeAAAA || qtype == dns.TypeANY) {
+			out.LocalMiss, out.LocalLabel = true, label
+		}
+		return out
 	}
 	appendMatching(resp, recs, name, qtype) // NODATA if the host lacks this family
 	return Outcome{Msg: resp}

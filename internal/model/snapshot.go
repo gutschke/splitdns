@@ -24,6 +24,10 @@ type Snapshot struct {
 	// resolves from the mDNS view like host.local, and is the canonical target for PTRs.
 	// Empty => *.local only.
 	LocalDomain string
+	// ServeDNSSD, when true, makes the local plane answer DNS-SD SRV/TXT/PTR synthesized from
+	// the passively-cached mDNS services (a read-only unicast DNS-SD gateway) — never the
+	// trigger for any active query. Default on; config-gated.
+	ServeDNSSD  bool
 	AllowSuffix []string // authoritative/stub/static suffixes (rebind scope, §4.2)
 	BuiltAt     time.Time
 	CFHealthy   bool // false => serving stale CF data (degraded)
@@ -101,8 +105,9 @@ type MDNSView struct {
 	Forward map[string][]RR
 	// Reverse maps an in-addr/ip6 arpa name -> PTR RRs.
 	Reverse map[string][]RR
-	// Services maps a bare hostname -> the DNS-SD services it advertises (type + port), a
-	// diagnostic fingerprint only. Never answered on the wire.
+	// Services maps a bare hostname -> the DNS-SD services it advertises (type + port + TXT).
+	// Used for diagnostics and, when Snapshot.ServeDNSSD is on, projected to SRV/TXT/PTR on
+	// the local plane (read-only; never solicits).
 	Services map[string][]MDNSService
 	// Info maps a bare hostname -> a friendly descriptor derived from DNS-SD TXT records
 	// (device model / friendly name), diagnostics only.
