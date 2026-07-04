@@ -41,7 +41,7 @@ func TestServiceCaptureIntoView(t *testing.T) {
 	src.HandlePacket(b, false)
 
 	svcs := src.View().Services["printer"]
-	if len(svcs) != 2 || svcs[0] != "_http._tcp" || svcs[1] != "_ipp._tcp" {
+	if len(svcs) != 2 || svcs[0].Type != "_http._tcp" || svcs[1].Type != "_ipp._tcp" {
 		t.Errorf("services = %v, want [_http._tcp _ipp._tcp]", svcs)
 	}
 	// A service for an unknown host is dropped (never creates a host / affects resolution).
@@ -68,7 +68,29 @@ func TestServiceCaptureFromAdditional(t *testing.T) {
 		t.Fatal(err)
 	}
 	src.HandlePacket(b, false)
-	if svcs := src.View().Services["cast"]; len(svcs) != 1 || svcs[0] != "_googlecast._tcp" {
-		t.Errorf("services = %v, want [_googlecast._tcp] (SRV was in Additional)", svcs)
+	if svcs := src.View().Services["cast"]; len(svcs) != 1 || svcs[0].Type != "_googlecast._tcp" || svcs[0].Port != 8009 {
+		t.Errorf("services = %v, want [{_googlecast._tcp 8009}] (SRV was in Additional)", svcs)
+	}
+}
+
+// A TXT record's model/name yields a friendly host descriptor (view.Info), and the SRV port
+// is captured alongside the service type.
+func TestServiceTXTAndPort(t *testing.T) {
+	src := NewSource(nil, func() time.Time { return time.Unix(1_000_000, 0) })
+	m := new(dns.Msg)
+	m.Response = true
+	m.Answer = []dns.RR{
+		&dns.A{Hdr: dns.RR_Header{Name: "printer.local.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 120}, A: net.ParseIP("10.0.0.9")},
+		&dns.SRV{Hdr: dns.RR_Header{Name: "Office._ipp._tcp.local.", Rrtype: dns.TypeSRV, Class: dns.ClassINET, Ttl: 120}, Target: "printer.local.", Port: 631},
+		&dns.TXT{Hdr: dns.RR_Header{Name: "Office._ipp._tcp.local.", Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: 120}, Txt: []string{"rp=ipp/print", "ty=HP LaserJet MFP M281fdw"}},
+	}
+	b, _ := m.Pack()
+	src.HandlePacket(b, false)
+	v := src.View()
+	if svcs := v.Services["printer"]; len(svcs) != 1 || svcs[0].Port != 631 {
+		t.Errorf("services = %v, want a single service on port 631", svcs)
+	}
+	if v.Info["printer"] != "HP LaserJet MFP M281fdw" {
+		t.Errorf("info = %q, want the TXT ty= model", v.Info["printer"])
 	}
 }

@@ -119,12 +119,13 @@ removing the host instantly, so an avahi restart immediately followed by a re-an
 is seamless.
 .TP
 .B service_discovery
-Active DNS-SD discovery (boolean, default \fBtrue\fR). When on, splitdnsd periodically
-multicasts the standard Bonjour service-discovery query so quiet devices (printers,
-casts, home speakers) and their service types are captured reliably instead of aging out
-of the passive view. Set \fBfalse\fR to remain a pure passive listener and emit no query
-traffic; \fBsplitdns\-notify\fR-proxied hosts (which advertise no services) are unaffected
-either way.
+Active DNS-SD discovery (boolean, default \fBtrue\fR). When on, splitdnsd multicasts the
+standard Bonjour service-discovery query so quiet devices (printers, casts, home speakers),
+their services (type, port) and TXT model/name are captured for the diagnostics console.
+Querying is \fBon-demand\fR: it runs only while the diagnostics console is open (each poll
+pokes it, throttled to the discovery interval), so there is zero active multicast when
+nobody is watching. Set \fBfalse\fR to remain a pure passive listener and never query;
+\fBsplitdns\-notify\fR-proxied hosts (which advertise no services) are unaffected either way.
 .SH "[vhost]"
 .TP
 .B feed

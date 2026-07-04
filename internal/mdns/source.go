@@ -22,10 +22,13 @@ type Source struct {
 	expireEvery time.Duration
 
 	// Active DNS-SD discovery (opt-in). queryEvery == 0 or a nil sender keeps splitdnsd a
-	// pure passive listener; when both are set, Run paces service-discovery queries so quiet
-	// Bonjour devices (printers/casts/…) and their services surface reliably.
+	// pure passive listener. When enabled, querying is POKE-DRIVEN (PokeDiscovery, called by
+	// the diagnostics poll) and throttled to queryEvery — so active multicast happens ONLY
+	// while the diagnostics screen is open, and costs nothing when it is not.
 	queryEvery time.Duration
 	sender     func([]byte)
+	discoverMu sync.Mutex
+	lastQuery  time.Time
 	typeMu     sync.Mutex
 	discovered map[string]struct{} // service types learned from enumeration responses
 	instances  map[string]struct{} // service instances learned from type responses (→ SRV)
@@ -122,6 +125,25 @@ func (s *Source) sendQuery() {
 	}
 }
 
+// PokeDiscovery fires one service-discovery query if active discovery is enabled and at
+// least queryEvery has elapsed since the last one. It is called by the diagnostics poll, so
+// active multicast happens only while the diagnostics screen is open (and its responses keep
+// arriving for a few seconds after) — otherwise splitdnsd stays a silent passive listener.
+// Safe for concurrent callers.
+func (s *Source) PokeDiscovery() {
+	if s.queryEvery <= 0 || s.sender == nil {
+		return
+	}
+	s.discoverMu.Lock()
+	if !s.lastQuery.IsZero() && s.now().Sub(s.lastQuery) < s.queryEvery {
+		s.discoverMu.Unlock()
+		return
+	}
+	s.lastQuery = s.now()
+	s.discoverMu.Unlock()
+	s.sendQuery()
+}
+
 // HandlePacket parses raw mDNS bytes and folds every announcement into the cache,
 // republishing the view if anything changed. trusted controls whether these
 // announcements may trigger DDNS write-back (D7); the view is updated either way.
@@ -137,7 +159,10 @@ func (s *Source) HandlePacket(b []byte, trusted bool) {
 	// DNS-SD service types (diagnostic fingerprint) attach to known hosts; parsed after
 	// addresses so a host announced in the same packet already exists.
 	for _, svc := range ParseServices(b) {
-		if s.cache.ApplyService(svc.Host, svc.Type, now) {
+		if s.cache.ApplyService(svc.Host, svc.Type, svc.Port, now) {
+			changed = true
+		}
+		if s.cache.ApplyInfo(svc.Host, svc.Desc, now) {
 			changed = true
 		}
 	}
@@ -172,16 +197,9 @@ func (s *Source) Run(ctx context.Context, progress func()) {
 	t := time.NewTicker(s.expireEvery)
 	defer t.Stop()
 
-	// Active DNS-SD discovery: fire an initial query shortly after start (repopulates quiet
-	// devices fast after a restart), then on a paced ticker. Off entirely when disabled.
-	var queryC <-chan time.Time
-	if s.queryEvery > 0 && s.sender != nil {
-		qt := time.NewTicker(s.queryEvery)
-		defer qt.Stop()
-		queryC = qt.C
-		s.sendQuery()
-	}
-
+	// No active-discovery ticker here: querying is poke-driven (PokeDiscovery, from the
+	// diagnostics poll) so it costs nothing when nobody is watching. This loop only does
+	// passive-expiry housekeeping.
 	for {
 		select {
 		case <-ctx.Done():
@@ -189,9 +207,6 @@ func (s *Source) Run(ctx context.Context, progress func()) {
 		case <-t.C:
 			s.cache.Expire(s.now())
 			s.publish() // republish so TTLs in the view decay toward expiry
-			progress()
-		case <-queryC:
-			s.sendQuery()
 			progress()
 		}
 	}

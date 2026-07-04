@@ -115,3 +115,34 @@ func TestSourceDiscoveryDisabled(t *testing.T) {
 		t.Errorf("passive source sent %d queries, want 0", sent)
 	}
 }
+
+// PokeDiscovery is the on-demand gate: it fires immediately when idle, throttles within the
+// interval, fires again after it, and is a no-op when discovery is disabled.
+func TestPokeDiscoveryThrottle(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	src := NewSource(nil, func() time.Time { return now }, WithServiceDiscovery(time.Minute))
+	sent := 0
+	src.SetSender(func([]byte) { sent++ })
+
+	src.PokeDiscovery() // first poke (never queried) → fires
+	if sent != 1 {
+		t.Fatalf("first poke: sent=%d, want 1", sent)
+	}
+	src.PokeDiscovery() // within the interval → throttled
+	if sent != 1 {
+		t.Errorf("throttled poke: sent=%d, want 1", sent)
+	}
+	now = now.Add(time.Minute + time.Second) // interval elapsed
+	src.PokeDiscovery()
+	if sent != 2 {
+		t.Errorf("post-interval poke: sent=%d, want 2", sent)
+	}
+
+	off := NewSource(nil, func() time.Time { return now }) // discovery disabled
+	offSent := 0
+	off.SetSender(func([]byte) { offSent++ })
+	off.PokeDiscovery()
+	if offSent != 0 {
+		t.Errorf("disabled source poked %d queries, want 0", offSent)
+	}
+}

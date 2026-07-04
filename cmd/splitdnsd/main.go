@@ -384,8 +384,9 @@ func main() {
 	}
 
 	// Read-only diagnostics HTTP (R10), localhost-only by default.
+	// The OUI DB loads lazily on first enrichment (i.e. only when the diagnostics console is
+	// opened) — no startup parse and no RAM held when diagnostics are never used.
 	oui := hostinfo.NewOUIDB()
-	go oui.Warm()                                               // parse the OUI DB off the request path
 	hostRes := hostinfo.New(oui, hostinfo.Options{Probe: true}) // mDNS-forward panel enrichment
 	// The client/poll path probes too: async (never blocks the poll) + rate-limited, so a
 	// privacy IPv6 client not yet in the ND cache gets nudged and identified on a later poll.
@@ -394,8 +395,9 @@ func main() {
 		WithConfigFile(*configPath).
 		// Eager mDNS-forward enrichment shown inline (vendor + DNS-SD services), no click.
 		// Cheap: hostRes caches OUI + the neighbor table; the async probe never blocks.
-		WithMDNSEnrich(func(name string, addrs []netip.Addr) (string, []string, string) {
+		WithMDNSEnrich(func(name string, addrs []netip.Addr) (string, string, []model.MDNSService, string) {
 			info := hostRes.Lookup(name, addrs)
+			view := src.View()
 			var detail []string
 			if len(info.MACs) > 0 {
 				detail = append(detail, strings.Join(info.MACs, ", "))
@@ -404,7 +406,7 @@ func main() {
 				detail = append(detail, info.Families)
 			}
 			detail = append(detail, info.Scopes...)
-			return strings.Join(info.Vendors, ", "), src.View().Services[name], strings.Join(detail, " · ")
+			return strings.Join(info.Vendors, ", "), view.Info[name], view.Services[name], strings.Join(detail, " · ")
 		})
 	diagSrv.WithCacheStats(func() (anscache.Stats, bool) {
 		if ansCache == nil {
@@ -454,6 +456,9 @@ func main() {
 	diagSrv.WithClientDevice(func(ip netip.Addr) string {
 		return strings.Join(clientRes.Lookup(ip.String(), []netip.Addr{ip}).Vendors, ", ")
 	})
+	// Active DNS-SD discovery runs only while the console is open: each diag poll pokes it
+	// (throttled to the discovery interval), so there is zero active multicast when idle.
+	diagSrv.WithPollHook(src.PokeDiscovery)
 	if cfg.Diag.SocketMode != "" {
 		// Non-fatal: a bad diag.socket_mode must not stop DNS — warn and keep the default.
 		if m, merr := strconv.ParseUint(cfg.Diag.SocketMode, 8, 32); merr != nil {

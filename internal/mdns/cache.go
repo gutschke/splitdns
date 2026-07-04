@@ -37,9 +37,10 @@ type ChangeFunc func(host string, addrs []netip.Addr)
 
 type entry struct {
 	addrs      map[netip.Addr]struct{}
-	services   map[string]struct{} // DNS-SD service types the host advertises (diagnostic)
-	freshUntil time.Time           // announced-TTL expiry — drives the SERVED DNS TTL
-	expiry     time.Time           // removal time = freshUntil + staleGrace (serve-stale window)
+	services   map[string]uint16 // DNS-SD service type -> SRV port (diagnostic)
+	info       string            // friendly descriptor from TXT (device model / friendly name)
+	freshUntil time.Time         // announced-TTL expiry — drives the SERVED DNS TTL
+	expiry     time.Time         // removal time = freshUntil + staleGrace (serve-stale window)
 	lastSeen   time.Time
 	notified   string // canonical join of the address set last sent to onChange
 }
@@ -133,7 +134,7 @@ func (c *Cache) Apply(a Announcement, now time.Time, trusted bool) bool {
 // (diagnostic fingerprint). Returns true if the type was newly added. Services for an
 // unknown host are dropped — they attach on a later packet once the host's address is known,
 // and they share the host entry's lifetime. Never creates a host or affects resolution.
-func (c *Cache) ApplyService(host, typ string, now time.Time) bool {
+func (c *Cache) ApplyService(host, typ string, port uint16, now time.Time) bool {
 	if host == "" || typ == "" {
 		return false
 	}
@@ -144,12 +145,28 @@ func (c *Cache) ApplyService(host, typ string, now time.Time) bool {
 		return false
 	}
 	if e.services == nil {
-		e.services = map[string]struct{}{}
+		e.services = map[string]uint16{}
 	}
-	if _, dup := e.services[typ]; dup {
+	if p, dup := e.services[typ]; dup && p == port {
 		return false
 	}
-	e.services[typ] = struct{}{}
+	e.services[typ] = port
+	return true
+}
+
+// ApplyInfo records a friendly descriptor (from TXT) for an EXISTING cached host. Returns
+// true if it changed. Dropped for an unknown host; shares the host entry's lifetime.
+func (c *Cache) ApplyInfo(host, desc string, now time.Time) bool {
+	if host == "" || desc == "" {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.hosts[host]
+	if !ok || e.info == desc {
+		return false
+	}
+	e.info = desc
 	return true
 }
 
@@ -254,15 +271,21 @@ func (c *Cache) View(now time.Time) *model.MDNSView {
 			}
 		}
 		if len(e.services) > 0 && len(e.addrs) > 0 {
-			svcs := make([]string, 0, len(e.services))
-			for s := range e.services {
-				svcs = append(svcs, s)
+			svcs := make([]model.MDNSService, 0, len(e.services))
+			for t, p := range e.services {
+				svcs = append(svcs, model.MDNSService{Type: t, Port: p})
 			}
-			sort.Strings(svcs)
+			sort.Slice(svcs, func(i, j int) bool { return svcs[i].Type < svcs[j].Type })
 			if v.Services == nil {
-				v.Services = map[string][]string{}
+				v.Services = map[string][]model.MDNSService{}
 			}
 			v.Services[host] = svcs
+			if e.info != "" {
+				if v.Info == nil {
+					v.Info = map[string]string{}
+				}
+				v.Info[host] = e.info
+			}
 		}
 	}
 	return v

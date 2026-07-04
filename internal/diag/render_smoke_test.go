@@ -34,11 +34,12 @@ func TestMDNSForwardEnrichmentInline(t *testing.T) {
 	snap := &model.Snapshot{LocalDomain: "lan"}
 	view := &model.MDNSView{
 		Forward:  map[string][]model.RR{"printer": {{Type: dns.TypeA, Content: "192.0.2.9"}}},
-		Services: map[string][]string{"printer": {"_ipp._tcp", "_uscan._tcp"}},
+		Services: map[string][]model.MDNSService{"printer": {{Type: "_ipp._tcp", Port: 631}, {Type: "_uscan._tcp"}}},
+		Info:     map[string]string{"printer": "HP LaserJet MFP M281fdw"},
 	}
 	s := New("127.0.0.1:0", func() *model.Snapshot { return snap }, func() *model.MDNSView { return view }, "t", nil).
-		WithMDNSEnrich(func(name string, addrs []netip.Addr) (string, []string, string) {
-			return "HP", view.Services[name], "aa:bb:cc:dd:ee:ff · IPv4 · LAN"
+		WithMDNSEnrich(func(name string, addrs []netip.Addr) (string, string, []model.MDNSService, string) {
+			return "HP", view.Info[name], view.Services[name], "aa:bb:cc:dd:ee:ff · IPv4 · LAN"
 		})
 	rec := httptest.NewRecorder()
 	s.handleRoot(rec, httptest.NewRequest("GET", "/", nil))
@@ -46,8 +47,8 @@ func TestMDNSForwardEnrichmentInline(t *testing.T) {
 		t.Fatalf("code = %d", rec.Code)
 	}
 	body := rec.Body.String()
-	// vendor + FRIENDLY labels (not raw types) in a hostmeta sub-line, detail on hover.
-	for _, want := range []string{`class="hostmeta"`, "HP", "IPP/AirPrint", "AirScan (eSCL)", `title="aa:bb:cc:dd:ee:ff`} {
+	// device model (TXT) + FRIENDLY labels with PORTS in a hostmeta sub-line; MAC on hover.
+	for _, want := range []string{`class="hostmeta"`, "HP LaserJet MFP M281fdw", "IPP/AirPrint:631", "AirScan (eSCL)", `title="aa:bb:cc:dd:ee:ff`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("mDNS-forward render missing %q", want)
 		}

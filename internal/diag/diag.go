@@ -59,6 +59,7 @@ type Server struct {
 	version        string
 	configFile     string       // path shown (redacted) in the config panel; "" => panel omitted
 	mdnsEnrich     mdnsEnrichFn // eager per-host enrichment for the mDNS panel; nil => omitted
+	pollHook       func()       // called on each /diag.json poll (drives on-demand discovery); nil => none
 
 	now func() time.Time // injectable clock for rate-limit/backoff tests (default time.Now)
 
@@ -89,16 +90,24 @@ func New(addr string, snapshot func() *model.Snapshot, view func() *model.MDNSVi
 // the panel.
 func (s *Server) WithConfigFile(path string) *Server { s.configFile = path; return s }
 
-// mdnsEnrichFn returns the hardware vendor, DNS-SD service types, and a detail string
-// (MAC/families/scopes, shown on hover) for an mDNS host given its addresses. The result is
-// rendered inline in the mDNS-forward panel — no click needed.
-type mdnsEnrichFn func(name string, addrs []netip.Addr) (vendor string, services []string, detail string)
+// mdnsEnrichFn returns, for an mDNS host: the OUI hardware vendor, a TXT-derived device
+// descriptor (model / friendly name), its DNS-SD services (type + port), and a detail string
+// (MAC/families/scopes, shown on hover). Rendered inline in the mDNS-forward panel.
+type mdnsEnrichFn func(name string, addrs []netip.Addr) (vendor, desc string, services []model.MDNSService, detail string)
 
 // WithMDNSEnrich wires eager per-host enrichment shown inline in the mDNS-forward panel
 // (vendor + services + a hover detail). Cheap: the provider's OUI and neighbor tables are
 // cached, so it runs in the poll like the client-device column. Nil omits the columns.
 func (s *Server) WithMDNSEnrich(fn mdnsEnrichFn) *Server {
 	s.mdnsEnrich = fn
+	return s
+}
+
+// WithPollHook registers a callback invoked on every /diag.json poll. It lets cost-bearing
+// diagnostics (active mDNS service discovery) run ONLY while the console is open — the hook
+// is the "screen is open" signal. Throttling is the callee's responsibility.
+func (s *Server) WithPollHook(fn func()) *Server {
+	s.pollHook = fn
 	return s
 }
 
@@ -813,6 +822,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleJSON(w http.ResponseWriter, r *http.Request) {
+	if s.pollHook != nil {
+		s.pollHook() // the screen is open — let cost-bearing tools (active discovery) spin up
+	}
 	page := s.build()
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)
@@ -983,12 +995,11 @@ type stubView struct {
 }
 
 type hostView struct {
-	Name     string   `json:"name"`
-	Records  []string `json:"records"`
-	Kind     string   `json:"kind,omitempty"`     // "" for a normal host; "id" for a machine/instance id
-	Vendor   string   `json:"vendor,omitempty"`   // hardware vendor guess (OUI); "" if unknown
-	Services []string `json:"services,omitempty"` // DNS-SD service types (e.g. _ipp._tcp)
-	Detail   string   `json:"detail,omitempty"`   // MAC/families/scopes, shown as a hover title
+	Name    string   `json:"name"`
+	Records []string `json:"records"`
+	Kind    string   `json:"kind,omitempty"`   // "" for a normal host; "id" for a machine/instance id
+	Meta    string   `json:"meta,omitempty"`   // pre-rendered sub-line: model/vendor · services
+	Detail  string   `json:"detail,omitempty"` // MAC/families/scopes, shown as a hover title
 }
 
 // classifyHost labels an mDNS host name so the UI can flag machine/instance ids (container,
@@ -1319,18 +1330,39 @@ func serviceLabel(t string) string {
 	return t
 }
 
-// friendlyServices maps raw service types to friendly labels, de-duplicated and sorted.
-func friendlyServices(types []string) []string {
+// buildMeta renders the muted sub-line under a host name: the device descriptor and/or
+// vendor, then its services as friendly labels with ports — e.g.
+// "HP Color LaserJet MFP M281fdw — AirScan (eSCL):8080 · JetDirect print · IPP/AirPrint:631".
+func buildMeta(vendor, desc string, services []model.MDNSService) string {
+	var lead []string
+	if desc != "" {
+		lead = append(lead, desc)
+	}
+	if vendor != "" && !strings.Contains(strings.ToLower(desc), strings.ToLower(vendor)) {
+		lead = append(lead, vendor) // OUI vendor adds info the model string didn't already carry
+	}
 	seen := map[string]bool{}
-	var out []string
-	for _, t := range types {
-		if l := serviceLabel(t); !seen[l] {
-			seen[l] = true
-			out = append(out, l)
+	var svc []string
+	for _, s := range services {
+		label := serviceLabel(s.Type)
+		if s.Port != 0 {
+			label += ":" + strconv.Itoa(int(s.Port))
+		}
+		if !seen[label] {
+			seen[label] = true
+			svc = append(svc, label)
 		}
 	}
-	sort.Strings(out)
-	return out
+	sort.Strings(svc)
+	head, tail := strings.Join(lead, " · "), strings.Join(svc, " · ")
+	switch {
+	case head != "" && tail != "":
+		return head + " — " + tail
+	case head != "":
+		return head
+	default:
+		return tail
+	}
 }
 
 func hostViews(m map[string][]model.RR, enrich mdnsEnrichFn) []hostView {
@@ -1348,9 +1380,9 @@ func hostViews(m map[string][]model.RR, enrich mdnsEnrichFn) []hostView {
 		}
 		sort.Strings(hv.Records)
 		if enrich != nil {
-			var raw []string
-			hv.Vendor, raw, hv.Detail = enrich(name, addrs)
-			hv.Services = friendlyServices(raw)
+			vendor, desc, services, detail := enrich(name, addrs)
+			hv.Meta = buildMeta(vendor, desc, services)
+			hv.Detail = detail
 		}
 		out = append(out, hv)
 	}
@@ -1627,7 +1659,7 @@ transport <select name="transport"><option value="do53">Do53 (UDP)</option><opti
 <details><summary>mDNS forward</summary>
 <p class="muted">badge <span class="badge">id</span> marks a machine/instance id (container, VM, or a device with no friendly hostname). The muted line under a host shows its hardware vendor and Bonjour/DNS-SD services (hover for MAC/scope).</p>
 <div data-live="mdns_forward"><table><tbody>
-{{range .MDNSFwd}}<tr data-key="{{.Name}}"><td data-f="name">{{.Name}}{{if .Kind}} <span class="badge">{{.Kind}}</span>{{end}}{{if and $.HasEnrich (or .Vendor .Services)}}<div class="hostmeta"{{if .Detail}} title="{{.Detail}}"{{end}}>{{if .Vendor}}{{.Vendor}}{{if .Services}} — {{end}}{{end}}{{range $i, $s := .Services}}{{if $i}} · {{end}}{{$s}}{{end}}</div>{{end}}</td><td data-f="records">{{range $i, $r := .Records}}{{if $i}}; {{end}}{{$r}}{{end}}</td></tr>{{end}}
+{{range .MDNSFwd}}<tr data-key="{{.Name}}"><td data-f="name">{{.Name}}{{if .Kind}} <span class="badge">{{.Kind}}</span>{{end}}{{if and $.HasEnrich .Meta}}<div class="hostmeta"{{if .Detail}} title="{{.Detail}}"{{end}}>{{.Meta}}</div>{{end}}</td><td data-f="records">{{range $i, $r := .Records}}{{if $i}}; {{end}}{{$r}}{{end}}</td></tr>{{end}}
 </tbody></table></div></details>
 <details><summary>mDNS reverse</summary><div data-live="mdns_reverse"><table><tbody>
 {{range .MDNSRev}}<tr data-key="{{.Name}}"><td data-f="name">{{.Name}}</td><td data-f="records">{{range $i, $r := .Records}}{{if $i}}; {{end}}{{$r}}{{end}}</td></tr>{{end}}
@@ -1747,14 +1779,13 @@ transport <select name="transport"><option value="do53">Do53 (UDP)</option><opti
   // service cells (eager enrichment); reverse rows are name + records only.
   function mdnsRecords(tr, x){ patchText(fcell(tr, 'records'), (x.records || []).join('; ')); }
   function nameCell(nc, x){ nc.textContent = x.name; if(x.kind){ nc.appendChild(document.createTextNode(' ')); var b = document.createElement('span'); b.className = 'badge'; b.textContent = x.kind; nc.appendChild(b); } }
-  // vendor + services fold into a muted sub-line under the host name (adjacent, wraps, no
-  // extra columns) — so the info is where the user reads and never scrolls off-screen.
-  function hostMetaText(x){ var s = x.services || []; return (x.vendor ? x.vendor + (s.length ? ' — ' : '') : '') + s.join(' · '); }
+  // model/vendor + services render as a muted sub-line under the host name (adjacent, wraps,
+  // no extra columns) — so the info is where the user reads and never scrolls off-screen.
   function fillMDNSFwd(tr, x){
     mdnsRecords(tr, x);
     if(!hasEnrich) return;
     var nc = fcell(tr, 'name'); if(!nc) return;
-    var meta = nc.querySelector('.hostmeta'), txt = hostMetaText(x);
+    var meta = nc.querySelector('.hostmeta'), txt = x.meta || '';
     if(txt){
       if(!meta){ meta = document.createElement('div'); meta.className = 'hostmeta'; nc.appendChild(meta); }
       patchText(meta, txt);

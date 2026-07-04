@@ -87,6 +87,12 @@ type RevZone struct {
 	SOA  RR     // owner == reverse apex
 }
 
+// MDNSService is one DNS-SD service a host advertises (type + SRV port), for diagnostics.
+type MDNSService struct {
+	Type string `json:"type"`           // e.g. "_ipp._tcp"
+	Port uint16 `json:"port,omitempty"` // SRV port (0 if unknown)
+}
+
 // MDNSView is the SEPARATE, independently-published volatile plane for *.local
 // hosts (§2.2). Decoupling it means mDNS churn never reallocates the CF zone map.
 type MDNSView struct {
@@ -94,8 +100,11 @@ type MDNSView struct {
 	Forward map[string][]RR
 	// Reverse maps an in-addr/ip6 arpa name -> PTR RRs.
 	Reverse map[string][]RR
-	// Services maps a bare hostname -> the DNS-SD service types it advertises (e.g.
-	// "_ipp._tcp"), a passive fingerprint for diagnostics only. Never answered on the wire.
-	Services map[string][]string
-	BuiltAt  time.Time
+	// Services maps a bare hostname -> the DNS-SD services it advertises (type + port), a
+	// diagnostic fingerprint only. Never answered on the wire.
+	Services map[string][]MDNSService
+	// Info maps a bare hostname -> a friendly descriptor derived from DNS-SD TXT records
+	// (device model / friendly name), diagnostics only.
+	Info    map[string]string
+	BuiltAt time.Time
 }

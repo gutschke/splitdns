@@ -98,15 +98,29 @@ func canonHost(name string) string {
 type Service struct {
 	Host string
 	Type string
+	Port uint16
 	TTL  uint32
+	Desc string // friendly descriptor from the instance's TXT (model / friendly name), "" if none
 }
 
-// ParseServices extracts host->service-type links from an mDNS response's SRV records.
-// Non-response / unparseable packets yield nothing.
+// ParseServices extracts host->service links (type + SRV port + a TXT-derived descriptor)
+// from an mDNS response. Non-response / unparseable packets yield nothing.
 func ParseServices(b []byte) []Service {
 	var m dns.Msg
 	if err := m.Unpack(b); err != nil || !m.Response {
 		return nil
+	}
+	// TXT records (owned by the service instance) carry model/friendly-name key=values;
+	// index a descriptor by instance name so we can attach it to the matching SRV below.
+	descByInst := map[string]string{}
+	for _, sect := range [][]dns.RR{m.Answer, m.Extra} {
+		for _, rr := range sect {
+			if txt, ok := rr.(*dns.TXT); ok {
+				if d := descFromTXT(txt.Txt); d != "" {
+					descByInst[strings.ToLower(txt.Hdr.Name)] = d
+				}
+			}
+		}
 	}
 	var out []Service
 	seen := map[string]bool{}
@@ -128,10 +142,44 @@ func ParseServices(b []byte) []Service {
 				continue
 			}
 			seen[key] = true
-			out = append(out, Service{Host: host, Type: typ, TTL: srv.Hdr.Ttl})
+			out = append(out, Service{
+				Host: host, Type: typ, Port: srv.Port, TTL: srv.Hdr.Ttl,
+				Desc: descByInst[strings.ToLower(srv.Hdr.Name)],
+			})
 		}
 	}
 	return out
+}
+
+// descFromTXT distills a friendly device descriptor from a DNS-SD TXT record's key=value
+// strings — a printer's ty=, a Chromecast's fn=+md=, etc. Returns "" when nothing useful.
+func descFromTXT(txt []string) string {
+	kv := map[string]string{}
+	for _, s := range txt {
+		k, v, _ := strings.Cut(s, "=")
+		if k = strings.ToLower(strings.TrimSpace(k)); k != "" {
+			kv[k] = strings.TrimSpace(v)
+		}
+	}
+	name := firstNonEmpty(kv["fn"], kv["n"], kv["nm"])
+	model := strings.Trim(firstNonEmpty(kv["ty"], kv["md"], kv["model"], kv["product"], kv["usb_mdl"]), "()")
+	switch {
+	case name != "" && model != "" && !strings.Contains(strings.ToLower(name), strings.ToLower(model)):
+		return name + " (" + model + ")"
+	case name != "":
+		return name
+	default:
+		return model
+	}
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // serviceType extracts the "_app._proto" DNS-SD service type from an instance owner name
