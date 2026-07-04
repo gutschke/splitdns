@@ -105,3 +105,21 @@ func TestPingProbeGating(t *testing.T) {
 		t.Errorf("scopeOf(100.64.0.1) = %q, want CGNAT", s)
 	}
 }
+
+// Regression: the ieee-data oui.txt lists each OUI twice — a "(hex)" line and a
+// "(base 16)" line (plus indented address lines). Only the (hex) vendor must win; the
+// (base 16) line must not overwrite it with "(base 16)  <vendor>" garbage.
+func TestParseOUIFileIeeeData(t *testing.T) {
+	f := filepath.Join(t.TempDir(), "oui.txt")
+	os.WriteFile(f, []byte(
+		"00-1B-63   (hex)\t\tApple, Inc.\n"+
+			"001B63     (base 16)\t\tApple, Inc.\n"+
+			"\t\t\t\t1 Infinite Loop\n"+
+			"\t\t\t\tCupertino CA 95014\n"+
+			"\t\t\t\tUS\n"), 0o644)
+	db := NewOUIDB(f)
+	mac, _ := EUI64MAC(netip.MustParseAddr("2001:db8::021b:63ff:fe00:0001"))
+	if v := db.Vendor(mac); v != "Apple, Inc." {
+		t.Errorf("vendor = %q, want %q (the (base 16) line must not corrupt it)", v, "Apple, Inc.")
+	}
+}

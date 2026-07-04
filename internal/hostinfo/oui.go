@@ -154,13 +154,20 @@ func parseOUILine(line string) (uint32, string, bool) {
 		}
 		return 0, "", false
 	}
-	// nmap-mac-prefixes: "001B63 Apple" (6 hex, space, vendor); skip comments.
+	// ieee-data repeats each OUI as a "001B63     (base 16)  <vendor>" line (plus indented
+	// address lines). Skip them: the "(hex)" line above already carried the vendor, and
+	// parsing this line as nmap-format would set the vendor to "(base 16)  <vendor>" and
+	// overwrite the correct entry.
+	if strings.Contains(line, "(base 16)") {
+		return 0, "", false
+	}
+	// nmap-mac-prefixes: "001B63 Apple" (6 hex, ONE space, vendor); skip comments.
 	line = strings.TrimSpace(line)
 	if line == "" || line[0] == '#' {
 		return 0, "", false
 	}
 	sp := strings.IndexByte(line, ' ')
-	if sp != 6 {
+	if sp != 6 || (len(line) > 7 && line[7] == ' ') { // one space only — not an indented/aligned line
 		return 0, "", false
 	}
 	if oui, ok := parseOUIHex(line[:6]); ok {

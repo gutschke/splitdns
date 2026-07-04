@@ -1913,7 +1913,7 @@ transport <select name="transport"><option value="do53">Do53 (UDP)</option><opti
     fetch('/host?name=' + encodeURIComponent(a.dataset.h), { cache: 'no-store' })
       .then(function(r){ return r.ok ? r.json() : Promise.reject(r.status); })
       .then(function(d){ cell.textContent = fmtHostInfo(d); })
-      .catch(function(e){ cell.textContent = 'n/a (' + e + ')'; });
+      .catch(function(e){ cell.textContent = (e === 404) ? 'no longer in view' : 'n/a'; });
   });
 
   // Config panel: fetch the redacted config lazily on first expand (never in the poll).
