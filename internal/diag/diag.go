@@ -1365,6 +1365,28 @@ func buildMeta(vendor, desc string, services []model.MDNSService) string {
 	}
 }
 
+// buildDetail assembles the whole-row hover tooltip: the base host facts (MAC/families/
+// scopes) then each service's curated TXT key=values, one line each (newline-separated for a
+// multi-line tooltip). This is the "rarely needed but occasionally invaluable" detail — off
+// the main line, revealed by hovering anywhere on the host's row.
+func buildDetail(base string, services []model.MDNSService) string {
+	lines := make([]string, 0, len(services)+1)
+	if base != "" {
+		lines = append(lines, base)
+	}
+	for _, s := range services {
+		if len(s.Text) == 0 {
+			continue
+		}
+		label := serviceLabel(s.Type)
+		if s.Port != 0 {
+			label += ":" + strconv.Itoa(int(s.Port))
+		}
+		lines = append(lines, label+"  "+strings.Join(s.Text, " · "))
+	}
+	return strings.Join(lines, "\n")
+}
+
 func hostViews(m map[string][]model.RR, enrich mdnsEnrichFn) []hostView {
 	var out []hostView
 	for name, rrs := range m {
@@ -1382,7 +1404,7 @@ func hostViews(m map[string][]model.RR, enrich mdnsEnrichFn) []hostView {
 		if enrich != nil {
 			vendor, desc, services, detail := enrich(name, addrs)
 			hv.Meta = buildMeta(vendor, desc, services)
-			hv.Detail = detail
+			hv.Detail = buildDetail(detail, services)
 		}
 		out = append(out, hv)
 	}
@@ -1465,7 +1487,10 @@ table.sortable thead th{position:sticky;top:calc(var(--topbar-h) + 1.9rem);backg
 .chip.ok{border-color:#9c9} .chip.flag{border-color:#e88;background:#fdeaea}
 .chip.clickable{cursor:pointer}
 .badge{font-size:.7rem;padding:0 .35rem;border-radius:.35rem;background:#e6e6e6;color:#555;vertical-align:middle}
-.hostmeta{display:block;white-space:normal;font-size:.82rem;color:#8a8a8a;margin-top:.1rem;font-weight:normal} /* vendor+services sub-line under an mDNS host name */
+.hostmeta{white-space:normal;font-size:.82rem;color:#8a8a8a;font-weight:normal} /* full-width mDNS meta sub-line (colspan cell) */
+tr.metarow td{padding-top:0} /* hug the host row above */
+tr.hostrow:has(+ .metarow) td{border-bottom:0} /* data row + its meta row read as one entry */
+tr.hostrow[title]{cursor:help} /* whole-row hover reveals the MAC/scope/TXT detail */
 #cfgtext{background:#f6f6f6;padding:.6rem;border-radius:4px;white-space:pre;font:12px/1.35 ui-monospace,monospace;color:#333}
 /* control-action feedback + lock affordances (see the control JS) */
 .ctl-msg{font-size:.85rem;margin-left:.4rem;font-variant-numeric:tabular-nums}
@@ -1659,7 +1684,7 @@ transport <select name="transport"><option value="do53">Do53 (UDP)</option><opti
 <details><summary>mDNS forward</summary>
 <p class="muted">badge <span class="badge">id</span> marks a machine/instance id (container, VM, or a device with no friendly hostname). The muted line under a host shows its hardware vendor and Bonjour/DNS-SD services (hover for MAC/scope).</p>
 <div data-live="mdns_forward"><table><tbody>
-{{range .MDNSFwd}}<tr data-key="{{.Name}}"><td data-f="name">{{.Name}}{{if .Kind}} <span class="badge">{{.Kind}}</span>{{end}}{{if and $.HasEnrich .Meta}}<div class="hostmeta"{{if .Detail}} title="{{.Detail}}"{{end}}>{{.Meta}}</div>{{end}}</td><td data-f="records">{{range $i, $r := .Records}}{{if $i}}; {{end}}{{$r}}{{end}}</td></tr>{{end}}
+{{range .MDNSFwd}}<tr data-key="{{.Name}}" class="hostrow"{{if .Detail}} title="{{.Detail}}"{{end}}><td data-f="name">{{.Name}}{{if .Kind}} <span class="badge">{{.Kind}}</span>{{end}}</td><td data-f="records">{{range $i, $r := .Records}}{{if $i}}; {{end}}{{$r}}{{end}}</td></tr>{{if and $.HasEnrich .Meta}}<tr data-key="{{.Name}}#meta" class="hostrow metarow"{{if .Detail}} title="{{.Detail}}"{{end}}><td class="hostmeta" data-f="meta" colspan="2">{{.Meta}}</td></tr>{{end}}{{end}}
 </tbody></table></div></details>
 <details><summary>mDNS reverse</summary><div data-live="mdns_reverse"><table><tbody>
 {{range .MDNSRev}}<tr data-key="{{.Name}}"><td data-f="name">{{.Name}}</td><td data-f="records">{{range $i, $r := .Records}}{{if $i}}; {{end}}{{$r}}{{end}}</td></tr>{{end}}
@@ -1779,22 +1804,28 @@ transport <select name="transport"><option value="do53">Do53 (UDP)</option><opti
   // service cells (eager enrichment); reverse rows are name + records only.
   function mdnsRecords(tr, x){ patchText(fcell(tr, 'records'), (x.records || []).join('; ')); }
   function nameCell(nc, x){ nc.textContent = x.name; if(x.kind){ nc.appendChild(document.createTextNode(' ')); var b = document.createElement('span'); b.className = 'badge'; b.textContent = x.kind; nc.appendChild(b); } }
-  // model/vendor + services render as a muted sub-line under the host name (adjacent, wraps,
-  // no extra columns) — so the info is where the user reads and never scrolls off-screen.
-  function fillMDNSFwd(tr, x){
-    mdnsRecords(tr, x);
-    if(!hasEnrich) return;
-    var nc = fcell(tr, 'name'); if(!nc) return;
-    var meta = nc.querySelector('.hostmeta'), txt = x.meta || '';
-    if(txt){
-      if(!meta){ meta = document.createElement('div'); meta.className = 'hostmeta'; nc.appendChild(meta); }
-      patchText(meta, txt);
-      if(x.detail) meta.title = x.detail; else meta.removeAttribute('title');
-    } else if(meta){ meta.remove(); }
-  }
-  function makeMDNSFwd(x){ var tr = document.createElement('tr'); tr.innerHTML = '<td data-f="name"></td><td data-f="records"></td>'; nameCell(fcell(tr, 'name'), x); fillMDNSFwd(tr, x); return tr; }
+  function rowTitle(tr, x){ if(hasEnrich && x.detail){ tr.title = x.detail; } else { tr.removeAttribute('title'); } }
+  function makeMDNSFwd(x){ var tr = document.createElement('tr'); tr.className = 'hostrow'; tr.innerHTML = '<td data-f="name"></td><td data-f="records"></td>'; nameCell(fcell(tr, 'name'), x); mdnsRecords(tr, x); return tr; }
   function makeMDNSRev(x){ var tr = document.createElement('tr'); tr.innerHTML = '<td data-f="name"></td><td data-f="records"></td>'; nameCell(fcell(tr, 'name'), x); mdnsRecords(tr, x); return tr; }
-  function mdnsFwdPatch(root, d){ reconcile(root.querySelector('tbody'), d || [], function(x){ return x.name; }, makeMDNSFwd, fillMDNSFwd); }
+  // mDNS forward: each host is a data row (name|records) plus, when enriched, a FULL-WIDTH
+  // meta row (colspan). The MAC/scope/TXT detail is a whole-row hover title on BOTH rows, so
+  // hovering anywhere on the host reveals it (a well-defined, discoverable target).
+  function mdnsFwdPatch(root, d){
+    var tbody = root.querySelector('tbody'), existing = {}, seen = {};
+    Array.prototype.forEach.call(tbody.children, function(tr){ existing[tr.dataset.key] = tr; });
+    (d || []).forEach(function(x){
+      var tr = existing[x.name];
+      if(!tr){ tr = makeMDNSFwd(x); tr.dataset.key = x.name; } else { mdnsRecords(tr, x); }
+      rowTitle(tr, x); tbody.appendChild(tr); seen[x.name] = true;
+      if(hasEnrich && x.meta){
+        var mk = x.name + '#meta', mr = existing[mk];
+        if(!mr){ mr = document.createElement('tr'); mr.dataset.key = mk; mr.className = 'hostrow metarow'; mr.innerHTML = '<td class="hostmeta" data-f="meta" colspan="2"></td>'; }
+        patchText(fcell(mr, 'meta'), x.meta); rowTitle(mr, x);
+        tbody.appendChild(mr); seen[mk] = true;
+      }
+    });
+    Object.keys(existing).forEach(function(k){ if(!seen[k]) existing[k].remove(); });
+  }
   function mdnsRevPatch(root, d){ reconcile(root.querySelector('tbody'), d || [], function(x){ return x.name; }, makeMDNSRev, mdnsRecords); }
 
   // ---- per-section patchers (key === data-live === /diag.json field) ----
@@ -1861,7 +1892,7 @@ transport <select name="transport"><option value="do53">Do53 (UDP)</option><opti
   // Measure natural widths in auto-layout, then pin them in fixed-layout on the reference
   // row (thead row if present, else first body row). State (max-seen widths) lives on the
   // <table> node, so it dies with the DOM and resets on a full reload.
-  function measureRow(tr, nat){ if(!tr) return; for(var c=0;c<tr.cells.length && c<nat.length;c++){ var w=tr.cells[c].getBoundingClientRect().width; if(w>nat[c]) nat[c]=w; } }
+  function measureRow(tr, nat){ if(!tr || tr.cells.length !== nat.length) return; for(var c=0;c<tr.cells.length && c<nat.length;c++){ var w=tr.cells[c].getBoundingClientRect().width; if(w>nat[c]) nat[c]=w; } } // skip colspan rows (their span isn't a single column)
   function ratchet(table){
     if(!table || !table.tBodies[0] || table.offsetParent===null) return; // skip hidden (closed <details>)
     var body=table.tBodies[0], ref=(table.tHead && table.tHead.rows[0]) || body.rows[0];

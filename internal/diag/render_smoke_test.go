@@ -33,9 +33,12 @@ func TestRootRendersConfigPanelAndBadge(t *testing.T) {
 func TestMDNSForwardEnrichmentInline(t *testing.T) {
 	snap := &model.Snapshot{LocalDomain: "lan"}
 	view := &model.MDNSView{
-		Forward:  map[string][]model.RR{"printer": {{Type: dns.TypeA, Content: "192.0.2.9"}}},
-		Services: map[string][]model.MDNSService{"printer": {{Type: "_ipp._tcp", Port: 631}, {Type: "_uscan._tcp"}}},
-		Info:     map[string]string{"printer": "HP LaserJet MFP M281fdw"},
+		Forward: map[string][]model.RR{"printer": {{Type: dns.TypeA, Content: "192.0.2.9"}}},
+		Services: map[string][]model.MDNSService{"printer": {
+			{Type: "_ipp._tcp", Port: 631, Text: []string{"rp=ipp/print", "ty=HP LaserJet MFP M281fdw"}},
+			{Type: "_uscan._tcp"},
+		}},
+		Info: map[string]string{"printer": "HP LaserJet MFP M281fdw"},
 	}
 	s := New("127.0.0.1:0", func() *model.Snapshot { return snap }, func() *model.MDNSView { return view }, "t", nil).
 		WithMDNSEnrich(func(name string, addrs []netip.Addr) (string, string, []model.MDNSService, string) {
@@ -47,13 +50,18 @@ func TestMDNSForwardEnrichmentInline(t *testing.T) {
 		t.Fatalf("code = %d", rec.Code)
 	}
 	body := rec.Body.String()
-	// device model (TXT) + FRIENDLY labels with PORTS in a hostmeta sub-line; MAC on hover.
-	for _, want := range []string{`class="hostmeta"`, "HP LaserJet MFP M281fdw", "IPP/AirPrint:631", "AirScan (eSCL)", `title="aa:bb:cc:dd:ee:ff`} {
+	// model (TXT) + friendly labels with PORTS on a FULL-WIDTH (colspan) meta row; the
+	// whole row carries a hover title with MAC/scope AND the raw TXT key=values.
+	for _, want := range []string{
+		`class="hostrow"`, `class="hostmeta" data-f="meta" colspan="2"`,
+		"HP LaserJet MFP M281fdw", "IPP/AirPrint:631", "AirScan (eSCL)",
+		`title="aa:bb:cc:dd:ee:ff`, "rp=ipp/print",
+	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("mDNS-forward render missing %q", want)
 		}
 	}
-	// raw service types and the old separate columns / identify link must be gone.
+	// raw service types on the visible line and the old columns / identify link must be gone.
 	for _, gone := range []string{"_ipp._tcp", "_uscan._tcp", `data-f="services"`, `data-f="vendor"`, `class="hi"`, ">identify<"} {
 		if strings.Contains(body, gone) {
 			t.Errorf("mDNS-forward render should not contain %q", gone)

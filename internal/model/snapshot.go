@@ -87,10 +87,11 @@ type RevZone struct {
 	SOA  RR     // owner == reverse apex
 }
 
-// MDNSService is one DNS-SD service a host advertises (type + SRV port), for diagnostics.
+// MDNSService is one DNS-SD service a host advertises, for diagnostics.
 type MDNSService struct {
-	Type string `json:"type"`           // e.g. "_ipp._tcp"
-	Port uint16 `json:"port,omitempty"` // SRV port (0 if unknown)
+	Type string   `json:"type"`           // e.g. "_ipp._tcp"
+	Port uint16   `json:"port,omitempty"` // SRV port (0 if unknown)
+	Text []string `json:"text,omitempty"` // curated raw TXT key=values (on-hover detail)
 }
 
 // MDNSView is the SEPARATE, independently-published volatile plane for *.local

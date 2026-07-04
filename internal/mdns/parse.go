@@ -100,7 +100,8 @@ type Service struct {
 	Type string
 	Port uint16
 	TTL  uint32
-	Desc string // friendly descriptor from the instance's TXT (model / friendly name), "" if none
+	Desc string   // friendly descriptor from the instance's TXT (model / friendly name), "" if none
+	Text []string // curated raw TXT key=values (for the on-hover detail); bounded
 }
 
 // ParseServices extracts host->service links (type + SRV port + a TXT-derived descriptor)
@@ -111,13 +112,20 @@ func ParseServices(b []byte) []Service {
 		return nil
 	}
 	// TXT records (owned by the service instance) carry model/friendly-name key=values;
-	// index a descriptor by instance name so we can attach it to the matching SRV below.
+	// index a descriptor + the curated raw key=values by instance name, to attach to the
+	// matching SRV below (the descriptor drives the visible line, the raw set the on-hover
+	// detail).
 	descByInst := map[string]string{}
+	textByInst := map[string][]string{}
 	for _, sect := range [][]dns.RR{m.Answer, m.Extra} {
 		for _, rr := range sect {
 			if txt, ok := rr.(*dns.TXT); ok {
+				inst := strings.ToLower(txt.Hdr.Name)
 				if d := descFromTXT(txt.Txt); d != "" {
-					descByInst[strings.ToLower(txt.Hdr.Name)] = d
+					descByInst[inst] = d
+				}
+				if t := curateTXT(txt.Txt); len(t) > 0 {
+					textByInst[inst] = t
 				}
 			}
 		}
@@ -142,9 +150,10 @@ func ParseServices(b []byte) []Service {
 				continue
 			}
 			seen[key] = true
+			inst := strings.ToLower(srv.Hdr.Name)
 			out = append(out, Service{
 				Host: host, Type: typ, Port: srv.Port, TTL: srv.Hdr.Ttl,
-				Desc: descByInst[strings.ToLower(srv.Hdr.Name)],
+				Desc: descByInst[inst], Text: textByInst[inst],
 			})
 		}
 	}
@@ -180,6 +189,28 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// curateTXT returns the TXT record's key=value strings for the on-hover detail, bounded so a
+// device with a huge TXT (e.g. a printer's pdl= format list) cannot bloat the view: values
+// are length-capped and the count is capped. Empty and pure-noise entries are dropped.
+func curateTXT(txt []string) []string {
+	const maxEntries, maxLen = 24, 96
+	var out []string
+	for _, s := range txt {
+		s = strings.TrimSpace(s)
+		if s == "" || len(s) > maxLen {
+			continue // skip empties and oversized values (format lists, blobs)
+		}
+		if k, _, _ := strings.Cut(s, "="); strings.EqualFold(k, "txtvers") {
+			continue // pure protocol noise
+		}
+		out = append(out, s)
+		if len(out) >= maxEntries {
+			break
+		}
+	}
+	return out
 }
 
 // serviceType extracts the "_app._proto" DNS-SD service type from an instance owner name
