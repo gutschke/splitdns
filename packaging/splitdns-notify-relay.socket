@@ -7,7 +7,9 @@ Documentation=man:splitdns-notify(8)
 # splitdns-notify-relay.service reads them and announces, so the TSIG key stays in that one
 # service and never in the writer's context. systemd owns the socket path and permissions.
 ListenDatagram=/run/splitdns-notify/lease-relay.sock
-DirectoryMode=0750
+# 0755, NOT 0750: writers (a DHCP hook's user) must be able to TRAVERSE this directory to
+# reach the socket. Access is gated by the socket's own 0660 + group below, not the dir.
+DirectoryMode=0755
 SocketMode=0660
 SocketGroup=splitdns-notify
 ReceiveBuffer=256K

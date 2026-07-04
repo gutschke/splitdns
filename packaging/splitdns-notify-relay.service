@@ -7,8 +7,10 @@ After=splitdns-notify-relay.socket network.target
 # Socket-activated: started on the first datagram, then reads in a loop. No [Install] here;
 # enabling the .socket is what makes it available.
 [Service]
-Type=notify
-NotifyAccess=main
+# Type=exec (not notify): the socket is systemd-owned and already bound, so there is no
+# readiness handshake to wait on — active as soon as the binary execs. Avoids a notify
+# timeout wedging a working relay.
+Type=exec
 ExecStart=/usr/bin/splitdns-notify --listen
 Restart=on-failure
 RestartSec=2

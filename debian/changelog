@@ -1,3 +1,11 @@
+splitdnsd (0.2.2) unstable; urgency=medium
+
+  * Fix splitdns-notify-relay.socket run-dir perms (DirectoryMode 0750 -> 0755) so a
+    writer in group splitdns-notify can traverse it to the socket; the relay service is
+    now Type=exec to avoid a readiness-handshake hang.
+
+ -- gutschke <gutschke@users.noreply.github.com>  Fri, 04 Jul 2026 12:00:00 -0700
+
 splitdnsd (0.2.1) unstable; urgency=medium
 
   * splitdns-notify: socket-activated relay (--listen) + built-in client (--relay)

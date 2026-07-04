@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-07-04
+
+### Fixed
+- `splitdns-notify-relay.socket`: the run-dir was `DirectoryMode=0750`, so a writer (a
+  DHCP hook's user, in group `splitdns-notify`) could not traverse it to reach the socket
+  and every write got EACCES. Now `0755` (the socket's own `0660`+group is the gate).
+- Relay service is `Type=exec` (was `notify`) so it can't hang on a readiness handshake;
+  the socket is systemd-owned and already bound.
+
 ## [0.2.1] — 2026-07-04
 
 ### splitdns-notify relay
