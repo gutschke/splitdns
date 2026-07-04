@@ -385,9 +385,11 @@ func main() {
 
 	// Read-only diagnostics HTTP (R10), localhost-only by default.
 	oui := hostinfo.NewOUIDB()
-	go oui.Warm()                                                 // parse the OUI DB off the request path
-	hostRes := hostinfo.New(oui, hostinfo.Options{Ping: true})    // lazy /host panel: may probe ARP
-	clientRes := hostinfo.New(oui, hostinfo.Options{Ping: false}) // poll path: passive only, no probing
+	go oui.Warm()                                               // parse the OUI DB off the request path
+	hostRes := hostinfo.New(oui, hostinfo.Options{Probe: true}) // /host panel
+	// The client/poll path probes too: async (never blocks the poll) + rate-limited, so a
+	// privacy IPv6 client not yet in the ND cache gets nudged and identified on a later poll.
+	clientRes := hostinfo.New(oui, hostinfo.Options{Probe: true})
 	diagSrv := diag.New(cfg.Diag.Addr, st.snapshot.Load, src.View, version, func(m string) { slog.Warn(m) }).
 		WithConfigFile(*configPath).
 		WithHostInfo(func(name string) (hostinfo.Info, bool) {

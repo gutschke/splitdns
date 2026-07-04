@@ -1,20 +1,21 @@
 package hostinfo
 
 import (
-	"bufio"
+	"encoding/binary"
 	"net"
 	"net/netip"
-	"os"
-	"strings"
-)
+	"sync"
+	"syscall"
+	"time"
 
-// procNetARP is the kernel IPv4 ARP table; overridable in tests.
-var procNetARP = "/proc/net/arp"
+	"golang.org/x/sys/unix"
+)
 
 // EUI64MAC extracts the hardware address embedded in a SLAAC EUI-64 IPv6 address (the
 // interface id has ff:fe in the middle and the U/L bit flipped). This is PASSIVE — the MAC
 // falls straight out of an address we already hold, and it works across routed subnets where
-// ARP would not. Returns false for IPv4, privacy/temporary addresses, and manually-set iids.
+// the neighbor table would not. Returns false for IPv4, privacy/temporary addresses, and
+// manually-set interface ids.
 func EUI64MAC(ip netip.Addr) (net.HardwareAddr, bool) {
 	if !ip.Is6() || ip.Is4In6() {
 		return nil, false
@@ -30,36 +31,100 @@ func EUI64MAC(ip netip.Addr) (net.HardwareAddr, bool) {
 	return mac, true
 }
 
-// ARPMAC looks up an IPv4 address's MAC in the kernel ARP table (same-L2-segment hosts
-// only). Returns false if absent/incomplete. Populate a missing entry first with a caller's
-// ping if desired (see the diag layer's gating).
-func ARPMAC(ip netip.Addr) (net.HardwareAddr, bool) {
-	if !ip.Is4() {
-		return nil, false
+// neighborTableFn is the neighbor-table source (overridable in tests); neighborNow is the
+// clock. The table (ARP for IPv4, ND for IPv6) is cached briefly so a burst of lookups reads
+// it once, not once per address.
+var (
+	neighborTableFn = netlinkNeighbors
+	neighborNow     = time.Now
+
+	neighMu      sync.Mutex
+	neighCache   map[netip.Addr]net.HardwareAddr
+	neighFetched time.Time
+)
+
+const neighborTTL = 5 * time.Second
+
+// NeighborMAC returns the MAC the kernel has cached for ip — ARP for IPv4, ND for IPv6 (so a
+// privacy IPv6 address resolves once the neighbor entry exists). ok=false if the entry is
+// absent or in an unusable state. Same-L2-segment only, by ARP/ND's nature.
+func NeighborMAC(ip netip.Addr) (net.HardwareAddr, bool) {
+	ip = ip.Unmap()
+	neighMu.Lock()
+	defer neighMu.Unlock()
+	if neighCache == nil || neighborNow().Sub(neighFetched) > neighborTTL {
+		neighCache = neighborTableFn()
+		neighFetched = neighborNow()
 	}
-	f, err := os.Open(procNetARP)
+	mac, ok := neighCache[ip]
+	return mac, ok
+}
+
+// netlinkNeighbors dumps the kernel neighbor cache as ip->MAC, keeping only entries in a
+// usable state (reachable/stale/delay/probe/permanent). Empty map on any error.
+func netlinkNeighbors() map[netip.Addr]net.HardwareAddr {
+	out := map[netip.Addr]net.HardwareAddr{}
+	data, err := syscall.NetlinkRIB(unix.RTM_GETNEIGH, unix.AF_UNSPEC)
 	if err != nil {
-		return nil, false
+		return out
 	}
-	defer f.Close()
-	target := ip.String()
-	sc := bufio.NewScanner(f)
-	sc.Scan() // header
-	for sc.Scan() {
-		fields := strings.Fields(sc.Text())
-		// IP  HWtype  Flags  HWaddr  Mask  Device
-		if len(fields) < 4 || fields[0] != target {
+	msgs, err := syscall.ParseNetlinkMessage(data)
+	if err != nil {
+		return out
+	}
+	const usable = unix.NUD_REACHABLE | unix.NUD_STALE | unix.NUD_DELAY | unix.NUD_PROBE | unix.NUD_PERMANENT
+	for i := range msgs {
+		m := &msgs[i]
+		if m.Header.Type != unix.RTM_NEWNEIGH || len(m.Data) < unix.SizeofNdMsg {
 			continue
 		}
-		if fields[2] == "0x0" { // incomplete entry
-			return nil, false
+		state := binary.LittleEndian.Uint16(m.Data[8:10]) // ndmsg.ndm_state
+		if state&usable == 0 {
+			continue
 		}
-		if mac, err := net.ParseMAC(fields[3]); err == nil && !isZeroMAC(mac) {
-			return mac, true
+		var ip netip.Addr
+		var mac net.HardwareAddr
+		for _, a := range parseRtAttrs(m.Data[unix.SizeofNdMsg:]) {
+			switch a.typ {
+			case unix.NDA_DST:
+				if x, ok := netip.AddrFromSlice(a.val); ok {
+					ip = x.Unmap()
+				}
+			case unix.NDA_LLADDR:
+				if len(a.val) == 6 && !isZeroMAC(net.HardwareAddr(a.val)) {
+					mac = net.HardwareAddr(append([]byte(nil), a.val...))
+				}
+			}
 		}
-		return nil, false
+		if ip.IsValid() && mac != nil {
+			out[ip] = mac
+		}
 	}
-	return nil, false
+	return out
+}
+
+type rtAttr struct {
+	typ uint16
+	val []byte
+}
+
+// parseRtAttrs walks a run of netlink rtattr TLVs (u16 len, u16 type, value; 4-byte aligned).
+func parseRtAttrs(b []byte) []rtAttr {
+	var out []rtAttr
+	for len(b) >= 4 {
+		alen := binary.LittleEndian.Uint16(b[0:2])
+		atyp := binary.LittleEndian.Uint16(b[2:4])
+		if alen < 4 || int(alen) > len(b) {
+			break
+		}
+		out = append(out, rtAttr{typ: atyp, val: b[4:alen]})
+		adv := (int(alen) + 3) &^ 3
+		if adv <= 0 || adv > len(b) {
+			break
+		}
+		b = b[adv:]
+	}
+	return out
 }
 
 func isZeroMAC(mac net.HardwareAddr) bool {

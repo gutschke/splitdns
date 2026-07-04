@@ -1,11 +1,29 @@
 package hostinfo
 
 import (
+	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
+
+// setNeighbors overrides the neighbor-table source with a fixed map and resets the cache.
+func setNeighbors(t *testing.T, table map[netip.Addr]net.HardwareAddr) {
+	t.Helper()
+	old := neighborTableFn
+	neighborTableFn = func() map[netip.Addr]net.HardwareAddr { return table }
+	neighMu.Lock()
+	neighCache = nil
+	neighMu.Unlock()
+	t.Cleanup(func() {
+		neighborTableFn = old
+		neighMu.Lock()
+		neighCache = nil
+		neighMu.Unlock()
+	})
+}
 
 func TestParseOUILine(t *testing.T) {
 	for line, want := range map[string]struct {
@@ -41,27 +59,26 @@ func TestEUI64MAC(t *testing.T) {
 	}
 }
 
-func TestARPMAC(t *testing.T) {
-	f := filepath.Join(t.TempDir(), "arp")
-	os.WriteFile(f, []byte("IP address       HW type     Flags       HW address            Mask     Device\n"+
-		"192.0.2.5        0x1         0x2         52:54:00:12:34:56     *        eth0\n"+
-		"192.0.2.6        0x1         0x0         00:00:00:00:00:00     *        eth0\n"), 0o644)
-	old := procNetARP
-	procNetARP = f
-	defer func() { procNetARP = old }()
-
-	if mac, ok := ARPMAC(netip.MustParseAddr("192.0.2.5")); !ok || mac.String() != "52:54:00:12:34:56" {
-		t.Errorf("ARPMAC(.5) = %v,%v", mac, ok)
+func TestNeighborMAC(t *testing.T) {
+	mac := net.HardwareAddr{0x52, 0x54, 0x00, 0x12, 0x34, 0x56}
+	priv := netip.MustParseAddr("2001:db8::d56c:b6e4:e8d:7c0f") // a privacy IPv6 (no EUI-64)
+	setNeighbors(t, map[netip.Addr]net.HardwareAddr{
+		netip.MustParseAddr("192.0.2.5"): mac,
+		priv:                             {0xbc, 0x24, 0x11, 0x2f, 0xc1, 0x53},
+	})
+	if got, ok := NeighborMAC(netip.MustParseAddr("192.0.2.5")); !ok || got.String() != mac.String() {
+		t.Errorf("NeighborMAC(v4) = %v,%v", got, ok)
 	}
-	if _, ok := ARPMAC(netip.MustParseAddr("192.0.2.6")); ok {
-		t.Error("incomplete ARP entry (flags 0x0) must be a miss")
+	if _, ok := NeighborMAC(priv); !ok {
+		t.Error("NeighborMAC must resolve a privacy IPv6 from the ND cache")
 	}
-	if _, ok := ARPMAC(netip.MustParseAddr("192.0.2.9")); ok {
-		t.Error("absent ARP entry must be a miss")
+	if _, ok := NeighborMAC(netip.MustParseAddr("192.0.2.9")); ok {
+		t.Error("absent neighbor must be a miss")
 	}
 }
 
 func TestLookupVendorAndProfile(t *testing.T) {
+	setNeighbors(t, nil) // deterministic: the LAN address isn't in the neighbor table
 	oui := filepath.Join(t.TempDir(), "oui.txt")
 	os.WriteFile(oui, []byte("52-54-00   (hex)\t\tAcme Devices\n"), 0o644)
 	r := New(NewOUIDB(oui), Options{})
@@ -84,26 +101,35 @@ func TestLookupVendorAndProfile(t *testing.T) {
 	}
 }
 
-func TestPingProbeGating(t *testing.T) {
-	f := filepath.Join(t.TempDir(), "arp")
-	os.WriteFile(f, []byte("IP address\n"), 0o644) // empty table
-	old := procNetARP
-	procNetARP = f
-	defer func() { procNetARP = old }()
+func TestProbeGating(t *testing.T) {
+	setNeighbors(t, nil) // empty neighbor table
 	db := NewOUIDB(filepath.Join(t.TempDir(), "absent"))
 
-	var pinged int
-	r := New(db, Options{Ping: true, probe: func(netip.Addr) { pinged++ }})
+	probed := make(chan netip.Addr, 4)
+	r := New(db, Options{Probe: true, probe: func(ip netip.Addr) { probed <- ip }})
 	r.Lookup("h", []netip.Addr{netip.MustParseAddr("10.0.0.9")})
-	if pinged != 1 {
-		t.Errorf("Ping enabled + missing ARP: probes = %d, want 1", pinged)
+	select {
+	case ip := <-probed:
+		if ip != netip.MustParseAddr("10.0.0.9") {
+			t.Errorf("probed %v, want 10.0.0.9", ip)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("Probe enabled + missing neighbor: expected an async probe")
 	}
-	r2 := New(db, Options{Ping: false, probe: func(netip.Addr) { t.Error("must not probe when Ping is off") }})
-	r2.Lookup("h", []netip.Addr{netip.MustParseAddr("10.0.0.9")})
-	// CGNAT scope classification.
+	// Same address again within the cooldown: no second probe.
+	r.probedAt[netip.MustParseAddr("10.0.0.9")] = time.Now()
+	if r.scheduleProbe(netip.MustParseAddr("10.0.0.9")) {
+		t.Error("probe should be rate-limited within the cooldown")
+	}
+	// Probe disabled -> no probe; public addresses are never probed (don't ping the internet).
+	New(db, Options{Probe: false, probe: func(netip.Addr) { t.Error("must not probe when Probe is off") }}).
+		Lookup("h2", []netip.Addr{netip.MustParseAddr("10.0.0.9")})
+	New(db, Options{Probe: true, probe: func(netip.Addr) { t.Error("must not probe a public address") }}).
+		Lookup("h3", []netip.Addr{netip.MustParseAddr("198.51.100.5")})
 	if s := scopeOf(netip.MustParseAddr("100.64.0.1")); s != "CGNAT" {
 		t.Errorf("scopeOf(100.64.0.1) = %q, want CGNAT", s)
 	}
+	time.Sleep(10 * time.Millisecond) // let async goroutines settle before hooks are GC'd
 }
 
 // Regression: the ieee-data oui.txt lists each OUI twice — a "(hex)" line and a
@@ -121,5 +147,16 @@ func TestParseOUIFileIeeeData(t *testing.T) {
 	mac, _ := EUI64MAC(netip.MustParseAddr("2001:db8::021b:63ff:fe00:0001"))
 	if v := db.Vendor(mac); v != "Apple, Inc." {
 		t.Errorf("vendor = %q, want %q (the (base 16) line must not corrupt it)", v, "Apple, Inc.")
+	}
+}
+
+// Exercise the real netlink neighbor dump on the test host: it must not panic and every
+// returned entry must be well-formed (the parse handles ARP + ND). Empty is fine (a
+// sandbox may return none).
+func TestNetlinkNeighborsSmoke(t *testing.T) {
+	for ip, mac := range netlinkNeighbors() {
+		if !ip.IsValid() || len(mac) != 6 {
+			t.Errorf("malformed neighbor entry: %v -> %v", ip, mac)
+		}
 	}
 }

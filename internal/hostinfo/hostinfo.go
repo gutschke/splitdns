@@ -21,24 +21,34 @@ type Info struct {
 
 // Options configure a Resolver.
 type Options struct {
-	TTL      time.Duration    // per-host cache lifetime (default 5m)
+	TTL      time.Duration    // resolved-entry cache lifetime (default 5m)
+	RetryTTL time.Duration    // unresolved-entry lifetime while a probe is in flight (default 20s)
 	MaxHosts int              // cache cap (default 4096)
-	Ping     bool             // send a UDP probe to populate a missing IPv4 ARP entry
+	Probe    bool             // fire an ASYNC ping/UDP probe to populate a missing neighbor entry
 	Now      func() time.Time // test clock (default time.Now)
-	probe    func(netip.Addr) // test hook for the ARP-populating probe
+	probe    func(netip.Addr) // test hook for the neighbor-populating probe
 }
+
+// probeCooldown rate-limits re-probing the same address, so an unreachable host (or an
+// off-segment one that will never appear in our neighbor table) is nudged at most this often
+// — a "ping or two," never a flood.
+const probeCooldown = 90 * time.Second
 
 // Resolver enriches hosts on demand and caches the result per name. Safe for concurrent use.
 type Resolver struct {
-	oui   *OUIDB
-	ttl   time.Duration
-	max   int
-	ping  bool
-	now   func() time.Time
-	probe func(netip.Addr)
+	oui      *OUIDB
+	ttl      time.Duration
+	retryTTL time.Duration
+	max      int
+	probeOn  bool
+	now      func() time.Time
+	probe    func(netip.Addr)
 
 	mu    sync.Mutex
 	cache map[string]cacheEntry
+
+	probeMu  sync.Mutex
+	probedAt map[netip.Addr]time.Time
 }
 
 type cacheEntry struct {
@@ -51,6 +61,9 @@ func New(oui *OUIDB, opts Options) *Resolver {
 	if opts.TTL <= 0 {
 		opts.TTL = 5 * time.Minute
 	}
+	if opts.RetryTTL <= 0 {
+		opts.RetryTTL = 20 * time.Second
+	}
 	if opts.MaxHosts <= 0 {
 		opts.MaxHosts = 4096
 	}
@@ -59,12 +72,17 @@ func New(oui *OUIDB, opts Options) *Resolver {
 	}
 	probe := opts.probe
 	if probe == nil {
-		probe = populateARP
+		probe = probeNeighbor
 	}
-	return &Resolver{oui: oui, ttl: opts.TTL, max: opts.MaxHosts, ping: opts.Ping, now: opts.Now, probe: probe, cache: map[string]cacheEntry{}}
+	return &Resolver{
+		oui: oui, ttl: opts.TTL, retryTTL: opts.RetryTTL, max: opts.MaxHosts, probeOn: opts.Probe,
+		now: opts.Now, probe: probe, cache: map[string]cacheEntry{}, probedAt: map[netip.Addr]time.Time{},
+	}
 }
 
-// Lookup returns cached enrichment for a host, computing (and caching) it on a miss.
+// Lookup returns cached enrichment for a host, computing (and caching) it on a miss. When an
+// address can't be identified passively it fires an async probe and caches the (still empty)
+// result briefly, so a follow-up lookup picks up the newly-populated neighbor entry.
 func (r *Resolver) Lookup(name string, addrs []netip.Addr) Info {
 	now := r.now()
 	r.mu.Lock()
@@ -74,7 +92,11 @@ func (r *Resolver) Lookup(name string, addrs []netip.Addr) Info {
 	}
 	r.mu.Unlock()
 
-	info := r.compute(addrs)
+	info, pending := r.compute(addrs)
+	ttl := r.ttl
+	if pending {
+		ttl = r.retryTTL // a probe was fired — re-check soon so its result shows up
+	}
 
 	r.mu.Lock()
 	if len(r.cache) >= r.max {
@@ -83,15 +105,32 @@ func (r *Resolver) Lookup(name string, addrs []netip.Addr) Info {
 			break
 		}
 	}
-	r.cache[name] = cacheEntry{info: info, exp: now.Add(r.ttl)}
+	r.cache[name] = cacheEntry{info: info, exp: now.Add(ttl)}
 	r.mu.Unlock()
 	return info
 }
 
-func (r *Resolver) compute(addrs []netip.Addr) Info {
+// scheduleProbe fires one async, rate-limited neighbor probe for ip. Returns true if a probe
+// was launched (so the caller can shorten the cache TTL and re-check soon).
+func (r *Resolver) scheduleProbe(ip netip.Addr) bool {
+	r.probeMu.Lock()
+	if t, ok := r.probedAt[ip]; ok && r.now().Sub(t) < probeCooldown {
+		r.probeMu.Unlock()
+		return false
+	}
+	if len(r.probedAt) > 4096 { // bound the cooldown map
+		r.probedAt = map[netip.Addr]time.Time{}
+	}
+	r.probedAt[ip] = r.now()
+	r.probeMu.Unlock()
+	go r.probe(ip)
+	return true
+}
+
+func (r *Resolver) compute(addrs []netip.Addr) (Info, bool) {
 	macs := map[string]net.HardwareAddr{}
 	scopes := map[string]bool{}
-	var v4, v6 bool
+	var v4, v6, pending bool
 	for _, ip := range addrs {
 		if !ip.IsValid() {
 			continue
@@ -107,15 +146,14 @@ func (r *Resolver) compute(addrs []netip.Addr) Info {
 			macs[mac.String()] = mac
 			continue
 		}
-		if ip.Is4() {
-			if mac, ok := ARPMAC(ip); ok {
-				macs[mac.String()] = mac
-			} else if r.ping {
-				r.probe(ip) // limited active: populate a same-segment ARP entry
-				if mac, ok := ARPMAC(ip); ok {
-					macs[mac.String()] = mac
-				}
-			}
+		if mac, ok := NeighborMAC(ip); ok { // ARP (v4) / ND (v6) neighbor cache
+			macs[mac.String()] = mac
+			continue
+		}
+		// Not identifiable passively (e.g. a privacy IPv6 address not yet in the ND cache).
+		// Fire one async, rate-limited probe so a later lookup can read the populated entry.
+		if r.probeOn && scopeOf(ip) != "public" && r.scheduleProbe(ip) {
+			pending = true
 		}
 	}
 
@@ -144,7 +182,7 @@ func (r *Resolver) compute(addrs []netip.Addr) Info {
 	case v6:
 		info.Families = "IPv6"
 	}
-	return info
+	return info, pending
 }
 
 // scopeOf labels an address by reachability class (for the address profile).
@@ -173,17 +211,18 @@ func isCGNAT(ip netip.Addr) bool {
 	return ip.Is4() && netip.PrefixFrom(netip.AddrFrom4([4]byte{100, 64, 0, 0}), 10).Contains(ip)
 }
 
-// populateARP sends a tiny UDP datagram toward an on-link IPv4 target so the kernel resolves
-// (and caches) its MAC, then waits briefly for the ARP to complete. No raw socket / no
-// privilege needed; harmless (discard port). Off-link targets resolve the gateway instead,
-// so no MAC is learned — matching ARP's L2 scope.
-func populateARP(ip netip.Addr) {
-	c, err := net.DialTimeout("udp", netip.AddrPortFrom(ip, 9).String(), 200*time.Millisecond)
+// probeNeighbor sends a tiny UDP datagram (a nudge or two) toward an on-link target so the
+// kernel resolves and caches its MAC in the ARP/ND table. It runs in its own goroutine and
+// NEVER blocks the caller; the populated entry is picked up by a later lookup. No raw socket
+// / no privilege (harmless discard port). Off-link targets resolve the gateway, so no host
+// MAC is learned — matching ARP/ND's L2 scope, which is why unreachable hosts stay unknown.
+func probeNeighbor(ip netip.Addr) {
+	c, err := net.DialTimeout("udp", netip.AddrPortFrom(ip, 9).String(), 500*time.Millisecond)
 	if err != nil {
 		return
 	}
-	_ = c.SetDeadline(time.Now().Add(200 * time.Millisecond))
+	_ = c.SetDeadline(time.Now().Add(500 * time.Millisecond))
 	_, _ = c.Write([]byte{0})
+	_, _ = c.Write([]byte{0}) // a second nudge ("a ping or two")
 	_ = c.Close()
-	time.Sleep(60 * time.Millisecond) // allow the kernel to complete ARP before we re-read
 }
