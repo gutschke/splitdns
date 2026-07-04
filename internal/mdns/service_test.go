@@ -49,3 +49,26 @@ func TestServiceCaptureIntoView(t *testing.T) {
 		t.Error("service for unknown host should be dropped")
 	}
 }
+
+// A service query-response carries the SRV in the ADDITIONAL section; splitdnsd must still
+// capture it (overhearing another client's _services._dns-sd._udp query).
+func TestServiceCaptureFromAdditional(t *testing.T) {
+	src := NewSource(nil, func() time.Time { return time.Unix(1_000_000, 0) })
+	m := new(dns.Msg)
+	m.Response = true
+	m.Answer = []dns.RR{
+		&dns.A{Hdr: dns.RR_Header{Name: "cast.local.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 120}, A: net.ParseIP("10.0.0.7")},
+		&dns.PTR{Hdr: dns.RR_Header{Name: "_googlecast._tcp.local.", Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: 120}, Ptr: "Living Room._googlecast._tcp.local."},
+	}
+	m.Extra = []dns.RR{
+		&dns.SRV{Hdr: dns.RR_Header{Name: "Living Room._googlecast._tcp.local.", Rrtype: dns.TypeSRV, Class: dns.ClassINET, Ttl: 120}, Target: "cast.local.", Port: 8009},
+	}
+	b, err := m.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	src.HandlePacket(b, false)
+	if svcs := src.View().Services["cast"]; len(svcs) != 1 || svcs[0] != "_googlecast._tcp" {
+		t.Errorf("services = %v, want [_googlecast._tcp] (SRV was in Additional)", svcs)
+	}
+}

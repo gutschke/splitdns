@@ -56,15 +56,20 @@ func ParsePacket(b []byte) []Announcement {
 			a.TTL = ttl
 		}
 	}
-	for _, rr := range m.Answer {
-		switch v := rr.(type) {
-		case *dns.A:
-			if ip, ok := netip.AddrFromSlice(v.A.To4()); ok {
-				add(canonHost(v.Hdr.Name), ip, v.Hdr.Ttl)
-			}
-		case *dns.AAAA:
-			if ip, ok := netip.AddrFromSlice(v.AAAA.To16()); ok {
-				add(canonHost(v.Hdr.Name), ip, v.Hdr.Ttl)
+	// Scan Answer AND Additional: a response to a service/PTR query carries the address
+	// records in the Additional section (RFC 6762 §6.3), so overhearing another client's
+	// query is a legitimate way to learn a host that isn't currently announcing itself.
+	for _, sect := range [][]dns.RR{m.Answer, m.Extra} {
+		for _, rr := range sect {
+			switch v := rr.(type) {
+			case *dns.A:
+				if ip, ok := netip.AddrFromSlice(v.A.To4()); ok {
+					add(canonHost(v.Hdr.Name), ip, v.Hdr.Ttl)
+				}
+			case *dns.AAAA:
+				if ip, ok := netip.AddrFromSlice(v.AAAA.To16()); ok {
+					add(canonHost(v.Hdr.Name), ip, v.Hdr.Ttl)
+				}
 			}
 		}
 	}
@@ -105,22 +110,26 @@ func ParseServices(b []byte) []Service {
 	}
 	var out []Service
 	seen := map[string]bool{}
-	for _, rr := range m.Answer {
-		srv, ok := rr.(*dns.SRV)
-		if !ok {
-			continue
+	// SRV records commonly arrive in the Additional section of a service query-response, so
+	// scan Answer AND Additional.
+	for _, sect := range [][]dns.RR{m.Answer, m.Extra} {
+		for _, rr := range sect {
+			srv, ok := rr.(*dns.SRV)
+			if !ok {
+				continue
+			}
+			host := canonHost(srv.Target)
+			typ := serviceType(srv.Hdr.Name)
+			if host == "" || typ == "" {
+				continue
+			}
+			key := host + "|" + typ
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			out = append(out, Service{Host: host, Type: typ, TTL: srv.Hdr.Ttl})
 		}
-		host := canonHost(srv.Target)
-		typ := serviceType(srv.Hdr.Name)
-		if host == "" || typ == "" {
-			continue
-		}
-		key := host + "|" + typ
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-		out = append(out, Service{Host: host, Type: typ, TTL: srv.Hdr.Ttl})
 	}
 	return out
 }
