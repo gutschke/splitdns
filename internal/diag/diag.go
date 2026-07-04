@@ -919,6 +919,7 @@ type queryView struct {
 	Time       string  `json:"time"`
 	Client     string  `json:"client"`
 	ClientName string  `json:"client_name,omitempty"`
+	Device     string  `json:"device,omitempty"` // vendor/device guess from the client's MAC
 	Transport  string  `json:"transport"`
 	Name       string  `json:"name"`
 	Type       string  `json:"type"`
@@ -1148,6 +1149,7 @@ func buildQueryStats(l *qlog.Log, nameFor, deviceFor func(netip.Addr) string) *q
 			Time:       e.Time.Format("15:04:05"),
 			Client:     addrStr(e.Client),
 			ClientName: name(e.Client),
+			Device:     device(e.Client),
 			Transport:  e.Transport,
 			Name:       e.Name,
 			Type:       e.Qtype,
@@ -1556,7 +1558,7 @@ transport <select name="transport"><option value="do53">Do53 (UDP)</option><opti
 {{range .Top}}<tr data-key="{{.Client}}"><td data-f="client">{{.Client}}</td><td data-f="name" class="muted">{{.Name}}</td><td data-f="device" class="muted">{{.Device}}</td><td data-f="count">{{.Count}}</td><td data-f="last_seen" class="muted">{{.LastSeen}}</td><td data-f="top_names" class="muted">{{range .TopNames}}{{.Name}} ({{.Count}}) {{end}}</td><td data-f="transports">{{range .Transports}}{{.Name}}:{{.Count}} {{end}}</td></tr>{{end}}</tbody></table>
 <h3>Recent queries <span class="muted">(click a header to sort)</span></h3>
 <table class="sortable" data-rows="recent" data-defsort="key:num:desc"><thead><tr><th>time</th><th>client</th><th>proto</th><th>name</th><th>type</th><th>decision</th><th>rcode</th><th>ms</th></tr></thead><tbody>
-{{range .Recent}}<tr data-key="{{.Seq}}"><td data-f="time" class="muted">{{.Time}}</td><td data-f="client">{{.Client}}{{if .ClientName}} <span data-f="cname" class="muted">{{.ClientName}}</span>{{end}}</td><td data-f="transport">{{.Transport}}</td><td data-f="name">{{.Name}}</td><td data-f="type">{{.Type}}</td>
+{{range .Recent}}<tr data-key="{{.Seq}}"><td data-f="time" class="muted">{{.Time}}</td><td data-f="client">{{.Client}}{{if .ClientName}} <span data-f="cname" class="muted">{{.ClientName}}</span>{{end}}{{if .Device}} <span data-f="cdev" class="muted">({{.Device}})</span>{{end}}</td><td data-f="transport">{{.Transport}}</td><td data-f="name">{{.Name}}</td><td data-f="type">{{.Type}}</td>
 <td data-f="decision">{{.Decision}}</td><td data-f="rcode">{{.Rcode}}</td><td data-f="ms">{{printf "%.1f" .LatencyMS}}</td></tr>{{end}}</tbody></table>
 </div>
 </section>
@@ -1579,10 +1581,10 @@ transport <select name="transport"><option value="do53">Do53 (UDP)</option><opti
 <details><summary>mDNS forward</summary>
 <p class="muted">badge <span class="badge">id</span> marks a machine/instance id (container, VM, or a device with no friendly hostname).</p>
 <div data-live="mdns_forward"><table><tbody>
-{{range .MDNSFwd}}<tr data-key="{{.Name}}"><td data-f="name">{{.Name}}{{if .Kind}} <span class="badge">{{.Kind}}</span>{{end}}</td><td data-f="records">{{range .Records}}{{.}}; {{end}}</td><td data-f="info" class="muted">{{if $.HasHostInfo}}<a class="hi" data-h="{{.Name}}" href="#" title="identify this host (vendor/scope)">identify</a>{{end}}</td></tr>{{end}}
+{{range .MDNSFwd}}<tr data-key="{{.Name}}"><td data-f="name">{{.Name}}{{if .Kind}} <span class="badge">{{.Kind}}</span>{{end}}</td><td data-f="records">{{range $i, $r := .Records}}{{if $i}}; {{end}}{{$r}}{{end}}</td><td data-f="info" class="muted">{{if $.HasHostInfo}}<a class="hi" data-h="{{.Name}}" href="#" title="identify this host (vendor/scope)">identify</a>{{end}}</td></tr>{{end}}
 </tbody></table></div></details>
 <details><summary>mDNS reverse</summary><div data-live="mdns_reverse"><table><tbody>
-{{range .MDNSRev}}<tr data-key="{{.Name}}"><td data-f="name">{{.Name}}</td><td data-f="records">{{range .Records}}{{.}}; {{end}}</td></tr>{{end}}
+{{range .MDNSRev}}<tr data-key="{{.Name}}"><td data-f="name">{{.Name}}</td><td data-f="records">{{range $i, $r := .Records}}{{if $i}}; {{end}}{{$r}}{{end}}</td></tr>{{end}}
 </tbody></table></div></details>
 {{if .HasConfig}}<details id="cfgpanel"><summary>Config <span class="muted">effective file — cryptographic material redacted</span></summary><pre id="cfgtext" class="muted">Loading…</pre></details>{{end}}
 </section>
@@ -1688,10 +1690,15 @@ transport <select name="transport"><option value="do53">Do53 (UDP)</option><opti
       if(!span){ cell.appendChild(document.createTextNode(' ')); span = document.createElement('span'); span.className = 'muted'; span.dataset.f = 'cname'; cell.appendChild(span); }
       patchText(span, x.client_name);
     } else if(span){ span.remove(); }
+    var dev = cell.querySelector('[data-f="cdev"]');
+    if(x.device){
+      if(!dev){ cell.appendChild(document.createTextNode(' ')); dev = document.createElement('span'); dev.className = 'muted'; dev.dataset.f = 'cdev'; cell.appendChild(dev); }
+      patchText(dev, '(' + x.device + ')');
+    } else if(dev){ dev.remove(); }
   }
 
   // mDNS forward/reverse: keyed by host/arpa name; only the records cell changes.
-  function mdnsRecords(tr, x){ patchText(fcell(tr, 'records'), (x.records || []).map(function(r){ return r + '; '; }).join('')); }
+  function mdnsRecords(tr, x){ patchText(fcell(tr, 'records'), (x.records || []).join('; ')); }
   function makeMDNS(x){ var tr = document.createElement('tr'); tr.innerHTML = '<td data-f="name"></td><td data-f="records"></td><td data-f="info" class="muted"></td>'; var nc = fcell(tr, 'name'); nc.textContent = x.name; if(x.kind){ nc.appendChild(document.createTextNode(' ')); var b = document.createElement('span'); b.className = 'badge'; b.textContent = x.kind; nc.appendChild(b); } if(hasHostInfo){ var a = document.createElement('a'); a.className = 'hi'; a.href = '#'; a.dataset.h = x.name; a.textContent = 'identify'; fcell(tr, 'info').appendChild(a); } mdnsRecords(tr, x); return tr; }
   function mdnsPatch(root, d){ reconcile(root.querySelector('tbody'), d || [], function(x){ return x.name; }, makeMDNS, mdnsRecords); }
 
