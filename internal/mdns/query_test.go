@@ -8,7 +8,8 @@ import (
 )
 
 func TestBuildDiscoveryQuery(t *testing.T) {
-	b := buildDiscoveryQuery([]string{"_ipp._tcp", "_googlecast._tcp", "_ipp._tcp"}) // dup ignored
+	b := buildDiscoveryQuery([]string{"_ipp._tcp", "_googlecast._tcp", "_ipp._tcp"}, // dup ignored
+		[]string{"Printer._ipp._tcp.local."})
 	if b == nil {
 		t.Fatal("nil query")
 	}
@@ -19,19 +20,31 @@ func TestBuildDiscoveryQuery(t *testing.T) {
 	if m.Response {
 		t.Error("discovery packet must be a query (QR=0)")
 	}
-	want := map[string]bool{serviceEnum: false, "_ipp._tcp.local.": false, "_googlecast._tcp.local.": false}
+	qtypeOf := map[string]uint16{}
 	for _, q := range m.Question {
-		if _, ok := want[q.Name]; ok {
-			if q.Qtype != dns.TypePTR {
-				t.Errorf("%s qtype = %d, want PTR", q.Name, q.Qtype)
-			}
-			want[q.Name] = true
+		qtypeOf[q.Name] = q.Qtype
+	}
+	for _, n := range []string{serviceEnum, "_ipp._tcp.local.", "_googlecast._tcp.local."} {
+		if qtypeOf[n] != dns.TypePTR {
+			t.Errorf("%s qtype = %d, want PTR", n, qtypeOf[n])
 		}
 	}
-	for n, seen := range want {
-		if !seen {
-			t.Errorf("missing question %q", n)
-		}
+	if qtypeOf["Printer._ipp._tcp.local."] != dns.TypeSRV {
+		t.Errorf("instance question should be an SRV query, got %d", qtypeOf["Printer._ipp._tcp.local."])
+	}
+}
+
+func TestParseInstances(t *testing.T) {
+	m := new(dns.Msg)
+	m.Response = true
+	m.Answer = []dns.RR{
+		&dns.PTR{Hdr: dns.RR_Header{Name: "_ipp._tcp.local.", Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: 120}, Ptr: "Printer._ipp._tcp.local."},
+		&dns.PTR{Hdr: dns.RR_Header{Name: serviceEnum, Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: 120}, Ptr: "_ipp._tcp.local."}, // enum, not an instance
+	}
+	b, _ := m.Pack()
+	got := parseInstances(b)
+	if len(got) != 1 || got[0] != "Printer._ipp._tcp.local." {
+		t.Errorf("instances = %v, want [Printer._ipp._tcp.local.]", got)
 	}
 }
 

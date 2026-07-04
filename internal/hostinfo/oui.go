@@ -50,6 +50,10 @@ func NewOUIDB(paths ...string) *OUIDB {
 	return &OUIDB{paths: paths}
 }
 
+// Warm loads the database now (call in a background goroutine at startup so the first
+// enrichment request doesn't pay the ~4 MB parse on the request path).
+func (d *OUIDB) Warm() { d.ensure(time.Now()) }
+
 // Source reports the loaded database path (or "" if none is available).
 func (d *OUIDB) Source() string {
 	d.ensure(time.Now())

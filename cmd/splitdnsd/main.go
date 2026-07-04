@@ -380,6 +380,7 @@ func main() {
 
 	// Read-only diagnostics HTTP (R10), localhost-only by default.
 	oui := hostinfo.NewOUIDB()
+	go oui.Warm()                                                 // parse the OUI DB off the request path
 	hostRes := hostinfo.New(oui, hostinfo.Options{Ping: true})    // lazy /host panel: may probe ARP
 	clientRes := hostinfo.New(oui, hostinfo.Options{Ping: false}) // poll path: passive only, no probing
 	diagSrv := diag.New(cfg.Diag.Addr, st.snapshot.Load, src.View, version, func(m string) { slog.Warn(m) }).

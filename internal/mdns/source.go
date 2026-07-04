@@ -28,6 +28,7 @@ type Source struct {
 	sender     func([]byte)
 	typeMu     sync.Mutex
 	discovered map[string]struct{} // service types learned from enumeration responses
+	instances  map[string]struct{} // service instances learned from type responses (→ SRV)
 }
 
 // Option customizes a Source at construction.
@@ -59,6 +60,7 @@ func NewSource(onChange ChangeFunc, now func() time.Time, opts ...Option) *Sourc
 		now:         now,
 		expireEvery: 30 * time.Second,
 		discovered:  map[string]struct{}{},
+		instances:   map[string]struct{}{},
 	}
 	for _, o := range opts {
 		o(s)
@@ -80,18 +82,34 @@ func (s *Source) addType(t string) {
 	}
 }
 
-// discoveryTypes returns the common seed plus learned types (bounded, deduped downstream).
-func (s *Source) discoveryTypes() []string {
+// addInstance records a service instance learned from a type response (bounded).
+func (s *Source) addInstance(inst string) {
 	s.typeMu.Lock()
 	defer s.typeMu.Unlock()
-	types := append([]string(nil), commonServiceTypes...)
+	if _, ok := s.instances[inst]; !ok && len(s.instances) < maxDiscoveredInstances {
+		s.instances[inst] = struct{}{}
+	}
+}
+
+// discoverySets returns the common+learned types and the learned instances to query
+// (bounded, deduped downstream).
+func (s *Source) discoverySets() (types, instances []string) {
+	s.typeMu.Lock()
+	defer s.typeMu.Unlock()
+	types = append(types, commonServiceTypes...)
 	for t := range s.discovered {
 		types = append(types, t)
 	}
 	if len(types) > maxQueryTypes {
 		types = types[:maxQueryTypes]
 	}
-	return types
+	for inst := range s.instances {
+		instances = append(instances, inst)
+		if len(instances) >= maxQueryInstances {
+			break
+		}
+	}
+	return types, instances
 }
 
 // sendQuery multicasts one service-discovery query (no-op if discovery is off/unwired).
@@ -99,7 +117,7 @@ func (s *Source) sendQuery() {
 	if s.queryEvery <= 0 || s.sender == nil {
 		return
 	}
-	if b := buildDiscoveryQuery(s.discoveryTypes()); b != nil {
+	if b := buildDiscoveryQuery(s.discoverySets()); b != nil {
 		s.sender(b)
 	}
 }
@@ -123,11 +141,15 @@ func (s *Source) HandlePacket(b []byte, trusted bool) {
 			changed = true
 		}
 	}
-	// Learn service types from an enumeration response so the next query round asks about
-	// them too (only relevant when active discovery is on).
+	// Learn service types (from the enumeration) and instances (from type responses) so the
+	// next query round asks about them — instance SRV queries are what actually yield the
+	// host↔service link. Only relevant when active discovery is on.
 	if s.queryEvery > 0 {
 		for _, t := range parseServiceTypes(b) {
 			s.addType(t)
+		}
+		for _, inst := range parseInstances(b) {
+			s.addInstance(inst)
 		}
 	}
 	if changed {

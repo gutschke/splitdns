@@ -13,8 +13,10 @@ const serviceEnum = "_services._dns-sd._udp.local."
 // maxDiscoveredTypes bounds the learned-type set so a hostile responder can't grow it without
 // limit; maxQueryTypes bounds one query packet so it stays a single, un-fragmented datagram.
 const (
-	maxDiscoveredTypes = 256
-	maxQueryTypes      = 60
+	maxDiscoveredTypes     = 256
+	maxQueryTypes          = 60
+	maxDiscoveredInstances = 512
+	maxQueryInstances      = 80
 )
 
 // commonServiceTypes seeds active discovery with the service types of the devices operators
@@ -28,27 +30,59 @@ var commonServiceTypes = []string{
 	"_smb._tcp", "_afpovertcp._tcp", "_device-info._tcp", "_companion-link._tcp",
 }
 
-// buildDiscoveryQuery packs ONE mDNS query asking for the service-type enumeration plus a
-// PTR for each service type (RFC 6762 allows many questions per packet; one packet is
-// reflector-friendly). Responses (their SRV/address records land in Answer/Additional) flow
-// back through the normal receive path. Returns nil if it cannot pack.
-func buildDiscoveryQuery(types []string) []byte {
+// buildDiscoveryQuery packs ONE mDNS query with the service-type enumeration (PTR), a PTR
+// for each service type (→ instances), and an SRV for each known instance (→ host + port).
+// The explicit instance-SRV step is what reliably yields the SRV in the response's ANSWER —
+// many responders (and reflectors) omit it from a type-PTR response's Additional, which is
+// why services weren't being captured. One packet, many questions (reflector-friendly).
+// Returns nil if it cannot pack.
+func buildDiscoveryQuery(types, instances []string) []byte {
 	m := new(dns.Msg)
-	m.Question = append(m.Question, dns.Question{Name: serviceEnum, Qtype: dns.TypePTR, Qclass: dns.ClassINET})
 	seen := map[string]bool{}
-	for _, t := range types {
-		name := dns.Fqdn(t + ".local")
+	add := func(name string, qtype uint16) {
 		if seen[name] {
-			continue
+			return
 		}
 		seen[name] = true
-		m.Question = append(m.Question, dns.Question{Name: name, Qtype: dns.TypePTR, Qclass: dns.ClassINET})
+		m.Question = append(m.Question, dns.Question{Name: name, Qtype: qtype, Qclass: dns.ClassINET})
+	}
+	add(serviceEnum, dns.TypePTR)
+	for _, t := range types {
+		add(dns.Fqdn(t+".local"), dns.TypePTR)
+	}
+	for _, inst := range instances {
+		add(dns.Fqdn(inst), dns.TypeSRV)
 	}
 	b, err := m.Pack()
 	if err != nil {
 		return nil
 	}
 	return b
+}
+
+// parseInstances returns the service INSTANCE names listed in a service-type response (PTRs
+// whose owner is a service type, e.g. _ipp._tcp.local → Printer._ipp._tcp.local), so active
+// discovery can query each instance's SRV next round.
+func parseInstances(b []byte) []string {
+	var m dns.Msg
+	if err := m.Unpack(b); err != nil || !m.Response {
+		return nil
+	}
+	var out []string
+	for _, sect := range [][]dns.RR{m.Answer, m.Extra} {
+		for _, rr := range sect {
+			ptr, ok := rr.(*dns.PTR)
+			if !ok || ptr.Ptr == "" {
+				continue
+			}
+			owner := strings.ToLower(strings.TrimSuffix(ptr.Hdr.Name, "."))
+			if owner == strings.TrimSuffix(serviceEnum, ".") || serviceType(ptr.Hdr.Name) == "" {
+				continue // the enum PTR, or an owner that isn't a service type
+			}
+			out = append(out, ptr.Ptr)
+		}
+	}
+	return out
 }
 
 // parseServiceTypes returns the "_app._proto" service types listed in a service-type
