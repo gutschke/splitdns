@@ -39,6 +39,7 @@ func post(t *testing.T, base, path string, form url.Values, header map[string]st
 	}
 	req, _ := http.NewRequest(http.MethodPost, base+path, body)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-Diag-Control", "1") // CSRF token the in-page fetch always sends
 	for k, v := range header {
 		req.Header.Set(k, v)
 	}
@@ -140,6 +141,30 @@ func TestControlCSRFRejected(t *testing.T) {
 	// same-origin (the in-page form) is allowed.
 	if code := post(t, base, "/control/flush-cache", nil, map[string]string{"Sec-Fetch-Site": "same-origin"}); code != http.StatusOK {
 		t.Errorf("same-origin POST: status = %d, want 200", code)
+	}
+}
+
+// A control POST lacking the X-Diag-Control header is refused even on a no-password
+// loopback bind. This is the layer that holds when Sec-Fetch-Site is absent (a
+// cross-site simple form cannot set a custom header; a cross-origin fetch that tries
+// is stopped by the unanswered CORS preflight).
+func TestControlRequiresCSRFHeader(t *testing.T) {
+	base, flushed, stop := ctlServer(t, Controls{AllowControl: true}, true)
+	defer stop()
+	req, _ := http.NewRequest(http.MethodPost, base+"/control/flush-cache", nil)
+	// deliberately NO X-Diag-Control header, and no Sec-Fetch-Site (models a
+	// non-browser or edge client the header-1 check alone would admit)
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("missing X-Diag-Control: status = %d, want 403", resp.StatusCode)
+	}
+	if flushed.Load() != 0 {
+		t.Errorf("request without CSRF header must not run the action")
 	}
 }
 

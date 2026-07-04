@@ -2,6 +2,8 @@ package mdns
 
 import (
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/miekg/dns"
 )
@@ -15,7 +17,15 @@ import (
 // configured), so callers can use it unconditionally.
 type SigVerifier struct {
 	secrets map[string]string // canonical key name (lowercase, trailing dot) -> base64 secret
+	mu      sync.Mutex
+	seen    map[string]time.Time // accepted TSIG MAC -> first-seen; anti-replay within the window
+	now     func() time.Time     // injectable clock (tests)
 }
+
+// tsigSeenCap bounds the anti-replay set. It only ever holds legitimate, unspoofable MACs
+// (an attacker without the secret cannot mint new ones), so it grows only with genuine
+// announcement traffic and is pruned by the retention window; the cap is a safety ceiling.
+const tsigSeenCap = 1024
 
 // NewSigVerifier builds a verifier from a canonical-name -> base64-secret map (as
 // produced by config.DDNSConfig.TSIGKeyset). An empty map yields nil so the common
@@ -28,7 +38,7 @@ func NewSigVerifier(secrets map[string]string) *SigVerifier {
 	for k, v := range secrets {
 		cp[canonKeyName(k)] = v
 	}
-	return &SigVerifier{secrets: cp}
+	return &SigVerifier{secrets: cp, seen: map[string]time.Time{}, now: time.Now}
 }
 
 // Verify reports whether b is a TSIG-signed announcement with a valid MAC for one of
@@ -56,8 +66,46 @@ func (v *SigVerifier) Verify(b []byte) bool {
 		return false
 	}
 	// requestMAC="" (an unsolicited announcement, not a query response); timersOnly=false.
-	// TsigVerify also enforces the signed-time/fudge window, bounding replay.
-	return dns.TsigVerify(b, secret, "", false) == nil
+	// TsigVerify enforces the signed-time/fudge window, bounding how old a replay can be.
+	if dns.TsigVerify(b, secret, "", false) != nil {
+		return false
+	}
+	// Anti-replay: within the fudge window an on-path attacker can re-send a captured
+	// valid packet to re-assert a (possibly stale) address set for an eligible host. Each
+	// signature's MAC is unique and unspoofable (no secret => no new MAC), so reject any
+	// MAC already accepted inside the retention window.
+	return v.freshMAC(t.MAC, time.Duration(t.Fudge)*time.Second)
+}
+
+// freshMAC returns true the FIRST time a given TSIG MAC is seen and false for any repeat
+// within the retention window (a replay). Retention is derived from the packet's own fudge
+// (covering the +/- skew TsigVerify allows), clamped to a sane floor/ceiling.
+func (v *SigVerifier) freshMAC(mac string, fudge time.Duration) bool {
+	if mac == "" {
+		return false
+	}
+	retain := 2 * fudge
+	if retain < 30*time.Second {
+		retain = 30 * time.Second
+	}
+	if retain > 10*time.Minute {
+		retain = 10 * time.Minute
+	}
+	now := v.now()
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	for k, ts := range v.seen { // prune expired (cheap: only genuine MACs ever land here)
+		if now.Sub(ts) > retain {
+			delete(v.seen, k)
+		}
+	}
+	if _, dup := v.seen[mac]; dup {
+		return false // replay of an already-accepted signature
+	}
+	if len(v.seen) < tsigSeenCap {
+		v.seen[mac] = now
+	}
+	return true
 }
 
 // canonKeyName matches config.CanonicalTSIGName without importing config (which would

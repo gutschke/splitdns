@@ -47,6 +47,7 @@ func TestUnixSocketBind(t *testing.T) {
 	}
 	// Control works WITHOUT a password (unix counts as loopback).
 	req, _ := http.NewRequest("POST", "http://unix/control/flush-cache", nil)
+	req.Header.Set("X-Diag-Control", "1") // CSRF token the in-page fetch always sends
 	cr, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("control over unix: %v", err)

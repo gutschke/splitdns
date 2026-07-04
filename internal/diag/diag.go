@@ -710,11 +710,21 @@ func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "control actions are POST-only", http.StatusMethodNotAllowed)
 		return
 	}
-	// CSRF defense (Fetch Metadata): a cross-site (or same-site/subdomain) browser form
-	// carries Sec-Fetch-Site != same-origin; reject it. Non-browser clients (curl) omit
-	// the header, and the in-page same-origin form sends "same-origin", so both pass.
+	// CSRF defense, two independent layers (both required):
+	//   1. Fetch Metadata: reject a cross-site browser request outright.
+	//   2. A custom request header the in-page fetch sets on every control call. A
+	//      cross-site <form> POST cannot set it, and a cross-origin fetch that tries
+	//      triggers a CORS preflight this daemon never answers — so it holds even when
+	//      Sec-Fetch-Site is absent (older/edge clients or a non-browser coaxed into
+	//      POSTing), which layer 1 alone would admit. This is what actually guards the
+	//      default loopback/no-password posture, where being loopback is otherwise the
+	//      only gate. Non-browser callers (curl) must send `X-Diag-Control: 1`.
 	if sfs := r.Header.Get("Sec-Fetch-Site"); sfs != "" && sfs != "same-origin" && sfs != "none" {
 		http.Error(w, "cross-site control request refused", http.StatusForbidden)
+		return
+	}
+	if r.Header.Get("X-Diag-Control") != "1" {
+		http.Error(w, "control requests require the X-Diag-Control: 1 header", http.StatusForbidden)
 		return
 	}
 	if code, msg := s.controlAuthorized(r); code != http.StatusOK {
@@ -867,7 +877,7 @@ func (s *Server) controlRateOK(action string) bool {
 	}
 	s.ctlMu.Lock()
 	defer s.ctlMu.Unlock()
-	now := time.Now()
+	now := s.now()
 	if last, ok := s.ctlLast[action]; ok && now.Sub(last) < iv {
 		return false
 	}
@@ -1573,7 +1583,12 @@ table.sortable thead th{position:sticky;top:calc(var(--topbar-h) + 1.9rem);backg
 .hostmeta{white-space:normal;font-size:.82rem;color:#8a8a8a;font-weight:normal} /* full-width mDNS meta sub-line (colspan cell) */
 tr.metarow td{padding-top:0} /* hug the host row above */
 tr.hostrow:has(+ .metarow) td{border-bottom:0} /* data row + its meta row read as one entry */
-tr.hostrow[title]{cursor:help} /* whole-row hover reveals the MAC/scope/TXT detail */
+tr.hostrow[data-tip]{cursor:help} /* whole-row hover reveals the MAC/scope/TXT detail */
+/* Open-coded tooltip: the native title= truncates long multi-line detail (TXT records)
+   in some browsers; this floating box does not. Driven by the [data-tip] handler below. */
+#tt{position:fixed;display:none;z-index:1000;max-width:min(560px,90vw);white-space:pre-wrap;
+overflow-wrap:anywhere;background:#282828;color:#f0f0f0;border:1px solid #555;border-radius:4px;
+padding:6px 9px;font:12px/1.4 ui-monospace,monospace;box-shadow:0 2px 12px rgba(0,0,0,.35);pointer-events:none}
 #cfgtext{background:#f6f6f6;padding:.6rem;border-radius:4px;white-space:pre;font:12px/1.35 ui-monospace,monospace;color:#333}
 /* control-action feedback + lock affordances (see the control JS) */
 .ctl-msg{font-size:.85rem;margin-left:.4rem;font-variant-numeric:tabular-nums}
@@ -1593,6 +1608,7 @@ details.zone{margin:.3rem 0} details.zone>summary{font-weight:600;color:#222}
   details{display:block} details>summary{display:none} details>*{display:block!important}
 }
 </style></head><body>
+<div id="tt" role="tooltip"></div>
 <header id="status">
 <h1>splitdnsd diagnostics <span class="muted">{{.Version}}</span></h1>
 <p>Built {{.BuiltAt}} — Cloudflare mirror:
@@ -1768,7 +1784,7 @@ transport <select name="transport"><option value="do53">Do53 (UDP)</option><opti
 <p class="muted">badge <span class="badge">id</span> marks a machine/instance id (container, VM, or a device with no friendly hostname). The muted line under a host shows its hardware vendor and Bonjour/DNS-SD services (hover for MAC/scope).</p>
 {{if .OnDemand}}<p class="muted" data-live="on_demand"><span data-f="od">on-demand mDNS: {{.OnDemand.Emitted}} emitted · {{.OnDemand.Hits}} found · {{.OnDemand.Suppressed}} suppressed · {{.OnDemand.RateLimited}} rate-limited · {{.OnDemand.CapFull}} cap-full · {{.OnDemand.InFlight}} in-flight</span></p>{{end}}
 <div data-live="mdns_forward"><table><tbody>
-{{range .MDNSFwd}}<tr data-key="{{.Name}}" class="hostrow"{{if .Detail}} title="{{.Detail}}"{{end}}><td data-f="name">{{.Name}}{{if .Kind}} <span class="badge">{{.Kind}}</span>{{end}}</td><td data-f="records">{{range $i, $r := .Records}}{{if $i}}; {{end}}{{$r}}{{end}}</td></tr>{{if and $.HasEnrich .Meta}}<tr data-key="{{.Name}}#meta" class="hostrow metarow"{{if .Detail}} title="{{.Detail}}"{{end}}><td class="hostmeta" data-f="meta" colspan="2">{{.Meta}}</td></tr>{{end}}{{end}}
+{{range .MDNSFwd}}<tr data-key="{{.Name}}" class="hostrow"{{if .Detail}} data-tip="{{.Detail}}"{{end}}><td data-f="name">{{.Name}}{{if .Kind}} <span class="badge">{{.Kind}}</span>{{end}}</td><td data-f="records">{{range $i, $r := .Records}}{{if $i}}; {{end}}{{$r}}{{end}}</td></tr>{{if and $.HasEnrich .Meta}}<tr data-key="{{.Name}}#meta" class="hostrow metarow"{{if .Detail}} data-tip="{{.Detail}}"{{end}}><td class="hostmeta" data-f="meta" colspan="2">{{.Meta}}</td></tr>{{end}}{{end}}
 </tbody></table></div></details>
 <details><summary>mDNS reverse</summary><div data-live="mdns_reverse"><table><tbody>
 {{range .MDNSRev}}<tr data-key="{{.Name}}"><td data-f="name">{{.Name}}</td><td data-f="records">{{range $i, $r := .Records}}{{if $i}}; {{end}}{{$r}}{{end}}</td></tr>{{end}}
@@ -1888,7 +1904,7 @@ transport <select name="transport"><option value="do53">Do53 (UDP)</option><opti
   // service cells (eager enrichment); reverse rows are name + records only.
   function mdnsRecords(tr, x){ patchText(fcell(tr, 'records'), (x.records || []).join('; ')); }
   function nameCell(nc, x){ nc.textContent = x.name; if(x.kind){ nc.appendChild(document.createTextNode(' ')); var b = document.createElement('span'); b.className = 'badge'; b.textContent = x.kind; nc.appendChild(b); } }
-  function rowTitle(tr, x){ if(hasEnrich && x.detail){ tr.title = x.detail; } else { tr.removeAttribute('title'); } }
+  function rowTitle(tr, x){ if(hasEnrich && x.detail){ tr.setAttribute('data-tip', x.detail); } else { tr.removeAttribute('data-tip'); } }
   function makeMDNSFwd(x){ var tr = document.createElement('tr'); tr.className = 'hostrow'; tr.innerHTML = '<td data-f="name"></td><td data-f="records"></td>'; nameCell(fcell(tr, 'name'), x); mdnsRecords(tr, x); return tr; }
   function makeMDNSRev(x){ var tr = document.createElement('tr'); tr.innerHTML = '<td data-f="name"></td><td data-f="records"></td>'; nameCell(fcell(tr, 'name'), x); mdnsRecords(tr, x); return tr; }
   // mDNS forward: each host is a data row (name|records) plus, when enriched, a FULL-WIDTH
@@ -2061,7 +2077,7 @@ transport <select name="transport"><option value="do53">Do53 (UDP)</option><opti
   function showPwErr(msg){ if(pwErr) pwErr.textContent = msg || ''; if(pwInput){ if(msg) pwInput.setAttribute('aria-invalid','true'); else pwInput.removeAttribute('aria-invalid'); } }
   function focusField(){ if(!pwInput) return; var sec = document.getElementById('controls'); if(sec) sec.scrollIntoView({ block: 'nearest' }); pwInput.focus(); pwInput.classList.add('flash'); setTimeout(function(){ pwInput.classList.remove('flash'); }, 700); }
   // verify against the side-effect-free probe so Unlock confirms immediately; cb(ok, status).
-  function verify(pw, cb){ fetch('/control/verify', { method: 'POST', headers: { 'X-Diag-Password': pw } }).then(function(r){ cb(r.status === 200, r.status); }).catch(function(){ cb(false, 0); }); }
+  function verify(pw, cb){ fetch('/control/verify', { method: 'POST', headers: { 'X-Diag-Control': '1', 'X-Diag-Password': pw } }).then(function(r){ cb(r.status === 200, r.status); }).catch(function(){ cb(false, 0); }); }
 
   if(pwForm){ pwForm.addEventListener('submit', function(e){
     e.preventDefault();
@@ -2091,7 +2107,7 @@ transport <select name="transport"><option value="do53">Do53 (UDP)</option><opti
     if(needPw && !stagedPw){ setSlot(btn, 'unlock first ↑', 'muted'); focusField(); return; } // locked: route to the field
     if(btn.dataset.confirm && !confirm(btn.dataset.confirm)) return; // a confirmation, not a result alert
     var q = ''; if(btn.dataset.op){ q = 'op=' + encodeURIComponent(btn.dataset.op); if(btn.dataset.addr) q += '&addr=' + encodeURIComponent(btn.dataset.addr); }
-    var headers = {}; if(needPw) headers['X-Diag-Password'] = stagedPw;
+    var headers = { 'X-Diag-Control': '1' }; if(needPw) headers['X-Diag-Password'] = stagedPw;
     btn.disabled = true; btn.setAttribute('aria-busy', 'true'); setSlot(btn, 'working…', 'muted'); // persists until resolved: "slow" is unambiguous
     var done = function(){ btn.disabled = false; btn.removeAttribute('aria-busy'); };
     fetch('/control/' + btn.dataset.action + (q ? '?' + q : ''), { method: 'POST', headers: headers }).then(function(r){
@@ -2129,6 +2145,27 @@ transport <select name="transport"><option value="do53">Do53 (UDP)</option><opti
       .then(function(t){ document.getElementById('cfgtext').textContent = t; })
       .catch(function(e){ cfgP.dataset.loaded = ''; document.getElementById('cfgtext').textContent = 'config unavailable (' + e + ')'; });
   }); }
+
+  // Open-coded tooltip for [data-tip] elements (replaces native title=, which some
+  // browsers truncate for long multi-line detail). textContent + white-space:pre-wrap
+  // keeps every TXT line; the box follows the cursor and stays on-screen.
+  (function(){
+    var tt = document.getElementById('tt');
+    function tipEl(n){ while(n && n !== document.body){ if(n.nodeType === 1 && n.hasAttribute('data-tip')) return n; n = n.parentNode; } return null; }
+    document.addEventListener('mouseover', function(e){
+      var el = tipEl(e.target);
+      if(el){ tt.textContent = el.getAttribute('data-tip'); tt.style.display = 'block'; }
+      else { tt.style.display = 'none'; }
+    });
+    document.addEventListener('mousemove', function(e){
+      if(tt.style.display !== 'block') return;
+      var x = e.clientX + 14, y = e.clientY + 16, w = tt.offsetWidth, h = tt.offsetHeight;
+      if(x + w > window.innerWidth - 8) x = window.innerWidth - w - 8;
+      if(y + h > window.innerHeight - 8) y = e.clientY - h - 12;
+      tt.style.left = Math.max(4, x) + 'px'; tt.style.top = Math.max(4, y) + 'px';
+    });
+    window.addEventListener('scroll', function(){ tt.style.display = 'none'; }, true);
+  })();
 
   poll(); // kick off live updates
 })();

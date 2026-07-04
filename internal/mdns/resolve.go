@@ -140,7 +140,24 @@ func (s *Source) odClientAllow(now time.Time, client netip.Addr) bool {
 		return true // no client key (e.g. internal caller) — global limit still applies
 	}
 	if len(s.odClients) > odTableCap {
-		s.odClients = map[netip.Addr]*odBucket{} // bound memory; cheap reset
+		// Evict IDLE buckets rather than wiping the whole map: a wholesale reset would
+		// let a flood from many (spoofable) source addresses clear every ACTIVE client's
+		// throttle. An idle bucket has long since refilled, so dropping it is
+		// behavior-neutral.
+		cutoff := now.Add(-odSuppressWindow)
+		for k, b := range s.odClients {
+			if b.last.Before(cutoff) {
+				delete(s.odClients, k)
+			}
+		}
+		// Pathological case (thousands of simultaneously-active sources): trim down to
+		// the cap WITHOUT wiping, so most survivors keep their throttle state.
+		for k := range s.odClients {
+			if len(s.odClients) <= odTableCap {
+				break
+			}
+			delete(s.odClients, k)
+		}
 	}
 	b := s.odClients[client]
 	if b == nil {

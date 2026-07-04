@@ -55,7 +55,7 @@ func TestMDNSForwardEnrichmentInline(t *testing.T) {
 	for _, want := range []string{
 		`class="hostrow"`, `class="hostmeta" data-f="meta" colspan="2"`,
 		"HP LaserJet MFP M281fdw", "IPP/AirPrint:631", "AirScan (eSCL)",
-		`title="aa:bb:cc:dd:ee:ff`, "rp=ipp/print",
+		`data-tip="aa:bb:cc:dd:ee:ff`, "rp=ipp/print",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("mDNS-forward render missing %q", want)

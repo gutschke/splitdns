@@ -86,6 +86,23 @@ func TestSigVerifier(t *testing.T) {
 	}
 }
 
+// A valid signed packet is accepted once; re-sending the exact bytes (an on-path replay
+// within the fudge window) is rejected.
+func TestSigVerifierReplay(t *testing.T) {
+	const (
+		key    = "splitdns-notify."
+		secret = "aGVsbG8td29ybGQtdGhpcy1pcy1hLXRlc3Qta2V5MTIzNA=="
+	)
+	v := NewSigVerifier(map[string]string{key: secret})
+	pkt := signed(t, key, secret, dns.HmacSHA256, "edge.local.", netip.MustParseAddr("203.0.113.7"), time.Now().Unix())
+	if !v.Verify(pkt) {
+		t.Fatal("first receipt of a valid signature should verify")
+	}
+	if v.Verify(pkt) {
+		t.Error("replay of the same signed packet must be rejected")
+	}
+}
+
 // NewSigVerifier returns nil for an empty key set so the hot path is a cheap nil check.
 func TestNewSigVerifierEmpty(t *testing.T) {
 	if NewSigVerifier(nil) != nil {
