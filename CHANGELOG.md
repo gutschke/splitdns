@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-07-04
+
 ### splitdns-notify relay
 - `splitdns-notify --listen` runs as a small socket-activated relay: it reads
   `<host> <addr>...` datagrams from a unix socket and performs the signed announce for each,
