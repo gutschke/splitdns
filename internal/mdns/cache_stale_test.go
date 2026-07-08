@@ -15,7 +15,7 @@ func TestServeStaleAndGoodbye(t *testing.T) {
 	c.goodbyeGrace = 30 * time.Second
 	base := time.Unix(1_000_000, 0)
 	ann := func(host, ip string, ttl uint32, at time.Time) {
-		c.Apply(Announcement{Host: host, Addrs: []netip.Addr{netip.MustParseAddr(ip)}, TTL: ttl}, at, false)
+		c.Apply(Announcement{Host: host, Addrs: []netip.Addr{netip.MustParseAddr(ip)}, TTL: ttl}, at, TrustNone)
 	}
 
 	ann("h", "10.0.0.5", 120, base)

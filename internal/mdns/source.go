@@ -65,6 +65,19 @@ func WithServiceDiscovery(every time.Duration) Option {
 	return func(s *Source) { s.queryEvery = every }
 }
 
+// WithTrustedStore configures the persistent trusted-allocation store: grace is how long a
+// trusted entry survives without a refresh (0 = hold until an explicit trusted withdrawal),
+// and max bounds the store (0 keeps the default). Only TrustStrong (TSIG/peer-cred)
+// announcements populate it.
+func WithTrustedStore(grace time.Duration, max int) Option {
+	return func(s *Source) {
+		s.cache.trustedGrace = grace
+		if max > 0 {
+			s.cache.maxTrusted = max
+		}
+	}
+}
+
 // WithOnDemand enables on-demand resolution (Source.Resolve) with the given per-query wait.
 // A sender must also be wired for queries to go out. Off when not set.
 func WithOnDemand(wait time.Duration) Option {
@@ -169,15 +182,15 @@ func (s *Source) PokeDiscovery() {
 }
 
 // HandlePacket parses raw mDNS bytes and folds every announcement into the cache,
-// republishing the view if anything changed. trusted controls whether these
-// announcements may trigger DDNS write-back (D7); the view is updated either way.
-// Safe for concurrent callers.
-func (s *Source) HandlePacket(b []byte, trusted bool) {
+// republishing the view if anything changed. trust controls the side effects: DDNS
+// write-back (>= TrustWeak) and the persistent trusted store (TrustStrong); the volatile
+// view is updated either way. Safe for concurrent callers.
+func (s *Source) HandlePacket(b []byte, trust Trust) {
 	now := s.now()
 	changed := false
 	var hosts []string
 	for _, a := range ParsePacket(b) {
-		if s.cache.Apply(a, now, trusted) {
+		if s.cache.Apply(a, now, trust) {
 			changed = true
 			// Wake an on-demand waiter ONLY for a host that genuinely landed in the view
 			// (Apply==true) — never on a no-op re-announcement, so a waiter can't be woken

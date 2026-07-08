@@ -39,6 +39,13 @@ type RR struct {
 	RecordID  string `json:"record_id,omitempty"`
 	Proxied   bool   `json:"proxied,omitempty"`
 	Synthetic bool   `json:"synthetic,omitempty"` // HTTPS/SVCB/tunnel via sidecar (§2.5)
+
+	// Trusted marks an mDNS-view address that arrived via the TRUSTED notification channel
+	// (TSIG signature / unix peer-cred), as opposed to a self-announced multicast address.
+	// This one flag IS read on the hot path — by the local-plane resolver — to serve
+	// restricted (vhost/DDNS) names from the trusted tier only, and to prefer trusted
+	// addresses. View-only: never populated for CF-zone records and never serialized.
+	Trusted bool `json:"-"`
 }
 
 // RDATA returns the canonical wire-form RDATA presentation for the record. For

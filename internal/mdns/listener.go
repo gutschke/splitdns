@@ -155,17 +155,21 @@ func (l *Listener) readLoop(uc *net.UDPConn) {
 		if err != nil {
 			return // connection closed
 		}
-		// Decide whether this packet may trigger DDNS write-back (D7). A valid TSIG
-		// signature is authoritative regardless of source IP (cannot be spoofed); the
-		// source-IP allowlist is a weaker fallback, disabled when requireSig is set.
-		// Everything else still updates the *.local view but is inert for write-back.
-		trusted := l.verify.Verify(buf[:n])
-		if !trusted && !l.requireSig && src != nil {
-			if a, ok := netip.AddrFromSlice(src.IP); ok {
-				trusted = l.trusted(a.Unmap())
+		// Grade the packet's trust tier. A valid TSIG signature is STRONG (authoritative
+		// regardless of source IP, cannot be spoofed) — it may both trigger DDNS write-back
+		// AND mint a persistent trusted-store entry. The source-IP allowlist is only WEAK
+		// (spoofable UDP): it may trigger write-back but MUST NOT earn a trusted-view entry,
+		// which is persistent and resolution-authoritative. Disabled entirely when requireSig
+		// is set. Everything else still updates the volatile *.local view.
+		trust := TrustNone
+		if l.verify.Verify(buf[:n]) {
+			trust = TrustStrong
+		} else if !l.requireSig && src != nil {
+			if a, ok := netip.AddrFromSlice(src.IP); ok && l.trusted(a.Unmap()) {
+				trust = TrustWeak
 			}
 		}
-		l.src.HandlePacket(buf[:n], trusted)
+		l.src.HandlePacket(buf[:n], trust)
 	}
 }
 

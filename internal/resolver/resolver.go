@@ -319,19 +319,29 @@ func answerLocal(snap *model.Snapshot, view *model.MDNSView, req *dns.Msg, name,
 			return out
 		}
 	}
-	recs, exists := view.Forward[label]
-	if !exists {
-		// Unknown LAN host: NXDOMAIN (mDNS carries no SOA, so none in AUTHORITY).
+	// Recover the bare host: a pure host.lan/host.local, or a search-list artifact that also
+	// carries a managed-zone label (host.example.com.lan). Not a single host => does not exist.
+	host, _, ok := recoverLocalHost(snap, name)
+	if !ok {
+		resp.Rcode = dns.RcodeNameError // mDNS carries no SOA, so none in AUTHORITY
+		return Outcome{Msg: resp}
+	}
+	// Trust policy: a restricted (vhost/DDNS) name serves the trusted tier only; else
+	// trusted-preferred. The queried name is NOT under a managed apex here (rightmost label is
+	// .local/.<localdomain>), so no zone scope filter and no SOA on negatives.
+	v4, v6, restricted := localHostAddrs(snap, view, host, false)
+	if len(v4) == 0 && len(v6) == 0 {
 		resp.Rcode = dns.RcodeNameError
 		out := Outcome{Msg: resp}
-		// Signal the server it MAY solicit this host over mDNS — but only for a plausible
-		// bare hostname (not a service-type/underscore label) and an address query.
-		if !strings.HasPrefix(label, "_") && (qtype == dns.TypeA || qtype == dns.TypeAAAA || qtype == dns.TypeANY) {
-			out.LocalMiss, out.LocalLabel = true, label
+		// Signal the server it MAY solicit this host over mDNS — an address query for a plain
+		// host that is NOT restricted (never solicit a managed name; a solicited self-announced
+		// reply would not be served for it anyway).
+		if !restricted && (qtype == dns.TypeA || qtype == dns.TypeAAAA || qtype == dns.TypeANY) {
+			out.LocalMiss, out.LocalLabel = true, host
 		}
 		return out
 	}
-	appendMatching(resp, recs, name, qtype) // NODATA if the host lacks this family
+	fillLocalAddrs(resp, name, qtype, v4, v6) // NODATA (no SOA) if the host lacks this family
 	return Outcome{Msg: resp}
 }
 
@@ -366,8 +376,189 @@ func answerZoneOrVHost(snap *model.Snapshot, view *model.MDNSView, req *dns.Msg,
 			return Outcome{Msg: mdnsZoneReply(zone, req, name, owner, qtype, local)}
 		}
 	}
+	// Step 6c — local-plane search-list collision recovery (trust-aware). A managed-zone name
+	// that also carries a .lan/.local label (e.g. host.lan.example.com) is a client
+	// search-list artifact: the stub tried host.lan (NXDOMAIN, host down), then re-appended
+	// the search domain. Synthesizing the public wildcard here would hand a LAN client an
+	// off-net address for a name it meant locally (the reported "ping host.lan -> public IP"
+	// bug). Serve it from the local plane instead, under the queried name and NEVER the
+	// wildcard: a restricted (vhost/DDNS) name from the TRUSTED tier only (a self-announced
+	// spoof can't shadow it), else trusted-preferred. Site-local addresses only — the queried
+	// name IS under the managed apex, so a public address here would land in its namespace. An
+	// exact published record/ENT at the owner still wins (operator intent).
+	if zone != nil && view != nil {
+		if host, tainted, ok := recoverLocalHost(snap, name); tainted &&
+			zone.Records[owner] == nil && zone.TunnelAddr[owner] == nil && !zone.ENT[owner] {
+			if ok {
+				return Outcome{Msg: localRecoveredZoneReply(snap, view, req, name, host, qtype, zone)}
+			}
+			// Tainted (a .lan/.local label) but not a single recoverable host (e.g. multi-label
+			// a.b.lan.<zone>): the name has no local meaning and must NOT fall to the public
+			// wildcard. Authoritative NXDOMAIN with the zone SOA.
+			return Outcome{Msg: nxdomainZoneSOA(req, zone)}
+		}
+	}
 	// Step 7 — authoritative CF zone.
 	return Outcome{Msg: answerAuthoritative(req, zone, name, owner, qtype)}
+}
+
+// nxdomainZoneSOA returns an authoritative NXDOMAIN carrying the zone SOA in AUTHORITY for
+// RFC-2308 negative caching.
+func nxdomainZoneSOA(req *dns.Msg, zone *model.Zone) *dns.Msg {
+	resp := reply(req)
+	resp.Authoritative = true
+	setNegativeSOA(resp, zone.SOA, zone.Apex, dns.RcodeNameError)
+	return resp
+}
+
+// recoverLocalHost recovers the bare host label a query MEANT, by stripping a trailing run of
+// label-aligned local/zone suffixes — .local, the configured local domain (e.g. .lan), and
+// any managed-zone apex — one complete member per step, bounded. It returns the single
+// remaining host label; tainted reports whether a .local/.<localdomain> label was among those
+// stripped (=> local-plane semantics: trusted-only for restricted names, never the public
+// wildcard). ok is false unless exactly one non-reserved, non-underscore label remains after
+// at least one strip — so a legitimate multi-label managed name (a.b.example.com) is left
+// untouched and a bare name is never mis-recovered. All matching is label-aligned, so "wlan"
+// never matches ".lan".
+func recoverLocalHost(snap *model.Snapshot, name string) (host string, tainted, ok bool) {
+	cur := name
+	stripped := false
+	for i := 0; i < 8; i++ { // bounded: each pass removes >=1 label from a finite name
+		if h, did := stripMember(cur, "local"); did {
+			cur, tainted, stripped = h, true, true
+			continue
+		}
+		if d := snap.LocalDomain; d != "" {
+			if h, did := stripMember(cur, d); did {
+				cur, tainted, stripped = h, true, true
+				continue
+			}
+		}
+		if apex := longestZoneSuffix(cur, snap.Zones); apex != "" {
+			if h, did := stripMember(cur, strings.TrimSuffix(apex, ".")); did {
+				cur, stripped = h, true
+				continue
+			}
+		}
+		break
+	}
+	if !stripped {
+		return "", false, false
+	}
+	label := strings.TrimSuffix(cur, ".")
+	if label == "" || strings.Contains(label, ".") || strings.HasPrefix(label, "_") {
+		return "", tainted, false // must be exactly one non-underscore label
+	}
+	if label == "local" || (snap.LocalDomain != "" && label == snap.LocalDomain) {
+		return "", tainted, false // a bare local-suffix label, no host
+	}
+	return label, tainted, true
+}
+
+// stripMember removes a single label-aligned suffix member (a label or multi-label apex,
+// WITHOUT trailing dot, e.g. "lan" or "example.com") from an FQDN (with trailing dot),
+// preserving FQDN form: "host.lan.example.com." with "example.com" -> "host.lan.". Reports
+// whether it matched. Requires a host label before the member (the bare member itself does
+// not match), so a name that is ONLY the member is never stripped to empty.
+func stripMember(fqdn, member string) (string, bool) {
+	m := member + "."
+	if strings.HasSuffix(fqdn, "."+m) {
+		return fqdn[:len(fqdn)-len(m)], true
+	}
+	return fqdn, false
+}
+
+// restrictedLabel reports whether a host label is a "restricted" (managed) name: a vhost, the
+// www/apex redirect label, or DDNS-eligible under any managed zone. A restricted name is
+// served on the local plane from the TRUSTED tier only, so a self-announced mDNS spoof can
+// never place an address for it (the spelling — .lan, .lan.<zone>, etc. — does not matter).
+func restrictedLabel(snap *model.Snapshot, host string) bool {
+	if host == "www" || snap.VHosts[host] {
+		return true
+	}
+	for apex := range snap.Zones {
+		if snap.DDNSEligible[host+"."+apex] {
+			return true
+		}
+	}
+	return false
+}
+
+// localServeAddrs returns the servable local-plane addresses of one family for a host, per
+// the trust policy: trusted-tier addresses if any (preferred); otherwise, for an UNrestricted
+// name, the self-announced ones; for a restricted name, nothing (trusted tier only, so a
+// self-announced spoof cannot surface). localScopeOnly additionally drops non-site-local
+// addresses (used where the queried name is under a managed apex, so a public address would
+// leak into the public namespace); the pure .local/.lan plane serves any servable address.
+func localServeAddrs(view *model.MDNSView, host string, qtype uint16, restricted, localScopeOnly bool) []model.RR {
+	var trusted, self []model.RR
+	for _, r := range view.Forward[host] {
+		if r.Type != qtype {
+			continue
+		}
+		ip, err := netip.ParseAddr(r.Content)
+		if err != nil || !isServable(ip) || (localScopeOnly && !isLocalScope(ip)) {
+			continue
+		}
+		if r.Trusted {
+			trusted = append(trusted, r)
+		} else {
+			self = append(self, r)
+		}
+	}
+	if len(trusted) > 0 {
+		return trusted
+	}
+	if restricted {
+		return nil
+	}
+	return self
+}
+
+// localHostAddrs returns a recovered host's servable A and AAAA records (trust- and
+// scope-filtered) plus whether the name is restricted (for the on-demand-solicit gate).
+func localHostAddrs(snap *model.Snapshot, view *model.MDNSView, host string, localScopeOnly bool) (v4, v6 []model.RR, restricted bool) {
+	restricted = restrictedLabel(snap, host)
+	if view == nil {
+		return nil, nil, restricted
+	}
+	v4 = localServeAddrs(view, host, dns.TypeA, restricted, localScopeOnly)
+	v6 = localServeAddrs(view, host, dns.TypeAAAA, restricted, localScopeOnly)
+	return v4, v6, restricted
+}
+
+// fillLocalAddrs appends the address answer(s) for qtype (functional ANY = both families),
+// owned by name. Non-address types append nothing (the caller renders NODATA).
+func fillLocalAddrs(resp *dns.Msg, name string, qtype uint16, v4, v6 []model.RR) {
+	switch qtype {
+	case dns.TypeA:
+		appendMatching(resp, v4, name, dns.TypeA)
+	case dns.TypeAAAA:
+		appendMatching(resp, v6, name, dns.TypeAAAA)
+	case dns.TypeANY:
+		appendMatching(resp, v4, name, dns.TypeA)
+		appendMatching(resp, v6, name, dns.TypeAAAA)
+	}
+}
+
+// localRecoveredZoneReply serves a recovered host under a managed-zone (queried) name — the
+// search-list-collision spelling host.lan.<zone>. Existence-consistent per RFC 2308/8020: if
+// the host has any servable site-local address the name EXISTS (address answers; other qtypes
+// and a missing family => NODATA), else it does not (NXDOMAIN for every qtype). Negatives
+// carry the zone SOA (the queried name is under the managed apex). Never the public wildcard.
+func localRecoveredZoneReply(snap *model.Snapshot, view *model.MDNSView, req *dns.Msg, name, host string, qtype uint16, zone *model.Zone) *dns.Msg {
+	resp := reply(req)
+	resp.Authoritative = true
+	v4, v6, _ := localHostAddrs(snap, view, host, true) // under the apex => site-local only
+	if len(v4) == 0 && len(v6) == 0 {
+		setNegativeSOA(resp, zone.SOA, zone.Apex, dns.RcodeNameError)
+		return resp
+	}
+	fillLocalAddrs(resp, name, qtype, v4, v6)
+	if len(resp.Answer) == 0 {
+		setNegativeSOA(resp, zone.SOA, zone.Apex, dns.RcodeSuccess) // NODATA — the name exists
+	}
+	return resp
 }
 
 // isVHostCandidate implements the §2.4 step-6 gate: ≤1 relative label, zone not an

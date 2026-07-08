@@ -6,6 +6,29 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Local plane: trust tiers + search-collision recovery
+- **Trusted vs self-announced mDNS.** The per-packet trust already computed at ingest (a
+  valid TSIG signature or a unix-socket peer-cred = *strong*; a `trusted_sources` source IP =
+  *weak*, spoofable) is now carried into the local view. A **strong** announcement (the notify
+  channel pushing static allocations) creates a persistent, shadow-immune *trusted* entry that
+  **survives host-down** — it is configuration, not a liveness signal — and is removed only by
+  an explicit trusted withdrawal or the new `[mdns] trusted_grace` cap (default 7d; `0` = hold
+  forever). A weak source-IP announcement keeps only its historical DDNS-trigger role; it can
+  no longer mint a persistent view entry. New `[mdns] max_trusted` (default 1024) bounds the
+  store independently of the volatile-cache LRU. An untrusted announcement (or spoofed goodbye)
+  can neither evict nor downgrade a trusted address.
+- **Search-list collision recovery.** A query that carries the local domain or `.local` as a
+  label together with a managed zone — `host.lan.example.com`, `host.example.com.lan` (any
+  order) — is a client search-list artifact (the stub re-appended its search domain after
+  `host.lan` NXDOMAINed). It is now resolved from the **local plane** under the queried name,
+  never the zone's public wildcard: the reported "`ping host.lan` → public IP" leak is closed.
+  A **restricted** name (a vhost or a DDNS-eligible name) is served from the **trusted tier
+  only**, so a self-announced mDNS spoof can never place an address for it under the public
+  namespace; an unrestricted name resolves to its self-announced address on every spelling
+  (the accepted mDNS collision risk). Under a managed apex only site-local addresses are
+  served (no public address leaks into the zone's namespace). Answers are existence-consistent
+  (RFC 2308/8020) and carry the zone SOA only when the queried name is actually under the apex.
+
 ## [0.2.2] — 2026-07-04
 
 ### Fixed

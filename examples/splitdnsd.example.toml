@@ -98,6 +98,17 @@ resolve_on_demand_wait = "300ms"   # how long to wait for a reply (clamped 50ms.
 # by unicast, including across VLANs where multicast doesn't reach. Read-only projection of
 # the cache — it never sends a query. Set false to serve only A/AAAA on the local domain.
 serve_dnssd = true
+# Trusted static allocations. An mDNS announcement that arrives with a valid TSIG signature or
+# over the authenticated unix socket (the notify channel that pushes your DHCP reservations) is
+# TRUSTED: it is served even when the host is powered off (a static allocation is configuration,
+# not a liveness signal) and CANNOT be shadowed by a self-announced multicast address — so a
+# restricted name (a vhost or a DDNS-eligible name) resolves on the LAN only to its trusted
+# address. A spoofable trusted_sources source IP does NOT qualify (it keeps only its DDNS-trigger
+# role). trusted_grace bounds how long a trusted entry is kept without a refresh — a backstop for
+# a notify channel that vanishes without a withdrawal; "0" holds until an explicit trusted
+# withdrawal. max_trusted bounds the store (independent of the volatile-cache limit).
+trusted_grace = "168h"   # 7 days; "0" = hold until explicit trusted withdrawal
+max_trusted = 1024
 
 [vhost]
 # Reverse-proxy redirect (any product: nginx, Caddy, Traefik, ...): naked domain / www / vhosts.

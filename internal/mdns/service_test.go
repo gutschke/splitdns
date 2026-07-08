@@ -38,7 +38,7 @@ func TestServiceCaptureIntoView(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	src.HandlePacket(b, false)
+	src.HandlePacket(b, TrustNone)
 
 	svcs := src.View().Services["printer"]
 	if len(svcs) != 2 || svcs[0].Type != "_http._tcp" || svcs[1].Type != "_ipp._tcp" {
@@ -67,7 +67,7 @@ func TestServiceCaptureFromAdditional(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	src.HandlePacket(b, false)
+	src.HandlePacket(b, TrustNone)
 	if svcs := src.View().Services["cast"]; len(svcs) != 1 || svcs[0].Type != "_googlecast._tcp" || svcs[0].Port != 8009 {
 		t.Errorf("services = %v, want [{_googlecast._tcp 8009}] (SRV was in Additional)", svcs)
 	}
@@ -85,7 +85,7 @@ func TestServiceTXTAndPort(t *testing.T) {
 		&dns.TXT{Hdr: dns.RR_Header{Name: "Office._ipp._tcp.local.", Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: 120}, Txt: []string{"rp=ipp/print", "ty=HP LaserJet MFP M281fdw"}},
 	}
 	b, _ := m.Pack()
-	src.HandlePacket(b, false)
+	src.HandlePacket(b, TrustNone)
 	v := src.View()
 	if svcs := v.Services["printer"]; len(svcs) != 1 || svcs[0].Port != 631 {
 		t.Errorf("services = %v, want a single service on port 631", svcs)

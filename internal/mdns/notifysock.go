@@ -237,7 +237,7 @@ func (n *NotifySocket) handle(conn *net.UnixConn) {
 	if len(b) == 0 {
 		return
 	}
-	n.src.HandlePacket(b, true) // authenticated peer ⇒ trusted DDNS trigger
+	n.src.HandlePacket(b, TrustStrong) // authenticated peer-cred ⇒ strong trust (DDNS + trusted store)
 }
 
 // Close stops the listener and removes the socket file.

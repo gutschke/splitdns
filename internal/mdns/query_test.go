@@ -88,7 +88,7 @@ func TestSourceServiceDiscovery(t *testing.T) {
 	resp.Response = true
 	resp.Answer = []dns.RR{&dns.PTR{Hdr: dns.RR_Header{Name: serviceEnum, Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: 120}, Ptr: "_customthing._tcp.local."}}
 	rb, _ := resp.Pack()
-	src.HandlePacket(rb, false)
+	src.HandlePacket(rb, TrustNone)
 
 	sent = nil
 	src.sendQuery()

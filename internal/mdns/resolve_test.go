@@ -31,7 +31,7 @@ func TestOnDemandCompletion(t *testing.T) {
 
 	go func() {
 		time.Sleep(30 * time.Millisecond)
-		src.HandlePacket(odAnnounce("printer", "10.0.0.9"), false)
+		src.HandlePacket(odAnnounce("printer", "10.0.0.9"), TrustNone)
 	}()
 	if !src.Resolve(context.Background(), "printer", netip.Addr{}) {
 		t.Error("Resolve should report the host appeared")
@@ -66,7 +66,7 @@ func TestOnDemandSingleFlight(t *testing.T) {
 		go func(i int) { defer wg.Done(); res[i] = src.Resolve(context.Background(), "nas", netip.Addr{}) }(i)
 	}
 	time.Sleep(40 * time.Millisecond)
-	src.HandlePacket(odAnnounce("nas", "10.0.0.5"), false)
+	src.HandlePacket(odAnnounce("nas", "10.0.0.5"), TrustNone)
 	wg.Wait()
 
 	if n := atomic.LoadInt32(&sent); n != 1 {

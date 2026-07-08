@@ -95,21 +95,21 @@ func TestCacheApplyChangeAndIdempotency(t *testing.T) {
 	c := NewCache(rec.fn)
 	t0 := time.Unix(1000, 0)
 
-	if !c.Apply(Announcement{Host: "edge", Addrs: ma("192.0.2.10"), TTL: 120}, t0, true) {
+	if !c.Apply(Announcement{Host: "edge", Addrs: ma("192.0.2.10"), TTL: 120}, t0, TrustWeak) {
 		t.Fatal("first apply should report change")
 	}
 	if rec.last() != "edge:192.0.2.10" {
 		t.Errorf("unexpected change event %q", rec.last())
 	}
 	// Same set again: no change, no new event.
-	if c.Apply(Announcement{Host: "edge", Addrs: ma("192.0.2.10"), TTL: 120}, t0.Add(time.Second), true) {
+	if c.Apply(Announcement{Host: "edge", Addrs: ma("192.0.2.10"), TTL: 120}, t0.Add(time.Second), TrustWeak) {
 		t.Error("identical apply should not report change")
 	}
 	if rec.count() != 1 {
 		t.Errorf("idempotent apply fired an extra event: %d", rec.count())
 	}
 	// New set after the burst window: replaces, fires change.
-	if !c.Apply(Announcement{Host: "edge", Addrs: ma("198.51.100.5"), TTL: 120}, t0.Add(10*time.Second), true) {
+	if !c.Apply(Announcement{Host: "edge", Addrs: ma("198.51.100.5"), TTL: 120}, t0.Add(10*time.Second), TrustWeak) {
 		t.Error("changed set should report change")
 	}
 	if rec.last() != "edge:198.51.100.5" {
@@ -122,7 +122,7 @@ func TestCacheApplyChangeAndIdempotency(t *testing.T) {
 func TestCacheTTLClamp(t *testing.T) {
 	c := NewCache(nil)
 	t0 := time.Unix(1000, 0)
-	c.Apply(Announcement{Host: "evil", Addrs: ma("192.0.2.10"), TTL: 999999}, t0, true)
+	c.Apply(Announcement{Host: "evil", Addrs: ma("192.0.2.10"), TTL: 999999}, t0, TrustWeak)
 	v := c.View(t0)
 	recs := v.Forward["evil"]
 	if len(recs) != 1 {
@@ -140,14 +140,14 @@ func TestCacheLRUEviction(t *testing.T) {
 	base := time.Unix(10000, 0)
 	// Fill to capacity; host i seen at base+i so "h0" is least-recently-seen.
 	for i := 0; i < maxHosts; i++ {
-		c.Apply(Announcement{Host: hostName(i), Addrs: ma("192.0.2.10"), TTL: 120}, base.Add(time.Duration(i)*time.Second), true)
+		c.Apply(Announcement{Host: hostName(i), Addrs: ma("192.0.2.10"), TTL: 120}, base.Add(time.Duration(i)*time.Second), TrustWeak)
 	}
 	if c.Len() != maxHosts {
 		t.Fatalf("expected full cache %d, got %d", maxHosts, c.Len())
 	}
 	// One more distinct host must be admitted (evicting the LRU victim h0).
 	newcomer := "newcomer"
-	if !c.Apply(Announcement{Host: newcomer, Addrs: ma("198.51.100.5"), TTL: 120}, base.Add(time.Hour), true) {
+	if !c.Apply(Announcement{Host: newcomer, Addrs: ma("198.51.100.5"), TTL: 120}, base.Add(time.Hour), TrustWeak) {
 		t.Fatal("newcomer at capacity should be admitted (change reported)")
 	}
 	if c.Len() != maxHosts {
@@ -173,7 +173,7 @@ func TestCacheUntrustedNoTrigger(t *testing.T) {
 	c := NewCache(rec.fn)
 	t0 := time.Unix(1000, 0)
 
-	c.Apply(Announcement{Host: "edge", Addrs: ma("9.9.9.9"), TTL: 120}, t0, false)
+	c.Apply(Announcement{Host: "edge", Addrs: ma("9.9.9.9"), TTL: 120}, t0, TrustNone)
 	if rec.count() != 0 {
 		t.Errorf("untrusted announcement must not fire the DDNS trigger, got %d", rec.count())
 	}
@@ -181,7 +181,7 @@ func TestCacheUntrustedNoTrigger(t *testing.T) {
 		t.Errorf("untrusted announcement should still update the *.local view")
 	}
 	// A trusted announcement with a different address fires the trigger.
-	c.Apply(Announcement{Host: "edge", Addrs: ma("8.8.8.8"), TTL: 120}, t0.Add(10*time.Second), true)
+	c.Apply(Announcement{Host: "edge", Addrs: ma("8.8.8.8"), TTL: 120}, t0.Add(10*time.Second), TrustWeak)
 	if rec.count() != 1 {
 		t.Errorf("trusted announcement should fire the trigger, got %d", rec.count())
 	}
@@ -191,9 +191,9 @@ func TestCacheBurstUnion(t *testing.T) {
 	rec := &changeRec{}
 	c := NewCache(rec.fn)
 	t0 := time.Unix(2000, 0)
-	c.Apply(Announcement{Host: "edge", Addrs: ma("192.0.2.10"), TTL: 120}, t0, true)
+	c.Apply(Announcement{Host: "edge", Addrs: ma("192.0.2.10"), TTL: 120}, t0, TrustWeak)
 	// Within burst window an A and AAAA from separate packets union.
-	c.Apply(Announcement{Host: "edge", Addrs: ma("2001:db8::1"), TTL: 120}, t0.Add(2*time.Second), true)
+	c.Apply(Announcement{Host: "edge", Addrs: ma("2001:db8::1"), TTL: 120}, t0.Add(2*time.Second), TrustWeak)
 	if got := rec.last(); got != "edge:192.0.2.10,2001:db8::1" {
 		t.Errorf("burst union failed, got %q", got)
 	}
@@ -203,7 +203,7 @@ func TestCacheExpire(t *testing.T) {
 	rec := &changeRec{}
 	c := NewCache(rec.fn)
 	t0 := time.Unix(3000, 0)
-	c.Apply(Announcement{Host: "edge", Addrs: ma("192.0.2.10"), TTL: 30}, t0, true)
+	c.Apply(Announcement{Host: "edge", Addrs: ma("192.0.2.10"), TTL: 30}, t0, TrustWeak)
 	if n := c.Expire(t0.Add(10 * time.Second)); n != 0 {
 		t.Fatalf("premature expiry: %d", n)
 	}
@@ -221,7 +221,7 @@ func TestCacheExpire(t *testing.T) {
 func TestView(t *testing.T) {
 	c := NewCache(nil)
 	t0 := time.Unix(4000, 0)
-	c.Apply(Announcement{Host: "edge", Addrs: ma("192.0.2.10", "2001:db8::1"), TTL: 120}, t0, true)
+	c.Apply(Announcement{Host: "edge", Addrs: ma("192.0.2.10", "2001:db8::1"), TTL: 120}, t0, TrustWeak)
 	v := c.View(t0)
 	fwd := v.Forward["edge"]
 	if len(fwd) != 2 {

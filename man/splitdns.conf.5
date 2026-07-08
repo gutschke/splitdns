@@ -152,6 +152,20 @@ Serve DNS-SD over unicast (boolean, default \fBtrue\fR). Local names also answer
 client can resolve or browse services (e.g. printers) by unicast \(em including across VLANs
 where multicast does not reach. It is a read-only projection of the cache and \fBnever\fR
 sends a query. Set \fBfalse\fR to serve only A/AAAA on the local domain.
+.TP
+.B trusted_grace
+How long a \fItrusted\fR static allocation is retained without a refresh (duration, default
+\fB168h\fR; \fB0\fR = hold until an explicit trusted withdrawal). An mDNS announcement that
+arrives TSIG-signed or over the authenticated notify socket is trusted: it is served even when
+the host is powered off (it is configuration, not a liveness signal) and cannot be shadowed by a
+self-announced address, so a restricted name (a vhost or a DDNS-eligible name) resolves on the
+LAN only to its trusted address. A spoofable \fB[ddns] trusted_sources\fR source IP does not
+qualify. \fBtrusted_grace\fR is a backstop for a notify channel that disappears without a
+withdrawal.
+.TP
+.B max_trusted
+Upper bound on the number of trusted static allocations retained (integer, default \fB1024\fR;
+\fB0\fR keeps the default), independent of the volatile mDNS cache's own limit.
 .SH "[vhost]"
 .TP
 .B feed

@@ -107,6 +107,16 @@ type MDNSConfig struct {
 	// captured services, so LAN clients can resolve/browse services over unicast (across VLANs
 	// where multicast doesn't reach). Read-only projection of the cache; never queries.
 	ServeDNSSD bool `toml:"serve_dnssd"`
+	// TrustedGrace is how long a TRUSTED static allocation (a TSIG/peer-cred announcement, e.g.
+	// from the notify cron pushing DHCP reservations) is retained WITHOUT a refresh — a backstop
+	// for a trusted channel that vanishes without an explicit withdrawal, after which a wrong
+	// mapping would otherwise persist forever. Default "168h" (7d). "0" = hold until an explicit
+	// trusted withdrawal (no time cap). A trusted entry survives host-down (it is configuration,
+	// not liveness) and cannot be shadowed by a self-announced address.
+	TrustedGrace string `toml:"trusted_grace"`
+	// MaxTrusted bounds the persistent trusted store so even a compromised trusted key cannot
+	// grow it without limit; independent of the volatile cache's LRU. Default 1024; "0" => default.
+	MaxTrusted int `toml:"max_trusted"`
 }
 
 // LocalDomainLabel returns the normalized bare local-domain label (lowercased, no dots),
@@ -126,6 +136,16 @@ func (m MDNSConfig) StaleGraceDuration() time.Duration {
 // rather than blinking the host out of the view.
 func (m MDNSConfig) GoodbyeGraceDuration() time.Duration {
 	return parseDurOr(m.GoodbyeGrace, 5*time.Minute)
+}
+
+// TrustedGraceDuration resolves trusted_grace (default 7d). "0" (or a negative) means hold
+// until an explicit trusted withdrawal — no time cap. Unparsable => the default.
+func (m MDNSConfig) TrustedGraceDuration() time.Duration {
+	s := strings.TrimSpace(m.TrustedGrace)
+	if s == "0" {
+		return 0 // hold until explicit trusted withdrawal
+	}
+	return parseDurOr(m.TrustedGrace, 7*24*time.Hour)
 }
 
 // ResolveOnDemandWaitDuration resolves resolve_on_demand_wait (default 300ms; clamped to a
@@ -457,6 +477,7 @@ func Default() Config {
 		MDNS: MDNSConfig{
 			LocalDomain: "lan", StaleGrace: "30m", GoodbyeGrace: "5m", ServiceDiscovery: true,
 			ResolveOnDemand: true, ResolveOnDemandWait: "300ms", ServeDNSSD: true,
+			TrustedGrace: "168h", MaxTrusted: 1024,
 		},
 		Cloudflare: CFConfig{ReadTokenFile: "/etc/splitdns/cloudflare-read.token"},
 		DDNS:       DDNSConfig{Enabled: false, DryRun: true, Rate: "10m", NotifySocket: "/run/splitdns/notify.sock"},

@@ -185,6 +185,7 @@ func main() {
 	srcOpts := []mdns.Option{
 		mdns.WithServeStale(cfg.MDNS.StaleGraceDuration(), cfg.MDNS.GoodbyeGraceDuration()),
 		mdns.WithServiceDiscovery(discoveryEvery),
+		mdns.WithTrustedStore(cfg.MDNS.TrustedGraceDuration(), cfg.MDNS.MaxTrusted),
 	}
 	if cfg.MDNS.ResolveOnDemand {
 		srcOpts = append(srcOpts, mdns.WithOnDemand(cfg.MDNS.ResolveOnDemandWaitDuration()))

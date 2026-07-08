@@ -62,11 +62,20 @@ type Cache struct {
 	// (no serve-stale; goodbye coerced to the legacy 120s) unless configured.
 	staleGrace   time.Duration
 	goodbyeGrace time.Duration
+
+	// trusted is the persistent, TSIG/peer-cred-sourced allocation store — SEPARATE from the
+	// volatile `hosts` cache so it is never LRU-evicted by a name flood and survives host-down
+	// (a static allocation is configuration, not a liveness signal). trustedGrace caps how long
+	// a trusted entry persists without a refresh (0 = hold until an explicit trusted withdrawal);
+	// maxTrusted bounds the store. Populated only via TrustStrong announcements. See trust.go.
+	trusted      map[string]*trustedEntry
+	trustedGrace time.Duration
+	maxTrusted   int
 }
 
 // NewCache returns an empty cache. onChange may be nil.
 func NewCache(onChange ChangeFunc) *Cache {
-	return &Cache{hosts: map[string]*entry{}, onChange: onChange}
+	return &Cache{hosts: map[string]*entry{}, trusted: map[string]*trustedEntry{}, maxTrusted: defaultMaxTrusted, onChange: onChange}
 }
 
 // Apply folds one announcement into the cache and returns true if the host's
@@ -74,11 +83,12 @@ func NewCache(onChange ChangeFunc) *Cache {
 // otherwise the new set replaces the old (so a host that drops an address is
 // reflected once announcements are spaced apart).
 //
-// trusted gates the DDNS side effect ONLY: the *.local view is always updated, but
-// onChange (the write-back trigger) fires only when the announcement came from a
-// trusted source/channel (D7). An untrusted announcement still resolves on the LAN;
-// it just cannot move a Cloudflare record.
-func (c *Cache) Apply(a Announcement, now time.Time, trusted bool) bool {
+// trust decides the side effects: the volatile *.local view is ALWAYS updated (so any
+// host resolves on the LAN); a TrustWeak-or-stronger announcement additionally fires
+// onChange (the DDNS write-back trigger, D7); and ONLY a TrustStrong announcement (TSIG or
+// peer-cred) reconciles the persistent trusted store (trust.go). An untrusted announcement
+// still resolves locally but can neither move a Cloudflare record nor mint a trusted entry.
+func (c *Cache) Apply(a Announcement, now time.Time, trust Trust) bool {
 	if a.Host == "" || len(a.Addrs) == 0 {
 		return false
 	}
@@ -120,11 +130,17 @@ func (c *Cache) Apply(a Announcement, now time.Time, trusted bool) bool {
 		e.expiry = e.freshUntil.Add(c.staleGrace) // serve-stale window past the announced TTL
 	}
 	changed, set := c.diffLocked(a.Host, e)
+	// A strong-trust announcement also reconciles the persistent trusted store; a change
+	// there (new host, renumber, withdrawal) republishes the view so the trusted address is
+	// served (or dropped) promptly.
+	if trust.isStrong() && c.applyTrustedLocked(a, now) {
+		changed = true
+	}
 	c.mu.Unlock()
 
-	// Fire the DDNS trigger only for trusted announcements (D7). The view itself was
+	// Fire the DDNS trigger for any trusted-enough announcement (D7). The view itself was
 	// already updated above regardless, so untrusted hosts still resolve on the LAN.
-	if trusted && c.onChange != nil {
+	if trust.triggersDDNS() && c.onChange != nil {
 		if evicted != "" {
 			c.onChange(evicted, nil)
 		}
@@ -217,6 +233,9 @@ func (c *Cache) Expire(now time.Time) int {
 	for _, h := range gone {
 		delete(c.hosts, h)
 	}
+	// The trusted store expires only past its (optional) grace cap — never on the liveness
+	// clock — and fires no onChange (the volatile entry already drove any DDNS cleanup).
+	c.expireTrustedLocked(now)
 	c.mu.Unlock()
 
 	for _, h := range gone {
@@ -243,7 +262,10 @@ func (c *Cache) diffLocked(host string, e *entry) (bool, []netip.Addr) {
 	return true, set
 }
 
-// View builds the immutable MDNSView for the hot path from non-expired hosts.
+// View builds the immutable MDNSView for the hot path. It covers every host in EITHER
+// store (a trusted static allocation is served even when the host is down and absent from
+// the volatile cache) and tags each address with its trust tier: trusted addresses (from the
+// persistent store, short wire TTL) win and dedupe the volatile self-announced ones.
 func (c *Cache) View(now time.Time) *model.MDNSView {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -252,11 +274,49 @@ func (c *Cache) View(now time.Time) *model.MDNSView {
 		Reverse: map[string][]model.RR{},
 		BuiltAt: now,
 	}
-	for host, e := range c.hosts {
-		if now.After(e.expiry) {
+	emit := func(host, fqdn string, a netip.Addr, ttl uint32, trusted bool) {
+		typ := uint16(dns.TypeA)
+		if a.Is6() {
+			typ = dns.TypeAAAA
+		}
+		v.Forward[host] = append(v.Forward[host], model.RR{
+			Name: fqdn, Type: typ, Class: dns.ClassINET, TTL: ttl, Content: a.String(), Trusted: trusted,
+		})
+		if arpa, err := dns.ReverseAddr(a.String()); err == nil {
+			v.Reverse[arpa] = append(v.Reverse[arpa], model.RR{
+				Name: arpa, Type: dns.TypePTR, Class: dns.ClassINET, TTL: ttl,
+				Content: fqdn, Target: fqdn,
+			})
+		}
+	}
+
+	hosts := make(map[string]struct{}, len(c.hosts)+len(c.trusted))
+	for h := range c.hosts {
+		hosts[h] = struct{}{}
+	}
+	for h := range c.trusted {
+		hosts[h] = struct{}{}
+	}
+	for host := range hosts {
+		fqdn := host + ".local."
+		// Trusted addresses first (persistent; short wire TTL so clients re-check after a renumber).
+		trustedAddrs := c.trustedAddrsLocked(host, now)
+		if len(trustedAddrs) > 0 {
+			set := make([]netip.Addr, 0, len(trustedAddrs))
+			for a := range trustedAddrs {
+				set = append(set, a)
+			}
+			sortAddrs(set)
+			for _, a := range set {
+				emit(host, fqdn, a, trustedTTL, true)
+			}
+		}
+		// Volatile (self-announced) addresses, only while unexpired and not already served as
+		// trusted (dedupe by address, trusted wins).
+		e, ok := c.hosts[host]
+		if !ok || now.After(e.expiry) {
 			continue
 		}
-		fqdn := host + ".local."
 		// Serve the announced-TTL remainder while fresh; once stale (serve-stale window),
 		// serve a short TTL so clients re-check soon and pick up a refresh promptly.
 		ttl := ttlUntil(e.freshUntil, now)
@@ -271,21 +331,12 @@ func (c *Cache) View(now time.Time) *model.MDNSView {
 		for a := range e.addrs {
 			set = append(set, a)
 		}
-		sort.Slice(set, func(i, j int) bool { return set[i].Less(set[j]) })
+		sortAddrs(set)
 		for _, a := range set {
-			typ := uint16(dns.TypeA)
-			if a.Is6() {
-				typ = dns.TypeAAAA
+			if _, dup := trustedAddrs[a]; dup {
+				continue
 			}
-			v.Forward[host] = append(v.Forward[host], model.RR{
-				Name: fqdn, Type: typ, Class: dns.ClassINET, TTL: ttl, Content: a.String(),
-			})
-			if arpa, err := dns.ReverseAddr(a.String()); err == nil {
-				v.Reverse[arpa] = append(v.Reverse[arpa], model.RR{
-					Name: arpa, Type: dns.TypePTR, Class: dns.ClassINET, TTL: ttl,
-					Content: fqdn, Target: fqdn,
-				})
-			}
+			emit(host, fqdn, a, ttl, false)
 		}
 		if len(e.services) > 0 && len(e.addrs) > 0 {
 			svcs := make([]model.MDNSService, 0, len(e.services))
@@ -313,6 +364,10 @@ func (c *Cache) Len() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return len(c.hosts)
+}
+
+func sortAddrs(set []netip.Addr) {
+	sort.Slice(set, func(i, j int) bool { return set[i].Less(set[j]) })
 }
 
 func joinAddrs(set []netip.Addr) string {
