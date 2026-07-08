@@ -8,9 +8,8 @@ import (
 	"github.com/gutschke/splitdns/internal/model"
 )
 
-// ta / taaaa build a TRUSTED (notification-channel) address record; a / aaaa are self-announced.
-func ta(content string) model.RR    { r := a(content); r.Trusted = true; return r }
-func taaaa(content string) model.RR { r := aaaa(content); r.Trusted = true; return r }
+// ta builds a TRUSTED (notification-channel) address record; a / aaaa are self-announced.
+func ta(content string) model.RR { r := a(content); r.Trusted = true; return r }
 
 // buildTrustSnap models the operator's world: a mirrored zone pub.test. with a PUBLIC A
 // wildcard, a vhost (hestia) with a TRUSTED static allocation, a DDNS-eligible name (managed)
