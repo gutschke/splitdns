@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-07-08
+
 ### Local plane: trust tiers + search-collision recovery
 - **Trusted vs self-announced mDNS.** The per-packet trust already computed at ingest (a
   valid TSIG signature or a unix-socket peer-cred = *strong*; a `trusted_sources` source IP =
@@ -153,5 +155,6 @@ mDNS helper, and the optional `splitdnsd-selfbuild` unattended security-rebuild 
   an adversarial chaos suite, and a golden-parity harness. CI gates on vet, govulncheck,
   golangci-lint, race tests, short fuzz, and a pristine/no-attribution scan.
 
-[Unreleased]: https://github.com/gutschke/splitdns/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/gutschke/splitdns/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/gutschke/splitdns/releases/tag/v0.3.0
 [0.1.0]: https://github.com/gutschke/splitdns/releases/tag/v0.1.0

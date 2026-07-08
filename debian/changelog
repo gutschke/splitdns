@@ -1,3 +1,16 @@
+splitdnsd (0.3.0) unstable; urgency=medium
+
+  * Local plane trust tiers: a TSIG/peer-cred (strong) mDNS announcement now creates a
+    persistent, shadow-immune trusted allocation that survives host-down and cannot be
+    displaced by a self-announced address; a trusted_sources source IP stays weak (DDNS
+    trigger only). New [mdns] trusted_grace + max_trusted knobs.
+  * Search-list collision recovery: host.lan.<zone> / host.<zone>.lan resolve from the
+    local plane under the queried name, never the public wildcard (closes the
+    "<host>.lan -> public IP" leak). Restricted (vhost/DDNS) names serve the trusted tier
+    only; unrestricted names serve their self-announced address on every spelling.
+
+ -- gutschke <gutschke@users.noreply.github.com>  Tue, 08 Jul 2026 12:00:00 -0700
+
 splitdnsd (0.2.2) unstable; urgency=medium
 
   * Fix splitdns-notify-relay.socket run-dir perms (DirectoryMode 0750 -> 0755) so a
