@@ -215,6 +215,15 @@ Boolean. When true, log intended edits without making them. Default \fBtrue\fR.
 .B rate
 Duration string (e.g. \fB"10m"\fR). Minimum interval between writes per host.
 .TP
+.B reconcile
+Duration string. How often the writer re-checks every host whose announcement it has
+accepted and repairs records that drifted from the announced addresses \(em a write that
+failed during an API outage, was held back by \fBrate\fR, or was changed by hand. It
+replays only state that was already authorized, under the same guards; a converged host
+costs one read and no write, and nothing is deleted without a fresh announcement. The
+state is held in memory, so after a restart a host is covered again from its next
+announcement. \fB"0"\fR disables it. Default \fB"30m"\fR.
+.TP
 .B eligible
 Array of host FQDNs. \fBRequired allowlist\fR for live writes: when empty (default)
 the writer is forced to dry-run (deny-all); a non-empty list restricts write-back to
@@ -236,6 +245,11 @@ optional \fBalgorithm\fR defaults to \fBhmac-sha256\fR. An announcement carrying
 TSIG for one of these keys may trigger write-back \fIregardless of source IP\fR \(em
 cryptographic authentication that cannot be spoofed, the recommended path for off-box
 notifiers. Generate a key with \fBsplitdns-notify \-\-genkey\fR.
+An optional \fBhosts\fR array scopes a key to the bare host labels it may speak for
+(as announced, e.g. \fB"edge"\fR for \fIedge.local\fR); for any other host in the same
+packet the signature is ignored and the announcement is graded as if it were unsigned.
+Without \fBhosts\fR a key may speak for any host. Give each off-box notifier its own
+scoped key, so a compromised machine can only move its own records.
 .TP
 .B require_signature
 Boolean. When true, only \fBTSIG\fR-signed (or \fBnotify_socket\fR) announcements may

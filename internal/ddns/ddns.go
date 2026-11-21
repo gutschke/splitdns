@@ -63,7 +63,19 @@ type Config struct {
 	// bucket (per-host gating still applies).
 	GlobalBurst  int
 	GlobalRefill time.Duration // one global token replenished per this interval
+
+	// Reconcile, when > 0, makes Run re-check every host whose announcement was accepted
+	// at this interval and repair any drift: a write that failed (API outage), was
+	// rate-limited, or was undone by hand converges again without waiting for the host to
+	// change address. It replays only state that was already authorized, under the same
+	// guards; nothing is ever deleted without a fresh announcement. 0 disables it.
+	Reconcile time.Duration
 }
+
+// rememberCap bounds how many hosts' last accepted state the periodic reconcile keeps.
+// Only hosts with eligible records are remembered, so in practice this is the size of
+// the eligibility allowlist; the cap is a safety ceiling.
+const rememberCap = 1024
 
 // Outcome categorizes what a single Reconcile decided, for logging/metrics/tests.
 type Outcome string
@@ -97,6 +109,7 @@ type Writer struct {
 	mu         sync.Mutex
 	lastByHost map[string]time.Time
 	global     *tokenBucket
+	accepted   map[string][]netip.Addr // host -> last accepted desired public addrs (periodic reconcile)
 }
 
 // New builds a Writer. now/log may be nil (defaults applied). audit may be nil
@@ -129,6 +142,7 @@ func New(cfg Config, src RecordSource, ed Editor, audit *Audit, now func() time.
 		log:        log,
 		ch:         make(chan Change, chanCap),
 		lastByHost: map[string]time.Time{},
+		accepted:   map[string][]netip.Addr{},
 	}
 	if cfg.GlobalBurst > 0 && cfg.GlobalRefill > 0 {
 		w.global = &tokenBucket{cap: float64(cfg.GlobalBurst), tokens: float64(cfg.GlobalBurst), refillPer: cfg.GlobalRefill, last: now()}
@@ -170,6 +184,12 @@ func (w *Writer) Run(ctx context.Context, progress func()) {
 	}
 	hb := time.NewTicker(30 * time.Second)
 	defer hb.Stop()
+	var periodic <-chan time.Time
+	if w.cfg.Reconcile > 0 {
+		t := time.NewTicker(w.cfg.Reconcile)
+		defer t.Stop()
+		periodic = t.C
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -179,10 +199,59 @@ func (w *Writer) Run(ctx context.Context, progress func()) {
 				w.log(fmt.Sprintf("ddns: reconcile %s: %v", c.Host, err))
 			}
 			progress()
+		case <-periodic:
+			w.ReconcileAccepted(ctx, progress)
 		case <-hb.C:
 			progress()
 		}
 	}
+}
+
+// ReconcileAccepted re-runs Reconcile for every host whose announcement was accepted,
+// repairing records that drifted from the announced state (a failed or rate-limited
+// write, an API outage, a manual edit). Converged hosts cost one read and no write.
+// Called from Run on the Reconcile interval; safe to call directly (tests do).
+func (w *Writer) ReconcileAccepted(ctx context.Context, progress func()) {
+	if progress == nil {
+		progress = func() {}
+	}
+	w.mu.Lock()
+	pending := make([]Change, 0, len(w.accepted))
+	for h, addrs := range w.accepted {
+		pending = append(pending, Change{Host: h, Addrs: append([]netip.Addr(nil), addrs...)})
+	}
+	w.mu.Unlock()
+	sort.Slice(pending, func(i, j int) bool { return pending[i].Host < pending[j].Host })
+	for _, c := range pending {
+		if ctx.Err() != nil {
+			return
+		}
+		out, err := w.Reconcile(ctx, c)
+		switch {
+		case err != nil:
+			w.log(fmt.Sprintf("ddns: periodic reconcile %s: %v", c.Host, err))
+		case out == OutcomeApplied:
+			w.log(fmt.Sprintf("ddns: periodic reconcile repaired %s", c.Host))
+		}
+		progress()
+	}
+}
+
+// remember records host's accepted desired state for the periodic reconcile; forget
+// drops it once the host has nothing eligible left to update.
+func (w *Writer) remember(host string, desired []netip.Addr) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if _, ok := w.accepted[host]; !ok && len(w.accepted) >= rememberCap {
+		return
+	}
+	w.accepted[host] = append([]netip.Addr(nil), desired...)
+}
+
+func (w *Writer) forget(host string) {
+	w.mu.Lock()
+	delete(w.accepted, host)
+	w.mu.Unlock()
 }
 
 // Reconcile resolves the host's current records, computes the minimal edit plan to
@@ -210,6 +279,9 @@ func (w *Writer) Reconcile(ctx context.Context, c Change) (Outcome, error) {
 
 	records, err := w.src.RecordsForHost(ctx, host)
 	if err != nil {
+		// Keep the state for the periodic reconcile: an outage at the moment of the
+		// announcement must not lose the change until the host's address moves again.
+		w.remember(host, desired)
 		return OutcomeError, fmt.Errorf("record source: %w", err)
 	}
 	// Belt-and-suspenders: keep only non-proxied A/AAAA even if the source already
@@ -217,8 +289,10 @@ func (w *Writer) Reconcile(ctx context.Context, c Change) (Outcome, error) {
 	records = filterEligibleRecords(records, w.cfg.Eligible)
 	if len(records) == 0 {
 		// Nothing we are permitted/able to update for this host.
+		w.forget(host)
 		return OutcomeNotEligible, nil
 	}
+	w.remember(host, desired)
 
 	plan := buildPlan(records, desired)
 	if plan.empty() {

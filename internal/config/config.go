@@ -237,6 +237,7 @@ type DDNSConfig struct {
 	Enabled          bool      `toml:"enabled"`
 	DryRun           bool      `toml:"dry_run"`
 	Rate             string    `toml:"rate"`
+	Reconcile        string    `toml:"reconcile"`          // re-check interval for already-announced hosts (repairs failed/lost writes); "0" disables
 	Eligible         []string  `toml:"eligible"`           // allowlist of writable FQDNs; empty = deny-all (D8)
 	TrustedSources   []string  `toml:"trusted_sources"`    // CIDRs whose UNSIGNED announcements may trigger DDNS (D7); empty = socket/signed-only
 	RequireSignature bool      `toml:"require_signature"`  // if true, only TSIG-signed (or socket) announcements may trigger DDNS
@@ -253,11 +254,18 @@ type DDNSConfig struct {
 // world-readable config; mode it 0400 splitdns:splitdns). Algorithm defaults to
 // hmac-sha256; on the resolver it is advisory (verification reads the algorithm from the
 // signed message) and is the algorithm splitdns-notify(8) signs with.
+//
+// Hosts optionally scopes the key: a signature made with it authenticates only these bare
+// host labels (as announced, e.g. "edge" for edge.local). Any other host in the same packet
+// is graded as if the packet were unsigned. Empty = the key may speak for any host, which
+// keeps a single shared key working; give each off-box notifier its own scoped key so a
+// compromised machine can only move its own records.
 type TSIGKey struct {
-	Name       string `toml:"name"`
-	Secret     string `toml:"secret"`
-	SecretFile string `toml:"secret_file"`
-	Algorithm  string `toml:"algorithm"`
+	Name       string   `toml:"name"`
+	Secret     string   `toml:"secret"`
+	SecretFile string   `toml:"secret_file"`
+	Algorithm  string   `toml:"algorithm"`
+	Hosts      []string `toml:"hosts"`
 }
 
 // TrustedSourceSet parses TrustedSources into a matcher. Empty yields a set that
@@ -294,6 +302,45 @@ func (d DDNSConfig) TSIGKeyset() (map[string]string, error) {
 		out[name] = secret
 	}
 	return out, nil
+}
+
+// TSIGKeyHosts resolves each key's optional Hosts scope into a canonical-key-name ->
+// bare-host-labels map. Keys without a scope are absent (they may speak for any host). A
+// scope entry that is not a single host label is an error so a typo fails loudly at
+// startup instead of silently locking a notifier out.
+func (d DDNSConfig) TSIGKeyHosts() (map[string][]string, error) {
+	var out map[string][]string
+	for i, k := range d.TSIGKeys {
+		if len(k.Hosts) == 0 {
+			continue
+		}
+		hosts := make([]string, 0, len(k.Hosts))
+		for _, h := range k.Hosts {
+			c := CanonicalHostLabel(h)
+			if c == "" {
+				return nil, fmt.Errorf("ddns.tsig_keys[%d] (%s): hosts entry %q is not a bare host label (e.g. \"edge\")", i, k.Name, h)
+			}
+			hosts = append(hosts, c)
+		}
+		if out == nil {
+			out = map[string][]string{}
+		}
+		out[CanonicalTSIGName(k.Name)] = hosts
+	}
+	return out, nil
+}
+
+// CanonicalHostLabel reduces a host as written in configuration ("Edge", "edge.local",
+// "edge.local.") to the bare lowercase label an mDNS announcement carries, or "" if it is
+// not a single label.
+func CanonicalHostLabel(h string) string {
+	h = strings.ToLower(strings.TrimSpace(h))
+	h = strings.TrimSuffix(h, ".")
+	h = strings.TrimSuffix(h, ".local")
+	if h == "" || strings.ContainsAny(h, ". \t") || strings.HasPrefix(h, "_") {
+		return ""
+	}
+	return h
 }
 
 // CanonicalTSIGName lowercases a TSIG key name and ensures a single trailing dot so the
@@ -350,6 +397,21 @@ func (d DDNSConfig) RateDuration() (time.Duration, error) {
 		return 0, nil
 	}
 	return time.ParseDuration(d.Rate)
+}
+
+// ReconcileDuration resolves Reconcile. Empty or "0" disables periodic re-checking.
+func (d DDNSConfig) ReconcileDuration() (time.Duration, error) {
+	if d.Reconcile == "" || d.Reconcile == "0" {
+		return 0, nil
+	}
+	r, err := time.ParseDuration(d.Reconcile)
+	if err != nil {
+		return 0, err
+	}
+	if r < 0 {
+		return 0, fmt.Errorf("%q is negative", d.Reconcile)
+	}
+	return r, nil
 }
 
 // DiagConfig is the diagnostics HTTP endpoint (R10), localhost-only by default. The
@@ -480,7 +542,7 @@ func Default() Config {
 			TrustedGrace: "168h", MaxTrusted: 1024,
 		},
 		Cloudflare: CFConfig{ReadTokenFile: "/etc/splitdns/cloudflare-read.token"},
-		DDNS:       DDNSConfig{Enabled: false, DryRun: true, Rate: "10m", NotifySocket: "/run/splitdns/notify.sock"},
+		DDNS:       DDNSConfig{Enabled: false, DryRun: true, Rate: "10m", Reconcile: "30m", NotifySocket: "/run/splitdns/notify.sock"},
 		Diag:       DiagConfig{Addr: "127.0.0.1:8080"},
 		Cache:      CacheConfig{Dir: "/var/lib/splitdns", Answers: true, MaxEntries: 10000, ServeStale: true},
 		// Encrypted client front-end OFF by default; if enabled, both transports come up on
@@ -570,6 +632,9 @@ func (c Config) Validate() error {
 	if _, err := c.DDNS.RateDuration(); err != nil {
 		return fmt.Errorf("ddns.rate: %w", err)
 	}
+	if _, err := c.DDNS.ReconcileDuration(); err != nil {
+		return fmt.Errorf("ddns.reconcile: %w", err)
+	}
 	if s := c.MDNS.ResolveOnDemandWait; s != "" {
 		if _, err := time.ParseDuration(s); err != nil {
 			return fmt.Errorf("mdns.resolve_on_demand_wait %q: %w (use e.g. \"300ms\")", s, err)
@@ -579,6 +644,9 @@ func (c Config) Validate() error {
 		return fmt.Errorf("ddns.trusted_sources: %w", err)
 	}
 	if _, err := c.DDNS.TSIGKeyset(); err != nil {
+		return fmt.Errorf("ddns: %w", err)
+	}
+	if _, err := c.DDNS.TSIGKeyHosts(); err != nil {
 		return fmt.Errorf("ddns: %w", err)
 	}
 	if c.DDNS.NotifySocketMode != "" {

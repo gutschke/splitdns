@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestTSIGKeyset(t *testing.T) {
@@ -106,5 +107,54 @@ tsig_secret = "aW5saW5l"
 	}
 	if len(n4.Servers) != 1 || n4.Servers[0] != "r" {
 		t.Errorf("notify from full config = %+v", n4)
+	}
+}
+
+func TestTSIGKeyHosts(t *testing.T) {
+	// No scoped keys => nil map (every key may speak for any host).
+	if m, err := (DDNSConfig{TSIGKeys: []TSIGKey{{Name: "a", Secret: "eA=="}}}).TSIGKeyHosts(); err != nil || m != nil {
+		t.Errorf("unscoped = (%v, %v), want (nil, nil)", m, err)
+	}
+
+	// Entries are canonicalized to the bare label an announcement carries.
+	d := DDNSConfig{TSIGKeys: []TSIGKey{
+		{Name: "Edge-Key", Secret: "eA==", Hosts: []string{"Edge", "edge2.local", "edge3.local."}},
+		{Name: "shared", Secret: "eQ=="},
+	}}
+	m, err := d.TSIGKeyHosts()
+	if err != nil {
+		t.Fatalf("hosts: %v", err)
+	}
+	got := m["edge-key."]
+	if len(got) != 3 || got[0] != "edge" || got[1] != "edge2" || got[2] != "edge3" {
+		t.Errorf("edge-key scope = %v, want [edge edge2 edge3]", got)
+	}
+	if _, ok := m["shared."]; ok {
+		t.Error("an unscoped key must not appear in the scope map")
+	}
+
+	// A multi-label or empty entry is a configuration error, not a silent lockout.
+	for _, bad := range []string{"edge.example.com", "", "  ", "_svc"} {
+		d := DDNSConfig{TSIGKeys: []TSIGKey{{Name: "k", Secret: "eA==", Hosts: []string{bad}}}}
+		if _, err := d.TSIGKeyHosts(); err == nil {
+			t.Errorf("hosts entry %q should be rejected", bad)
+		}
+	}
+}
+
+func TestReconcileDuration(t *testing.T) {
+	for in, want := range map[string]time.Duration{"": 0, "0": 0, "30m": 30 * time.Minute, "90s": 90 * time.Second} {
+		got, err := (DDNSConfig{Reconcile: in}).ReconcileDuration()
+		if err != nil || got != want {
+			t.Errorf("Reconcile %q = (%v, %v), want %v", in, got, err, want)
+		}
+	}
+	for _, bad := range []string{"soon", "-5m"} {
+		if _, err := (DDNSConfig{Reconcile: bad}).ReconcileDuration(); err == nil {
+			t.Errorf("Reconcile %q should be rejected", bad)
+		}
+	}
+	if d := Default().DDNS.Reconcile; d != "30m" {
+		t.Errorf("default reconcile = %q, want 30m", d)
 	}
 }

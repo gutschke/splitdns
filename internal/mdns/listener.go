@@ -161,15 +161,23 @@ func (l *Listener) readLoop(uc *net.UDPConn) {
 		// (spoofable UDP): it may trigger write-back but MUST NOT earn a trusted-view entry,
 		// which is persistent and resolution-authoritative. Disabled entirely when requireSig
 		// is set. Everything else still updates the volatile *.local view.
-		trust := TrustNone
-		if l.verify.Verify(buf[:n]) {
-			trust = TrustStrong
-		} else if !l.requireSig && src != nil {
+		//
+		// A host-scoped key makes the signature STRONG only for the hosts it covers; any
+		// other host in the same packet falls back to the tier the packet would have had
+		// unsigned, so a notifier cannot borrow its key to speak for someone else.
+		fallback := TrustNone
+		if !l.requireSig && src != nil {
 			if a, ok := netip.AddrFromSlice(src.IP); ok && l.trusted(a.Unmap()) {
-				trust = TrustWeak
+				fallback = TrustWeak
 			}
 		}
-		l.src.HandlePacket(buf[:n], trust)
+		key, signed := l.verify.VerifyKey(buf[:n])
+		l.src.HandlePacketScoped(buf[:n], func(host string) Trust {
+			if signed && l.verify.Permits(key, host) {
+				return TrustStrong
+			}
+			return fallback
+		})
 	}
 }
 

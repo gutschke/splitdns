@@ -6,6 +6,21 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### DDNS
+- **Host-scoped TSIG keys.** `[[ddns.tsig_keys]]` entries take an optional `hosts` list of
+  bare host labels. A signature made with a scoped key authenticates only those hosts; any
+  other host in the same packet is graded as if the packet were unsigned (it still updates the
+  volatile `*.local` view, but cannot trigger write-back or mint a trusted entry). Unscoped
+  keys behave as before. This lets each off-box notifier carry its own key without being able
+  to move anyone else's records.
+- **Periodic reconcile.** New `[ddns] reconcile` (default `30m`, `0` disables): the writer
+  re-checks every host whose announcement it accepted and repairs drift. Previously a write
+  that failed (API outage), was rate-limited, or was undone by hand stayed wrong until the
+  host's address changed again. The pass replays only already-authorized state under the
+  existing guards (`eligible`, per-host `rate`, global bucket) and never deletes records
+  without a fresh announcement. A failed record lookup at announcement time is remembered
+  too, so an outage at that moment is repaired once the API answers.
+
 ## [0.3.0] — 2026-07-08
 
 ### Local plane: trust tiers + search-collision recovery

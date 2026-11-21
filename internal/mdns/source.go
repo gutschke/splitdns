@@ -186,11 +186,18 @@ func (s *Source) PokeDiscovery() {
 // write-back (>= TrustWeak) and the persistent trusted store (TrustStrong); the volatile
 // view is updated either way. Safe for concurrent callers.
 func (s *Source) HandlePacket(b []byte, trust Trust) {
+	s.HandlePacketScoped(b, func(string) Trust { return trust })
+}
+
+// HandlePacketScoped is HandlePacket with the trust tier decided per announced host, so
+// one packet can carry hosts its signature covers and hosts it does not (a host-scoped
+// TSIG key). trustFor receives the bare host label.
+func (s *Source) HandlePacketScoped(b []byte, trustFor func(host string) Trust) {
 	now := s.now()
 	changed := false
 	var hosts []string
 	for _, a := range ParsePacket(b) {
-		if s.cache.Apply(a, now, trust) {
+		if s.cache.Apply(a, now, trustFor(a.Host)) {
 			changed = true
 			// Wake an on-demand waiter ONLY for a host that genuinely landed in the view
 			// (Apply==true) — never on a no-op re-announcement, so a waiter can't be woken

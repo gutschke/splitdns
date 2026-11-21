@@ -215,11 +215,16 @@ func main() {
 		slog.Error("ddns.tsig_keys load failed", "err", kerr)
 		os.Exit(2)
 	}
+	keyHosts, herr := cfg.DDNS.TSIGKeyHosts()
+	if herr != nil {
+		slog.Error("ddns.tsig_keys hosts invalid", "err", herr)
+		os.Exit(2)
+	}
 	if len(tsigKeys) > 0 {
-		slog.Info("ddns: TSIG-authenticated triggers enabled", "keys", len(tsigKeys), "require_signature", cfg.DDNS.RequireSignature)
+		slog.Info("ddns: TSIG-authenticated triggers enabled", "keys", len(tsigKeys), "host_scoped", len(keyHosts), "require_signature", cfg.DDNS.RequireSignature)
 	}
 	trusted := func(a netip.Addr) bool { return trustedSrc.Contains(a) }
-	verify := mdns.NewSigVerifier(tsigKeys)
+	verify := mdns.NewSigVerifier(tsigKeys).WithHostScopes(keyHosts)
 	if lis, lerr := mdns.Listen(src, 5353, trusted, verify, cfg.DDNS.RequireSignature, func(m string) { slog.Warn(m) }); lerr != nil {
 		slog.Warn("mDNS listener unavailable (LAN/*.local resolution degraded)", "err", lerr)
 	} else {
@@ -1045,12 +1050,13 @@ func buildWriter(cfg config.Config, recSrc ddns.RecordSource) (*ddns.Writer, err
 	}
 	editor := cfapi.New(cfg.Cloudflare.BaseURL, strings.TrimSpace(string(editTok)), nil)
 	rate, _ := cfg.DDNS.RateDuration()
+	reconcile, _ := cfg.DDNS.ReconcileDuration()
 	elig := map[string]bool{}
 	for _, e := range cfg.DDNS.Eligible {
 		elig[strings.TrimSuffix(strings.ToLower(e), ".")] = true
 	}
 	return ddns.New(ddns.Config{
 		Enabled: true, DryRun: cfg.DDNS.DryRun, Rate: rate, Eligible: elig,
-		TokenID: "cf-edit", GlobalBurst: 8, GlobalRefill: rate,
+		TokenID: "cf-edit", GlobalBurst: 8, GlobalRefill: rate, Reconcile: reconcile,
 	}, recSrc, editor, nil, nil, func(m string) { slog.Warn(m) }), nil
 }

@@ -15,8 +15,12 @@ import (
 // announcement is honored regardless of its source IP — unlike the trusted_sources
 // path, it cannot be spoofed. A nil *SigVerifier verifies nothing (no keys
 // configured), so callers can use it unconditionally.
+//
+// A key may be scoped to a set of hosts (see WithHostScopes): its signature then
+// authenticates only those hosts, so a notifier holding it cannot speak for others.
 type SigVerifier struct {
-	secrets map[string]string // canonical key name (lowercase, trailing dot) -> base64 secret
+	secrets map[string]string          // canonical key name (lowercase, trailing dot) -> base64 secret
+	scopes  map[string]map[string]bool // canonical key name -> permitted bare hosts; absent = any host
 	mu      sync.Mutex
 	seen    map[string]time.Time // accepted TSIG MAC -> first-seen; anti-replay within the window
 	now     func() time.Time     // injectable clock (tests)
@@ -41,40 +45,84 @@ func NewSigVerifier(secrets map[string]string) *SigVerifier {
 	return &SigVerifier{secrets: cp, seen: map[string]time.Time{}, now: time.Now}
 }
 
+// WithHostScopes restricts keys to the bare hosts they may authenticate (as produced
+// by config.DDNSConfig.TSIGKeyHosts). A key with no entry keeps speaking for any host.
+// It returns v for chaining and is a no-op on a nil verifier.
+func (v *SigVerifier) WithHostScopes(scopes map[string][]string) *SigVerifier {
+	if v == nil || len(scopes) == 0 {
+		return v
+	}
+	v.scopes = make(map[string]map[string]bool, len(scopes))
+	for k, hosts := range scopes {
+		set := make(map[string]bool, len(hosts))
+		for _, h := range hosts {
+			if c := canonHost(h); c != "" {
+				set[c] = true
+			}
+		}
+		v.scopes[canonKeyName(k)] = set
+	}
+	return v
+}
+
 // Verify reports whether b is a TSIG-signed announcement with a valid MAC for one of
 // the configured keys. It is conservative: any parse failure, missing/!TSIG trailing
 // record, unknown key, or MAC/time mismatch returns false (untrusted, not an error) so
 // the packet falls through to the source-IP path or stays view-only.
 func (v *SigVerifier) Verify(b []byte) bool {
+	_, ok := v.VerifyKey(b)
+	return ok
+}
+
+// VerifyKey is Verify that also returns the canonical name of the key that signed b,
+// so the caller can apply that key's host scope (Permits).
+func (v *SigVerifier) VerifyKey(b []byte) (string, bool) {
 	if v == nil {
-		return false
+		return "", false
 	}
 	var m dns.Msg
 	if err := m.Unpack(b); err != nil {
-		return false
+		return "", false
 	}
 	if len(m.Extra) == 0 {
-		return false
+		return "", false
 	}
 	// A TSIG is always the LAST record in the additional section (RFC 8945 §5.1).
 	t, ok := m.Extra[len(m.Extra)-1].(*dns.TSIG)
 	if !ok {
-		return false
+		return "", false
 	}
-	secret, ok := v.secrets[canonKeyName(t.Hdr.Name)]
+	key := canonKeyName(t.Hdr.Name)
+	secret, ok := v.secrets[key]
 	if !ok {
-		return false
+		return "", false
 	}
 	// requestMAC="" (an unsolicited announcement, not a query response); timersOnly=false.
 	// TsigVerify enforces the signed-time/fudge window, bounding how old a replay can be.
 	if dns.TsigVerify(b, secret, "", false) != nil {
-		return false
+		return "", false
 	}
 	// Anti-replay: within the fudge window an on-path attacker can re-send a captured
 	// valid packet to re-assert a (possibly stale) address set for an eligible host. Each
 	// signature's MAC is unique and unspoofable (no secret => no new MAC), so reject any
 	// MAC already accepted inside the retention window.
-	return v.freshMAC(t.MAC, time.Duration(t.Fudge)*time.Second)
+	if !v.freshMAC(t.MAC, time.Duration(t.Fudge)*time.Second) {
+		return "", false
+	}
+	return key, true
+}
+
+// Permits reports whether a signature made with key (as returned by VerifyKey) may
+// authenticate an announcement for host. Unscoped keys permit every host.
+func (v *SigVerifier) Permits(key, host string) bool {
+	if v == nil {
+		return false
+	}
+	set, scoped := v.scopes[canonKeyName(key)]
+	if !scoped {
+		return true
+	}
+	return set[canonHost(host)]
 }
 
 // freshMAC returns true the FIRST time a given TSIG MAC is seen and false for any repeat

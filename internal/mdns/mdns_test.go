@@ -279,3 +279,66 @@ func ma(ss ...string) []netip.Addr {
 	}
 	return out
 }
+
+// End to end over loopback: one packet signed with a host-scoped key announces its own
+// host and a foreign one. Only the in-scope host may trigger DDNS; the foreign host still
+// lands in the volatile view but stays inert for write-back.
+func TestListenerScopedKeyOnlyTriggersOwnHost(t *testing.T) {
+	const (
+		key    = "edge-notify."
+		secret = "aGVsbG8td29ybGQtdGhpcy1pcy1hLXRlc3Qta2V5MTIzNA=="
+	)
+	var mu sync.Mutex
+	triggered := map[string]bool{}
+	src := NewSource(func(host string, _ []netip.Addr) {
+		mu.Lock()
+		triggered[host] = true
+		mu.Unlock()
+	}, nil)
+	verify := NewSigVerifier(map[string]string{key: secret}).
+		WithHostScopes(map[string][]string{key: {"edge"}})
+	l, err := Listen(src, 0, nil, verify, true, func(string) {})
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer l.Close()
+
+	m := new(dns.Msg)
+	m.Response, m.Authoritative = true, true
+	for _, rr := range []struct{ host, ip string }{{"edge.local.", "203.0.113.7"}, {"intruder.local.", "203.0.113.8"}} {
+		hdr := dns.RR_Header{Name: rr.host, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 120}
+		m.Answer = append(m.Answer, &dns.A{Hdr: hdr, A: net.ParseIP(rr.ip).To4()})
+	}
+	m.SetTsig(key, dns.HmacSHA256, 300, time.Now().Unix())
+	pkt, _, err := dns.TsigGenerate(m, secret, "", false)
+	if err != nil {
+		t.Fatalf("TsigGenerate: %v", err)
+	}
+	conn, err := net.Dial("udp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(l.Port())))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write(pkt); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if v := src.View(); v != nil && len(v.Forward["edge"]) == 1 && len(v.Forward["intruder"]) == 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !triggered["edge"] {
+		t.Error("the in-scope host should trigger DDNS")
+	}
+	if triggered["intruder"] {
+		t.Error("a host outside the key's scope must not trigger DDNS")
+	}
+	if v := src.View(); len(v.Forward["intruder"]) != 1 {
+		t.Errorf("the foreign host should still be visible in the view; forward=%v", v.Forward)
+	}
+}

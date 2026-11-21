@@ -112,3 +112,37 @@ func TestNewSigVerifierEmpty(t *testing.T) {
 		t.Error("empty map should yield a nil verifier")
 	}
 }
+
+// A host-scoped key authenticates only its own hosts; unscoped keys keep the old
+// any-host behavior, and VerifyKey reports which key signed.
+func TestSigVerifierHostScope(t *testing.T) {
+	const (
+		scoped   = "edge-notify."
+		shared   = "splitdns-notify."
+		secretA  = "aGVsbG8td29ybGQtdGhpcy1pcy1hLXRlc3Qta2V5MTIzNA=="
+		secretB  = "b3RoZXItc2VjcmV0LXZhbHVlLW5vdC10aGUtc2FtZS0xMjM0"
+		hostname = "edge.local."
+	)
+	v := NewSigVerifier(map[string]string{scoped: secretA, shared: secretB}).
+		WithHostScopes(map[string][]string{"Edge-Notify": {"edge"}})
+	addr := netip.MustParseAddr("203.0.113.7")
+	now := time.Now().Unix()
+
+	key, ok := v.VerifyKey(signed(t, scoped, secretA, dns.HmacSHA256, hostname, addr, now))
+	if !ok || key != scoped {
+		t.Fatalf("VerifyKey = (%q, %v), want (%q, true)", key, ok, scoped)
+	}
+	if !v.Permits(key, "edge") || !v.Permits(key, "EDGE.local.") {
+		t.Error("scoped key must permit its own host (any spelling)")
+	}
+	if v.Permits(key, "other") {
+		t.Error("scoped key must not permit a host outside its scope")
+	}
+	if !v.Permits(shared, "anything") {
+		t.Error("an unscoped key must keep permitting every host")
+	}
+	var nilv *SigVerifier
+	if nilv.Permits(scoped, "edge") || nilv.WithHostScopes(map[string][]string{scoped: {"edge"}}) != nil {
+		t.Error("nil verifier must permit nothing and stay nil")
+	}
+}

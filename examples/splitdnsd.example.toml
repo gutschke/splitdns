@@ -143,7 +143,11 @@ edit_token_file = ""
 #                   IP — cryptographic auth that cannot be spoofed; the recommended path
 #                   for off-box notifiers. Run `splitdns-notify --genkey` to mint a key and
 #                   print both ends' config. Prefer secret_file over an inline secret
-#                   (keep the key out of this world-readable file).
+#                   (keep the key out of this world-readable file). An optional
+#                   hosts = [...] scopes a key to the host labels it may announce, so
+#                   each off-box notifier can only move its own records.
+#   reconcile       How often accepted hosts are re-checked and drifted records repaired
+#                   (failed/rate-limited writes, manual edits). "0" disables. Default "30m".
 #   require_signature  If true, ONLY signed (or unix-socket) announcements may trigger
 #                   write-back; trusted_sources alone no longer suffices. Default false
 #                   (back-compat); recommended true for any exposed/multi-host deployment.
@@ -165,6 +169,7 @@ edit_token_file = ""
 enabled         = false
 dry_run         = true
 rate            = "10m"
+reconcile       = "30m"
 eligible        = []
 trusted_sources = []
 notify_socket   = "/run/splitdns/notify.sock"
@@ -173,7 +178,7 @@ notify_socket   = "/run/splitdns/notify.sock"
 # notify_socket_mode = "0660"
 # require_signature = true
 # tsig_keys = [
-#   { name = "edge-router", secret_file = "/etc/splitdns/secrets/edge-router.tsig" },
+#   { name = "edge-router", secret_file = "/etc/splitdns/secrets/edge-router.tsig", hosts = ["edge-router"] },
 # ]
 
 [notify]
