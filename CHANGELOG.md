@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-11-21
+
 ### DDNS
 - **Host-scoped TSIG keys.** `[[ddns.tsig_keys]]` entries take an optional `hosts` list of
   bare host labels. A signature made with a scoped key authenticates only those hosts; any
@@ -170,6 +172,7 @@ mDNS helper, and the optional `splitdnsd-selfbuild` unattended security-rebuild 
   an adversarial chaos suite, and a golden-parity harness. CI gates on vet, govulncheck,
   golangci-lint, race tests, short fuzz, and a pristine/no-attribution scan.
 
-[Unreleased]: https://github.com/gutschke/splitdns/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/gutschke/splitdns/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/gutschke/splitdns/releases/tag/v0.4.0
 [0.3.0]: https://github.com/gutschke/splitdns/releases/tag/v0.3.0
 [0.1.0]: https://github.com/gutschke/splitdns/releases/tag/v0.1.0

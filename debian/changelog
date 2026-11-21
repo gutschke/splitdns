@@ -1,3 +1,14 @@
+splitdnsd (0.4.0) unstable; urgency=medium
+
+  * Host-scoped TSIG keys: [[ddns.tsig_keys]] takes an optional hosts list; a
+    signature authenticates only those hosts, any other host in the packet is graded
+    as unsigned. Unscoped keys behave as before.
+  * Periodic DDNS reconcile ([ddns] reconcile, default 30m): accepted hosts are
+    re-checked and drifted records repaired (failed or rate-limited writes, manual
+    edits), under the existing guards and without deleting anything.
+
+ -- gutschke <gutschke@users.noreply.github.com>  Sat, 21 Nov 2026 10:56:56 -0800
+
 splitdnsd (0.3.0) unstable; urgency=medium
 
   * Local plane trust tiers: a TSIG/peer-cred (strong) mDNS announcement now creates a
