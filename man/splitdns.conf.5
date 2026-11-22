@@ -166,6 +166,15 @@ withdrawal.
 .B max_trusted
 Upper bound on the number of trusted static allocations retained (integer, default \fB1024\fR;
 \fB0\fR keeps the default), independent of the volatile mDNS cache's own limit.
+.TP
+.B persist_trusted
+Keep the trusted allocations across restarts (boolean, default \fBtrue\fR), in
+\fImdns-trusted.json\fR under \fB[cache] dir\fR (mode 0600). Without it a restart forgets
+them, and restricted names fall back to their public answers until the notifiers re-announce.
+On startup each saved entry is checked against the current configuration: it is dropped if the
+TSIG key that last announced it is gone or no longer covers the host, if it came over the
+notify socket and the socket is disabled, or if it is past \fBtrusted_grace\fR. A restart
+never extends an entry's life, and restoring never triggers DDNS write-back.
 .SH "[vhost]"
 .TP
 .B feed

@@ -109,6 +109,9 @@ serve_dnssd = true
 # withdrawal. max_trusted bounds the store (independent of the volatile-cache limit).
 trusted_grace = "168h"   # 7 days; "0" = hold until explicit trusted withdrawal
 max_trusted = 1024
+# Keep trusted allocations across restarts in <[cache] dir>/mdns-trusted.json. On startup,
+# entries from a removed or re-scoped TSIG key (or a disabled notify socket) are dropped.
+persist_trusted = true
 
 [vhost]
 # Reverse-proxy redirect (any product: nginx, Caddy, Traefik, ...): naked domain / www / vhosts.

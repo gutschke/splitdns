@@ -71,6 +71,9 @@ type Cache struct {
 	trusted      map[string]*trustedEntry
 	trustedGrace time.Duration
 	maxTrusted   int
+	// trustedGen counts trusted-store mutations; the Source persists the store when it moves
+	// (persist.go).
+	trustedGen uint64
 }
 
 // NewCache returns an empty cache. onChange may be nil.
@@ -89,6 +92,13 @@ func NewCache(onChange ChangeFunc) *Cache {
 // peer-cred) reconciles the persistent trusted store (trust.go). An untrusted announcement
 // still resolves locally but can neither move a Cloudflare record nor mint a trusted entry.
 func (c *Cache) Apply(a Announcement, now time.Time, trust Trust) bool {
+	return c.ApplyBy(a, now, trust, "")
+}
+
+// ApplyBy is Apply that also records which authenticator vouched for a strong-trust
+// announcement ("tsig:<key>" or "socket"), so a persisted trusted entry can be re-checked
+// against the configuration after a restart.
+func (c *Cache) ApplyBy(a Announcement, now time.Time, trust Trust, by string) bool {
 	if a.Host == "" || len(a.Addrs) == 0 {
 		return false
 	}
@@ -133,7 +143,7 @@ func (c *Cache) Apply(a Announcement, now time.Time, trust Trust) bool {
 	// A strong-trust announcement also reconciles the persistent trusted store; a change
 	// there (new host, renumber, withdrawal) republishes the view so the trusted address is
 	// served (or dropped) promptly.
-	if trust.isStrong() && c.applyTrustedLocked(a, now) {
+	if trust.isStrong() && c.applyTrustedLocked(a, now, by) {
 		changed = true
 	}
 	c.mu.Unlock()

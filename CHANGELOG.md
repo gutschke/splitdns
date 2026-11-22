@@ -6,6 +6,24 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### mDNS
+- **Trusted allocations survive restarts.** New `[mdns] persist_trusted` (default `true`)
+  keeps the trusted store in `<[cache] dir>/mdns-trusted.json` (mode 0600, written on change
+  and on shutdown). Previously a restart forgot it, so restricted names answered with their
+  public addresses until the notifiers re-announced (up to their cron interval). On load,
+  entries whose TSIG key was removed or no longer covers the host, socket entries while the
+  notify socket is disabled, and entries past `trusted_grace` are dropped; restored entries
+  keep their last-seen time and never trigger DDNS write-back.
+
+### Packaging
+- **Self-build:** autobuild fails (and emails) when the installed packages are newer than its
+  shipped source, instead of reporting "up to date" forever; the version stamp also reads
+  `golang-1.NN-go` when the `golang-1.NN` metapackage is not installed.
+
+### CI
+- vet/vuln, race tests and fuzz run on Go 1.26.x with govulncheck v1.10.0; lint stays on the
+  go.mod minimum (1.24).
+
 ## [0.4.0] — 2026-11-21
 
 ### DDNS

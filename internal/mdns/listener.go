@@ -172,12 +172,16 @@ func (l *Listener) readLoop(uc *net.UDPConn) {
 			}
 		}
 		key, signed := l.verify.VerifyKey(buf[:n])
-		l.src.HandlePacketScoped(buf[:n], func(host string) Trust {
+		by := ""
+		if signed {
+			by = "tsig:" + key
+		}
+		l.src.HandlePacketScopedBy(buf[:n], func(host string) Trust {
 			if signed && l.verify.Permits(key, host) {
 				return TrustStrong
 			}
 			return fallback
-		})
+		}, by)
 	}
 }
 

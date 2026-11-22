@@ -44,6 +44,13 @@ type Source struct {
 	odClients    map[netip.Addr]*odBucket
 
 	odEmitted, odHits, odSuppressed, odLimited, odCapFull atomic.Uint64
+
+	// Trusted-store persistence (opt-in via WithTrustedPersistence). persistPath=="" keeps the
+	// store memory-only. savedGen is the cache.trustedGen last written. See persist.go.
+	persistPath string
+	persistLog  func(string)
+	persistMu   sync.Mutex
+	savedGen    uint64
 }
 
 // Option customizes a Source at construction.
@@ -193,11 +200,22 @@ func (s *Source) HandlePacket(b []byte, trust Trust) {
 // one packet can carry hosts its signature covers and hosts it does not (a host-scoped
 // TSIG key). trustFor receives the bare host label.
 func (s *Source) HandlePacketScoped(b []byte, trustFor func(host string) Trust) {
+	s.HandlePacketScopedBy(b, trustFor, "")
+}
+
+// HandlePacketBy is HandlePacket that names the authenticator of a strong-trust packet
+// ("tsig:<key>" or "socket"); it is recorded with the trusted entries (persist.go).
+func (s *Source) HandlePacketBy(b []byte, trust Trust, by string) {
+	s.HandlePacketScopedBy(b, func(string) Trust { return trust }, by)
+}
+
+// HandlePacketScopedBy is HandlePacketScoped plus the authenticator name (see HandlePacketBy).
+func (s *Source) HandlePacketScopedBy(b []byte, trustFor func(host string) Trust, by string) {
 	now := s.now()
 	changed := false
 	var hosts []string
 	for _, a := range ParsePacket(b) {
-		if s.cache.Apply(a, now, trustFor(a.Host)) {
+		if s.cache.ApplyBy(a, now, trustFor(a.Host), by) {
 			changed = true
 			// Wake an on-demand waiter ONLY for a host that genuinely landed in the view
 			// (Apply==true) — never on a no-op re-announcement, so a waiter can't be woken
@@ -253,10 +271,12 @@ func (s *Source) Run(ctx context.Context, progress func()) {
 	for {
 		select {
 		case <-ctx.Done():
+			s.saveTrusted() // final flush, so a restart resumes from the latest state
 			return
 		case <-t.C:
 			s.cache.Expire(s.now())
 			s.publish() // republish so TTLs in the view decay toward expiry
+			s.saveTrusted()
 			progress()
 		}
 	}

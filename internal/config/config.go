@@ -117,6 +117,11 @@ type MDNSConfig struct {
 	// MaxTrusted bounds the persistent trusted store so even a compromised trusted key cannot
 	// grow it without limit; independent of the volatile cache's LRU. Default 1024; "0" => default.
 	MaxTrusted int `toml:"max_trusted"`
+	// PersistTrusted (default on) keeps the trusted store in <cache.dir>/mdns-trusted.json
+	// across restarts, so trusted names keep their internal answers instead of falling back to
+	// public ones until the notifiers re-announce. On load, entries whose TSIG key was removed
+	// or no longer covers the host, or past trusted_grace, are dropped.
+	PersistTrusted bool `toml:"persist_trusted"`
 }
 
 // LocalDomainLabel returns the normalized bare local-domain label (lowercased, no dots),
@@ -539,7 +544,7 @@ func Default() Config {
 		MDNS: MDNSConfig{
 			LocalDomain: "lan", StaleGrace: "30m", GoodbyeGrace: "5m", ServiceDiscovery: true,
 			ResolveOnDemand: true, ResolveOnDemandWait: "300ms", ServeDNSSD: true,
-			TrustedGrace: "168h", MaxTrusted: 1024,
+			TrustedGrace: "168h", MaxTrusted: 1024, PersistTrusted: true,
 		},
 		Cloudflare: CFConfig{ReadTokenFile: "/etc/splitdns/cloudflare-read.token"},
 		DDNS:       DDNSConfig{Enabled: false, DryRun: true, Rate: "10m", Reconcile: "30m", NotifySocket: "/run/splitdns/notify.sock"},

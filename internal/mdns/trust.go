@@ -48,6 +48,10 @@ const trustedTTL = 120
 type trustedEntry struct {
 	addrs map[netip.Addr]struct{}
 	seen  time.Time // last strong-trust announcement — drives the optional trustedGrace cap
+	// by names the authenticator of the latest announcement ("tsig:<key>" or "socket"; ""
+	// when the caller did not say). Persisted, so a restart can drop entries whose key was
+	// removed or re-scoped (persist.go) instead of resurrecting them.
+	by string
 }
 
 // applyTrustedLocked reconciles one strong-trust announcement into the trusted store and
@@ -58,10 +62,11 @@ type trustedEntry struct {
 //   - Otherwise the set is reconciled: outside burstWindow a fresh announcement REPLACES the
 //     set (so a renumber drops the old address); within it the sets union (A/AAAA split
 //     across packets). seen is refreshed so a re-announcing cron keeps the entry alive.
-func (c *Cache) applyTrustedLocked(a Announcement, now time.Time) bool {
+func (c *Cache) applyTrustedLocked(a Announcement, now time.Time, by string) bool {
 	if a.TTL == 0 {
 		if _, ok := c.trusted[a.Host]; ok {
 			delete(c.trusted, a.Host)
+			c.trustedGen++
 			return true
 		}
 		return false
@@ -84,6 +89,10 @@ func (c *Cache) applyTrustedLocked(a Announcement, now time.Time) bool {
 		te.addrs[addr] = struct{}{}
 	}
 	te.seen = now
+	if by != "" {
+		te.by = by
+	}
+	c.trustedGen++ // any refresh (even an unchanged set moves seen) is worth persisting
 	return trustedKey(te.addrs) != before
 }
 
@@ -111,6 +120,7 @@ func (c *Cache) expireTrustedLocked(now time.Time) {
 	for h, te := range c.trusted {
 		if now.Sub(te.seen) > c.trustedGrace {
 			delete(c.trusted, h)
+			c.trustedGen++
 		}
 	}
 }
@@ -127,6 +137,7 @@ func (c *Cache) evictOldestTrustedLocked() {
 	}
 	if victim != "" {
 		delete(c.trusted, victim)
+		c.trustedGen++
 	}
 }
 

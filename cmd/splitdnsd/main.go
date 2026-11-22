@@ -22,6 +22,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -187,6 +188,11 @@ func main() {
 		mdns.WithServiceDiscovery(discoveryEvery),
 		mdns.WithTrustedStore(cfg.MDNS.TrustedGraceDuration(), cfg.MDNS.MaxTrusted),
 	}
+	trustedPath := ""
+	if cfg.MDNS.PersistTrusted && cfg.Cache.Dir != "" {
+		trustedPath = filepath.Join(cfg.Cache.Dir, "mdns-trusted.json")
+		srcOpts = append(srcOpts, mdns.WithTrustedPersistence(trustedPath, func(m string) { slog.Warn(m) }))
+	}
 	if cfg.MDNS.ResolveOnDemand {
 		srcOpts = append(srcOpts, mdns.WithOnDemand(cfg.MDNS.ResolveOnDemandWaitDuration()))
 		slog.Info("mdns on-demand resolution enabled", "wait", cfg.MDNS.ResolveOnDemandWaitDuration())
@@ -225,6 +231,16 @@ func main() {
 	}
 	trusted := func(a netip.Addr) bool { return trustedSrc.Contains(a) }
 	verify := mdns.NewSigVerifier(tsigKeys).WithHostScopes(keyHosts)
+	if trustedPath != "" {
+		// Re-check every persisted trusted entry against the CURRENT keys: a removed key, a
+		// narrowed host scope, or a disabled notify socket must not survive the restart.
+		keep := mdns.TrustedKeeper(verify, cfg.DDNS.NotifySocket != "")
+		if n, lerr := src.LoadTrusted(keep); lerr != nil {
+			slog.Warn("trusted store not restored", "err", lerr)
+		} else {
+			slog.Info("trusted store restored", "entries", n, "path", trustedPath)
+		}
+	}
 	if lis, lerr := mdns.Listen(src, 5353, trusted, verify, cfg.DDNS.RequireSignature, func(m string) { slog.Warn(m) }); lerr != nil {
 		slog.Warn("mDNS listener unavailable (LAN/*.local resolution degraded)", "err", lerr)
 	} else {

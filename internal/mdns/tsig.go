@@ -112,6 +112,15 @@ func (v *SigVerifier) VerifyKey(b []byte) (string, bool) {
 	return key, true
 }
 
+// HasKey reports whether key (canonical or not) is configured.
+func (v *SigVerifier) HasKey(key string) bool {
+	if v == nil {
+		return false
+	}
+	_, ok := v.secrets[canonKeyName(key)]
+	return ok
+}
+
 // Permits reports whether a signature made with key (as returned by VerifyKey) may
 // authenticate an announcement for host. Unscoped keys permit every host.
 func (v *SigVerifier) Permits(key, host string) bool {
