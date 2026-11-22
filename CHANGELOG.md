@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-11-22
+
+### Security
+- **Scoped TSIG hosts are claimed.** A host listed in any key's `hosts` may now be
+  announced as trusted only by the keys that list it; unscoped keys keep every other
+  name. Before, an unscoped key (e.g. one that signs DHCP client names) could also speak
+  for a name another key was scoped to. Configs without any `hosts` are unaffected.
+  Entries restored from the trusted store are checked the same way.
+
 ### splitdns-notify
 - **`[notify] multicast`** (default `true`): set `false` in `notify.toml` to skip the
   link-local multicast announcement, so a notifier that reaches the resolver by unicast no
@@ -204,7 +213,8 @@ mDNS helper, and the optional `splitdnsd-selfbuild` unattended security-rebuild 
   an adversarial chaos suite, and a golden-parity harness. CI gates on vet, govulncheck,
   golangci-lint, race tests, short fuzz, and a pristine/no-attribution scan.
 
-[Unreleased]: https://github.com/gutschke/splitdns/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/gutschke/splitdns/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/gutschke/splitdns/releases/tag/v0.5.1
 [0.5.0]: https://github.com/gutschke/splitdns/releases/tag/v0.5.0
 [0.4.0]: https://github.com/gutschke/splitdns/releases/tag/v0.4.0
 [0.3.0]: https://github.com/gutschke/splitdns/releases/tag/v0.3.0

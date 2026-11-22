@@ -1,3 +1,13 @@
+splitdnsd (0.5.1) unstable; urgency=medium
+
+  * TSIG host scopes are claims: a host listed in any key's hosts may be
+    announced as trusted only by the keys listing it.
+  * splitdns-notify: [notify] multicast (default true); -no-multicast still
+    overrides.
+  * Ship splitdnsd.minimal.toml; install docs start from the release .debs.
+
+ -- gutschke <gutschke@users.noreply.github.com>  Sun, 22 Nov 2026 12:11:45 -0800
+
 splitdnsd (0.5.0) unstable; urgency=medium
 
   * Trusted mDNS allocations survive restarts ([mdns] persist_trusted, default
