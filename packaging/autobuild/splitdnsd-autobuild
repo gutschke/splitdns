@@ -59,6 +59,15 @@ base=$(cat "$LIBDIR/VERSION" 2>/dev/null || true)
 [ -n "$base" ] || base="${sd_ver%%+*}"
 [ -n "$base" ] || base="${sn_ver%%+*}"
 [ -n "$base" ] || die "cannot determine base version (no $LIBDIR/VERSION and neither package installed)"
+# Installed binaries newer than the shipped source would make the target version lower
+# than theirs: every run would report "up to date" and never rebuild them again (and
+# --force would downgrade). Fail instead, so the administrator is emailed.
+for v in "$sd_ver" "$sn_ver"; do
+  [ -n "$v" ] || continue
+  if dpkg --compare-versions "${v%%+*}" gt "$base"; then
+    die "installed $v is newer than this self-build's source ($base); upgrade splitdnsd-selfbuild to ${v%%+*}"
+  fi
+done
 want=$(BASE_VERSION="$base" GO="$("$LIBDIR/select-go.sh" | head -1)" "$LIBDIR/pkg-version.sh" version) \
   || die "could not compute target version (no apt Go toolchain?)"
 
