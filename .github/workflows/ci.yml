@@ -33,17 +33,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24.x'
+          go-version: '1.26.x'
           cache: true
       - name: go vet
         run: go vet ./...
       - name: govulncheck (BLOCKING)
         run: |
           # Install with module mode (the repo-wide GOFLAGS=-mod=vendor would otherwise
-          # reject `go install` with "cannot query module"). Pin a version whose go.mod
-          # directive is <= the pinned toolchain — govulncheck >= 1.5 needs Go 1.25, but
-          # GOTOOLCHAIN=local holds us at 1.24.
-          env GOFLAGS= GOWORK=off go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          # reject `go install` with "cannot query module"). The scan reports the stdlib of
+          # the Go that runs it, so this job uses a supported Go (1.26.x), not the 1.24
+          # minimum from go.mod.
+          env GOFLAGS= GOWORK=off go install golang.org/x/vuln/cmd/govulncheck@v1.10.0
           # Ship policy: BLOCK on a reachable vuln in a vendored module (fixable here);
           # WARN (non-blocking) on a reachable Go-stdlib vuln (fixed by the apt toolchain
           # / self-rebuild, not from this repo). See scripts/govulncheck-gate.sh + design §11.
@@ -55,6 +55,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
+          # golangci-lint v1 cannot type-check a Go 1.26 stdlib; lint results do not
+          # depend on the toolchain, so lint stays on the go.mod minimum.
           go-version: '1.24.x'
           cache: true
       - name: golangci-lint (BLOCKING — enforces the §3 context gate)
@@ -68,7 +70,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24.x'
+          go-version: '1.26.x'
           cache: true
       # The race detector needs cgo; production binaries are still built static.
       - name: go test -race
@@ -82,7 +84,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24.x'
+          go-version: '1.26.x'
           cache: true
       # Bounded fuzz of every FuzzXxx target; runner has few cores so memory is fine.
       - name: make test-fuzz-short
