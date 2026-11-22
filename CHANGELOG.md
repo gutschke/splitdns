@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-11-22
+
 ### mDNS
 - **Trusted allocations survive restarts.** New `[mdns] persist_trusted` (default `true`)
   keeps the trusted store in `<[cache] dir>/mdns-trusted.json` (mode 0600, written on change
@@ -190,7 +192,8 @@ mDNS helper, and the optional `splitdnsd-selfbuild` unattended security-rebuild 
   an adversarial chaos suite, and a golden-parity harness. CI gates on vet, govulncheck,
   golangci-lint, race tests, short fuzz, and a pristine/no-attribution scan.
 
-[Unreleased]: https://github.com/gutschke/splitdns/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/gutschke/splitdns/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/gutschke/splitdns/releases/tag/v0.5.0
 [0.4.0]: https://github.com/gutschke/splitdns/releases/tag/v0.4.0
 [0.3.0]: https://github.com/gutschke/splitdns/releases/tag/v0.3.0
 [0.1.0]: https://github.com/gutschke/splitdns/releases/tag/v0.1.0

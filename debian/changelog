@@ -1,3 +1,14 @@
+splitdnsd (0.5.0) unstable; urgency=medium
+
+  * Trusted mDNS allocations survive restarts ([mdns] persist_trusted, default
+    on): kept in <[cache] dir>/mdns-trusted.json; on load, entries of removed or
+    re-scoped TSIG keys, socket entries while the socket is off, and entries past
+    trusted_grace are dropped. No DDNS write-back on restore.
+  * Self-build: fail loudly when the installed packages are newer than the shipped
+    source; read the apt version from golang-1.NN-go when the metapackage is absent.
+
+ -- gutschke <gutschke@users.noreply.github.com>  Sun, 22 Nov 2026 10:24:22 -0800
+
 splitdnsd (0.4.0) unstable; urgency=medium
 
   * Host-scoped TSIG keys: [[ddns.tsig_keys]] takes an optional hosts list; a
