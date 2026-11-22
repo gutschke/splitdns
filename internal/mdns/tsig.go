@@ -17,10 +17,13 @@ import (
 // configured), so callers can use it unconditionally.
 //
 // A key may be scoped to a set of hosts (see WithHostScopes): its signature then
-// authenticates only those hosts, so a notifier holding it cannot speak for others.
+// authenticates only those hosts, so a notifier holding it cannot speak for others. A
+// scoped host is also CLAIMED: unscoped keys no longer authenticate it, so a broad key
+// (say, one that signs DHCP client names) cannot take over a name another key owns.
 type SigVerifier struct {
 	secrets map[string]string          // canonical key name (lowercase, trailing dot) -> base64 secret
-	scopes  map[string]map[string]bool // canonical key name -> permitted bare hosts; absent = any host
+	scopes  map[string]map[string]bool // canonical key name -> permitted bare hosts; absent = any unclaimed host
+	claimed map[string]bool            // union of all scopes: hosts only their scoping keys may speak for
 	mu      sync.Mutex
 	seen    map[string]time.Time // accepted TSIG MAC -> first-seen; anti-replay within the window
 	now     func() time.Time     // injectable clock (tests)
@@ -46,18 +49,21 @@ func NewSigVerifier(secrets map[string]string) *SigVerifier {
 }
 
 // WithHostScopes restricts keys to the bare hosts they may authenticate (as produced
-// by config.DDNSConfig.TSIGKeyHosts). A key with no entry keeps speaking for any host.
+// by config.DDNSConfig.TSIGKeyHosts). A key with no entry keeps speaking for any host
+// that no scope lists.
 // It returns v for chaining and is a no-op on a nil verifier.
 func (v *SigVerifier) WithHostScopes(scopes map[string][]string) *SigVerifier {
 	if v == nil || len(scopes) == 0 {
 		return v
 	}
 	v.scopes = make(map[string]map[string]bool, len(scopes))
+	v.claimed = map[string]bool{}
 	for k, hosts := range scopes {
 		set := make(map[string]bool, len(hosts))
 		for _, h := range hosts {
 			if c := canonHost(h); c != "" {
 				set[c] = true
+				v.claimed[c] = true
 			}
 		}
 		v.scopes[canonKeyName(k)] = set
@@ -122,16 +128,18 @@ func (v *SigVerifier) HasKey(key string) bool {
 }
 
 // Permits reports whether a signature made with key (as returned by VerifyKey) may
-// authenticate an announcement for host. Unscoped keys permit every host.
+// authenticate an announcement for host. A scoped key permits its own hosts; an unscoped
+// key permits every host that no key's scope claims.
 func (v *SigVerifier) Permits(key, host string) bool {
 	if v == nil {
 		return false
 	}
+	h := canonHost(host)
 	set, scoped := v.scopes[canonKeyName(key)]
 	if !scoped {
-		return true
+		return !v.claimed[h]
 	}
-	return set[canonHost(host)]
+	return set[h]
 }
 
 // freshMAC returns true the FIRST time a given TSIG MAC is seen and false for any repeat

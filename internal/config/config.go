@@ -262,9 +262,10 @@ type DDNSConfig struct {
 //
 // Hosts optionally scopes the key: a signature made with it authenticates only these bare
 // host labels (as announced, e.g. "edge" for edge.local). Any other host in the same packet
-// is graded as if the packet were unsigned. Empty = the key may speak for any host, which
-// keeps a single shared key working; give each off-box notifier its own scoped key so a
-// compromised machine can only move its own records.
+// is graded as if the packet were unsigned. Listed hosts are also claimed: keys without
+// Hosts may no longer speak for them. Empty = the key may speak for any unclaimed host,
+// which keeps a single shared key working; give each off-box notifier its own scoped key
+// so a compromised machine can only move its own records.
 type TSIGKey struct {
 	Name       string   `toml:"name"`
 	Secret     string   `toml:"secret"`

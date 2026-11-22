@@ -257,8 +257,11 @@ notifiers. Generate a key with \fBsplitdns-notify \-\-genkey\fR.
 An optional \fBhosts\fR array scopes a key to the bare host labels it may speak for
 (as announced, e.g. \fB"edge"\fR for \fIedge.local\fR); for any other host in the same
 packet the signature is ignored and the announcement is graded as if it were unsigned.
-Without \fBhosts\fR a key may speak for any host. Give each off-box notifier its own
-scoped key, so a compromised machine can only move its own records.
+Listed hosts are also \fIclaimed\fR: a key without \fBhosts\fR may no longer speak for
+them, so a broad key (for example one that signs DHCP client names) cannot take over a
+name another key owns. Several keys may list the same host. Without \fBhosts\fR a key
+may speak for any unclaimed host. Give each off-box notifier its own scoped key, so a
+compromised machine can only move its own records.
 .TP
 .B require_signature
 Boolean. When true, only \fBTSIG\fR-signed (or \fBnotify_socket\fR) announcements may

@@ -139,10 +139,36 @@ func TestSigVerifierHostScope(t *testing.T) {
 		t.Error("scoped key must not permit a host outside its scope")
 	}
 	if !v.Permits(shared, "anything") {
-		t.Error("an unscoped key must keep permitting every host")
+		t.Error("an unscoped key must keep permitting unclaimed hosts")
+	}
+	if v.Permits(shared, "edge") || v.Permits(shared, "Edge.local.") {
+		t.Error("an unscoped key must not speak for a host another key's scope claims")
 	}
 	var nilv *SigVerifier
 	if nilv.Permits(scoped, "edge") || nilv.WithHostScopes(map[string][]string{scoped: {"edge"}}) != nil {
 		t.Error("nil verifier must permit nothing and stay nil")
+	}
+}
+
+func TestHostScopesSharedClaim(t *testing.T) {
+	// Two scoped keys may list the same host; both keep it, unscoped keys lose it.
+	v := NewSigVerifier(map[string]string{"a.": "x", "b.": "y", "wide.": "z"}).
+		WithHostScopes(map[string][]string{"a": {"gw", "nas"}, "b": {"gw"}})
+	for _, tc := range []struct {
+		key, host string
+		want      bool
+	}{
+		{"a.", "gw", true}, {"b.", "gw", true}, {"a.", "nas", true}, {"b.", "nas", false},
+		{"wide.", "gw", false}, {"wide.", "nas", false}, {"wide.", "laptop", true},
+		{"a.", "laptop", false},
+	} {
+		if got := v.Permits(tc.key, tc.host); got != tc.want {
+			t.Errorf("Permits(%s, %s) = %v, want %v", tc.key, tc.host, got, tc.want)
+		}
+	}
+	// Without any scope, every key speaks for every host (unchanged default).
+	open := NewSigVerifier(map[string]string{"wide.": "z"})
+	if !open.Permits("wide.", "gw") {
+		t.Error("no scopes configured: an unscoped key must permit every host")
 	}
 }
