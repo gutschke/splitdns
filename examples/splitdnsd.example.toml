@@ -191,10 +191,12 @@ notify_socket   = "/run/splitdns/notify.sock"
 # (host or host:port; default port 5353); empty does NOT mean "no delivery" — the socket
 # and multicast are still used. socket is the resolver socket path (default
 # /run/splitdns/notify.sock, matching [ddns].notify_socket above); -socket overrides it.
+# multicast = false skips the multicast channel (default true; -no-multicast overrides).
 # The tsig_* fields make the helper SIGN its announcements so the resolver authenticates
 # them regardless of source IP; prefer tsig_secret_file over an inline tsig_secret. On
 # notify-only hosts these usually live in /etc/splitdns/notify.toml.
 # servers = ["192.0.2.53:5353"]
+# multicast        = true
 # socket           = "/run/splitdns/notify.sock"
 # tsig_key         = "edge-router"
 # tsig_secret_file = "/etc/splitdns/secrets/edge-router.tsig"

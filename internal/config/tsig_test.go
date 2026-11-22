@@ -77,6 +77,9 @@ tsig_secret = "aW5saW5l"
 	if n.Socket != "/run/custom/notify.sock" {
 		t.Errorf("socket = %q, want /run/custom/notify.sock", n.Socket)
 	}
+	if !n.MulticastEnabled() {
+		t.Errorf("multicast unset: MulticastEnabled() = false, want true (default on)")
+	}
 
 	// Secret file is folded into TSIGSecret when no inline secret is given.
 	p2 := filepath.Join(dir, "notify2.toml")
@@ -156,5 +159,32 @@ func TestReconcileDuration(t *testing.T) {
 	}
 	if d := Default().DDNS.Reconcile; d != "30m" {
 		t.Errorf("default reconcile = %q, want 30m", d)
+	}
+}
+
+func TestLoadNotifyMulticast(t *testing.T) {
+	dir := t.TempDir()
+	for _, tc := range []struct {
+		body string
+		want bool
+	}{
+		{"[notify]\nservers = [\"r\"]\n", true},
+		{"[notify]\nmulticast = true\n", true},
+		{"[notify]\nservers = [\"r\"]\nmulticast = false\n", false},
+	} {
+		p := filepath.Join(dir, "notify.toml")
+		if err := os.WriteFile(p, []byte(tc.body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		n, err := LoadNotify(p)
+		if err != nil {
+			t.Fatalf("LoadNotify(%q): %v", tc.body, err)
+		}
+		if got := n.MulticastEnabled(); got != tc.want {
+			t.Errorf("%q: MulticastEnabled() = %v, want %v", tc.body, got, tc.want)
+		}
+	}
+	if !(NotifyConfig{}).MulticastEnabled() {
+		t.Error("zero NotifyConfig: multicast should default on")
 	}
 }

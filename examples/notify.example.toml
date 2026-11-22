@@ -10,7 +10,7 @@
 
 [notify]
 # Delivery uses up to three best-effort channels, all attempted: the local unix socket
-# (tried first), the unicast servers below, and multicast (unless -no-multicast).
+# (tried first), the unicast servers below, and multicast (unless turned off below).
 
 # Additional unicast resolver target(s) used when the helper is run with no -server flag
 # (host or host:port; default port 5353). Point these at a stable name/VIP that follows
@@ -18,6 +18,11 @@
 # delivery" — the socket and multicast are still used; set this for resolvers on subnets
 # that multicast does not reach.
 # servers = ["resolver.lan"]
+
+# Announce to the link-local mDNS multicast groups as well (default true). Set false on a
+# notifier that reaches the resolver via servers (or the socket) and should not multicast
+# on its segments, e.g. a router with many interfaces. -no-multicast overrides this.
+# multicast = false
 
 # Resolver unix-socket path (the trusted local DDNS-trigger channel). Default
 # /run/splitdns/notify.sock, matching the resolver's [ddns].notify_socket — so leave it

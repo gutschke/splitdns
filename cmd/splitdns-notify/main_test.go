@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/base64"
+	"flag"
 	"net"
 	"net/netip"
 	"os"
@@ -378,4 +379,38 @@ func TestRelayClient(t *testing.T) {
 		t.Fatalf("relay client exit=%d, want 0", rc)
 	}
 	assertReceivedA(t, pc, "clienthost.local.", "10.0.0.3")
+}
+
+func TestEffectiveMulticast(t *testing.T) {
+	off, on := false, true
+	for _, tc := range []struct {
+		name               string
+		flagGiven, noMcast bool
+		cfg                *bool
+		want               bool
+	}{
+		{"defaults", false, false, nil, true},
+		{"config off", false, false, &off, false},
+		{"config on", false, false, &on, true},
+		{"flag off beats config on", true, true, &on, false},
+		{"flag =false beats config off", true, false, &off, true},
+		{"flag off, no config", true, true, nil, false},
+	} {
+		got := effectiveMulticast(tc.flagGiven, tc.noMcast, config.NotifyConfig{Multicast: tc.cfg})
+		if got != tc.want {
+			t.Errorf("%s: effectiveMulticast = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestFlagSet(t *testing.T) {
+	fs := flag.NewFlagSet("t", flag.ContinueOnError)
+	fs.Bool("no-multicast", false, "")
+	fs.Bool("quiet", false, "")
+	if err := fs.Parse([]string{"-no-multicast=false"}); err != nil {
+		t.Fatal(err)
+	}
+	if !flagSet(fs, "no-multicast") || flagSet(fs, "quiet") {
+		t.Errorf("flagSet: no-multicast=%v quiet=%v, want true/false", flagSet(fs, "no-multicast"), flagSet(fs, "quiet"))
+	}
 }

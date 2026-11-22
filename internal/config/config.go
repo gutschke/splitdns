@@ -386,14 +386,22 @@ func ResolveNotifyGroups(names []string) (gids map[uint32]string, unknown []stri
 // sent to when the caller passes no -server flag (empty => multicast only). The TSIG
 // fields, when set, make the helper cryptographically SIGN its announcements so the
 // resolver can authenticate them regardless of source IP; TSIGSecretFile reads the
-// base64 secret from a file instead of inlining it.
+// base64 secret from a file instead of inlining it. Multicast (default on) turns the
+// link-local mDNS multicast announcement off when set to false; see MulticastEnabled.
 type NotifyConfig struct {
 	Servers        []string `toml:"servers"`
-	Socket         string   `toml:"socket"` // resolver unix-socket path the helper connects to (default /run/splitdns/notify.sock); -socket overrides
+	Multicast      *bool    `toml:"multicast"` // nil = default (on); false = unicast/socket only; -no-multicast overrides
+	Socket         string   `toml:"socket"`    // resolver unix-socket path the helper connects to (default /run/splitdns/notify.sock); -socket overrides
 	TSIGKeyName    string   `toml:"tsig_key"`
 	TSIGSecret     string   `toml:"tsig_secret"`
 	TSIGSecretFile string   `toml:"tsig_secret_file"`
 	TSIGAlgorithm  string   `toml:"tsig_algorithm"`
+}
+
+// MulticastEnabled reports whether the helper should announce to the link-local mDNS
+// multicast groups. Unset means yes, so a stock install keeps working with no config.
+func (n NotifyConfig) MulticastEnabled() bool {
+	return n.Multicast == nil || *n.Multicast
 }
 
 // RateDuration parses the configured min-interval-per-host.

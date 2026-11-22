@@ -57,7 +57,9 @@ path that may trigger write\-back regardless of
 It is also sent as an ordinary authoritative mDNS response (no privileged source
 port is needed) by unicast to every configured resolver and, unless
 .B \-no\-multicast
-is given, multicast to the link\-local mDNS groups
+is given or
+.B [notify].multicast
+is false, multicast to the link\-local mDNS groups
 .RB ( 224.0.0.251 " and " ff02::fb )
 on each multicast\-capable interface. Delivery is best\-effort, matching mDNS.
 .SS Authenticating off\-box triggers (TSIG)
@@ -142,7 +144,11 @@ Set the mDNS cache\-flush bit (RFC 6762) so receivers replace any prior records 
 the name instead of adding to them.
 .TP
 .B \-no\-multicast
-Do not announce to the multicast groups; send only to the unicast targets.
+Do not announce to the multicast groups; send only to the socket and the unicast targets.
+Overrides
+.BR [notify].multicast ;
+.B \-no\-multicast=false
+turns multicast back on for one run.
 .TP
 .B \-quiet
 Suppress per\-target progress and soft\-error messages.

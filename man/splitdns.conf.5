@@ -294,7 +294,7 @@ Defaults for the
 .BR splitdns-notify (8)
 helper, which announces over up to three best-effort channels \(em all attempted when
 enabled, none required: the local authenticated unix \fBsocket\fR (tried first), the
-unicast \fBservers\fR below, and (unless \fB\-no\-multicast\fR) link-local multicast.
+unicast \fBservers\fR below, and (unless \fBmulticast\fR is false) link-local multicast.
 .TP
 .B socket
 Path to the resolver's authenticated unix socket the helper connects to (the trusted
@@ -310,6 +310,12 @@ port \fB5353\fR) an announcement is sent to when the caller passes no \fB\-serve
 These are independent of the socket and multicast: an empty list does NOT mean "no
 delivery" \(em the socket and multicast are still used. Set it for resolvers on subnets
 that multicast does not reach.
+.TP
+.B multicast
+Announce to the link-local mDNS groups (\fB224.0.0.251\fR, \fBff02::fb\fR). Default
+\fBtrue\fR. Set \fBfalse\fR on a notifier that reaches the resolver by \fBservers\fR or
+the socket and should stay quiet on its segment (a router with many interfaces, say).
+The \fB\-no\-multicast\fR flag overrides this either way.
 .TP
 .BR tsig_key ", " tsig_secret ", " tsig_secret_file ", " tsig_algorithm
 The TSIG key the helper SIGNS announcements with: a key \fBname\fR plus its base64

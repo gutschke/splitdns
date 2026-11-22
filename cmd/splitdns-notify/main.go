@@ -99,7 +99,7 @@ func run(argv []string, out, errOut *os.File) int {
 		cfgPath     = fs.String("config", "", "config file for [notify] (default: /etc/splitdns/notify.toml then splitdnsd.toml)")
 		port        = fs.Int("port", 5353, "mDNS UDP port for every target")
 		ttl         = fs.Uint("ttl", 900, "advertised record TTL in seconds; MUST exceed your re-announce interval (splitdnsd drops the record when it elapses) — comfortably above the longest interval avoids a resolve gap")
-		noMulticast = fs.Bool("no-multicast", false, "do not announce to the link-local mDNS multicast groups")
+		noMulticast = fs.Bool("no-multicast", false, "do not announce to the link-local mDNS multicast groups (overrides [notify].multicast; -no-multicast=false forces multicast on)")
 		cacheFlush  = fs.Bool("cache-flush", false, "set the mDNS cache-flush bit so receivers replace prior records")
 		quiet       = fs.Bool("quiet", false, "suppress per-target progress and soft-error messages")
 		verbose     = fs.Bool("verbose", false, "explain what is sent, how, signed or not, and whether each path succeeded")
@@ -166,18 +166,19 @@ func run(argv []string, out, errOut *os.File) int {
 	if len(unicast) == 0 {
 		unicast = ncfg.Servers
 	}
+	multicast := effectiveMulticast(flagSet(fs, "no-multicast"), *noMulticast, ncfg)
 	ann := &announcer{
 		ttl: uint32(*ttl), cacheFlush: *cacheFlush,
 		keyName: keyName, secret: secret, algo: algo, noTSIG: *noTSIG,
 		useSocket: !*noSocket && socketPath != "", socketPath: socketPath,
-		targets: buildTargets(unicast, *port, !*noMulticast),
+		targets: buildTargets(unicast, *port, multicast),
 	}
 	if cfgUsed != "" {
 		vf("config: %s", cfgUsed)
 	} else {
 		vf("config: none found (flags + socket/multicast defaults)")
 	}
-	vf("targets: socket=%v (%s) unicast=%d multicast=%v", ann.useSocket, socketPath, len(unicast), !*noMulticast)
+	vf("targets: socket=%v (%s) unicast=%d multicast=%v", ann.useSocket, socketPath, len(unicast), multicast)
 
 	// --listen: relay/daemon mode. Keeps the TSIG key in ONE small service so an
 	// unprivileged writer (a DHCP lease hook) just sends a datagram and needs no announce
@@ -203,7 +204,7 @@ func run(argv []string, out, errOut *os.File) int {
 		return 2
 	}
 	if len(res) == 0 {
-		fmt.Fprintf(errOut, "splitdns-notify: no delivery path (no socket and no UDP targets; give -server or drop -no-multicast)\n")
+		fmt.Fprintf(errOut, "splitdns-notify: no delivery path (no socket and no UDP targets; give -server, or re-enable multicast)\n")
 		return 1
 	}
 	sent, failed := 0, 0
@@ -547,6 +548,27 @@ func sendUnix(packed []byte, path string) error {
 	return err
 }
 
+// flagSet reports whether the named flag was given on the command line.
+func flagSet(fs *flag.FlagSet, name string) bool {
+	set := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
+}
+
+// effectiveMulticast merges -no-multicast with [notify].multicast. An explicit flag wins
+// (so -no-multicast=false re-enables multicast for one run); otherwise the config decides,
+// and an absent key means on.
+func effectiveMulticast(flagGiven, noMulticast bool, n config.NotifyConfig) bool {
+	if flagGiven {
+		return !noMulticast
+	}
+	return n.MulticastEnabled()
+}
+
 // loadNotifyConfig resolves and loads the [notify] config, returning the path actually
 // used ("" if none) and the parsed config. An explicit -config that fails to load is a
 // soft error (we continue with multicast-only); auto-discovery silently skips missing
@@ -626,6 +648,7 @@ func genTSIGKey(name string, out, errOut *os.File) int {
 # --- notifier: /etc/splitdns/notify.toml ---
 [notify]
 # servers      = ["resolver.lan"]   # unicast target(s); optional if multicast reaches the resolver
+# multicast    = false              # with servers set: skip the link-local multicast announcement
 tsig_key     = %q
 tsig_secret  = %q
 
