@@ -6,8 +6,9 @@ Detailed documentation beyond the top-level [README](../README.md),
 
 - **[configuration.md](configuration.md)** — every config section explained, with
   rationale and worked examples.
-- **[deployment.md](deployment.md)** — the three deployment modes, the parallel-safe
-  validation pattern, cutover, and arming dynamic-DNS write-back.
+- **[deployment.md](deployment.md)** — installing from a release or source, the three
+  deployment modes, the parallel-safe validation pattern, cutover, and arming
+  dynamic-DNS write-back.
 - **[encrypted-dns.md](encrypted-dns.md)** — the opt-in DoT/DoH front-end and DDR
   auto-upgrade discovery: the ADN certificate, the optional DNR-via-DHCP recipe, and
   how to verify a client actually upgraded.

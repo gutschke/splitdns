@@ -17,18 +17,39 @@ dynamic-DNS is disabled and in dry-run by default.
 
 ## Install
 
-The build produces **two** packages:
+splitdns ships as three Debian packages:
 
 | Package | Installs | Use on |
 |---------|----------|--------|
-| `splitdnsd` | the server binary, systemd unit, example config, man pages | the resolver host |
-| `splitdns-notify` | only the `splitdns-notify` helper + its man page (one static binary, no service, no user, no config) | any host that announces itself to the resolver |
+| `splitdnsd` | the server binary, systemd unit, example configs, man pages | the resolver host |
+| `splitdns-notify` | only the `splitdns-notify` helper and its man page (one static binary; no service, no user, no config) | any host that announces itself to the resolver |
+| `splitdnsd-selfbuild` | optional: rebuilds both binaries when the apt Go toolchain gets a security fix ([self-rebuild.md](self-rebuild.md)) | the resolver host |
+
+### Download a release
+
+Each [GitHub release](https://github.com/gutschke/splitdns/releases) carries the three
+`.deb` files and a `SHA256SUMS`. They are built on Ubuntu 24.04 LTS for amd64; the two
+binaries are static. Download them from the release page, or with `gh`:
 
 ```sh
-./scripts/build-deb.sh                       # -> dist/splitdnsd_<ver>_amd64.deb
-                                             #    dist/splitdns-notify_<ver>_amd64.deb
-sudo apt install ./dist/splitdnsd_*.deb      # the server (also pulls in splitdns-notify)
+gh release download --repo gutschke/splitdns --pattern '*.deb' --pattern SHA256SUMS
+sha256sum -c SHA256SUMS
+sudo apt install ./splitdnsd_*.deb        # the server (also pulls in splitdns-notify)
 ```
+
+### Or build from source
+
+You need Go 1.24 or newer (Ubuntu: `golang-1.24` or newer; Debian: `golang-go`):
+
+```sh
+git clone https://github.com/gutschke/splitdns && cd splitdns
+./scripts/build-deb.sh                    # -> dist/splitdnsd_<ver>_amd64.deb
+                                          #    dist/splitdns-notify_<ver>_amd64.deb
+                                          #    dist/splitdnsd-selfbuild_<ver>_all.deb
+sudo apt install ./dist/splitdnsd_*.deb
+```
+
+### What the package does
 
 Use `apt install ./…deb`, **not** `dpkg -i` — `dpkg` ignores `Recommends`, so the optional
 `ieee-data` package (OUI database that gives manufacturer names in the diagnostics host
@@ -40,6 +61,30 @@ The `splitdnsd` package creates the unprivileged `splitdns` account and `/etc/sp
 `/etc/splitdns/secrets`, `/var/lib/splitdns`, and installs a hardened unit. It does not
 ship a live config and does not start the service.
 
+### First start
+
+Start from the minimal config (mode 1: forwarder + local names, no account, no token):
+
+```sh
+sudo cp /usr/share/doc/splitdnsd/splitdnsd.minimal.toml /etc/splitdns/splitdnsd.toml
+sudoedit /etc/splitdns/splitdnsd.toml     # set [zones].reverse to your LAN
+sudo -u splitdns splitdnsd -config /etc/splitdns/splitdnsd.toml -check-config
+```
+
+`splitdnsd` binds `:53`. If another resolver already runs on this host
+(`systemd-resolved`'s stub, `dnsmasq`, `unbound`), either stop it or, better, follow
+[Validate in parallel](#validate-in-parallel-recommended-for-every-install) below and give
+splitdnsd its own address first. For a host with nothing on `:53`:
+
+```sh
+sudo systemctl enable --now splitdnsd
+dig @127.0.0.1 example.org A +short       # forwarding works
+dig @127.0.0.1 somehost.local A +short    # mDNS works
+```
+
+The full annotated config is next to it (`splitdnsd.example.toml`); every key
+is optional. Modes 2 and 3 are added section by section, as described below.
+
 ### `splitdns-notify` on other hosts
 
 Hosts that only need to *announce* their name/address to the resolver — to refresh its
@@ -49,7 +94,7 @@ systemd unit, and creates no `splitdns` user, so the server cannot be started th
 by accident:
 
 ```sh
-sudo apt install ./dist/splitdns-notify_*.deb   # just the helper; no server
+sudo apt install ./splitdns-notify_*.deb        # just the helper; no server
 splitdns-notify host1 203.0.113.45              # announce this host to the resolver
 ```
 
@@ -65,7 +110,9 @@ splitdns-notify -no-socket -server resolver.lan host1 203.0.113.45
 ```
 
 To avoid repeating flags, drop a `/etc/splitdns/notify.toml` (see the package's
-`notify.example.toml`) with a `[notify] servers = ["resolver.lan"]`. Use `-v`/`--verbose`
+`notify.example.toml`) with a `[notify] servers = ["resolver.lan"]`. Add
+`multicast = false` there if the resolver is reachable by unicast and the host should not
+multicast on its segments (a router with many interfaces, for example). Use `-v`/`--verbose`
 to see which config was used, whether the announcement was signed, and the per-path result.
 
 ### Letting non-root local services trigger (no key) — `notify_groups`

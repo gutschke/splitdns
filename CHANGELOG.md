@@ -6,6 +6,18 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### splitdns-notify
+- **`[notify] multicast`** (default `true`): set `false` in `notify.toml` to skip the
+  link-local multicast announcement, so a notifier that reaches the resolver by unicast no
+  longer needs `-no-multicast` on every call. The flag still overrides the config either
+  way (`-no-multicast=false` forces multicast on).
+
+### Packaging / docs
+- `splitdnsd` now ships `splitdnsd.minimal.toml` next to the full example in
+  `/usr/share/doc/splitdnsd/`.
+- The deployment guide and README start from the release `.debs` (checksum-verified),
+  with building from source as the alternative, and cover all three packages.
+
 ## [0.5.0] — 2026-11-22
 
 ### mDNS

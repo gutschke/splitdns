@@ -19,7 +19,7 @@ On the resolver:
 #    lightweight choice (relay to a smarthost); any MTA works — nothing is hard-coded.
 sudo apt install msmtp msmtp-mta bsd-mailx      # then configure /etc/msmtprc
 # 2. The self-build package (pulls in the apt Go toolchain + helpers).
-sudo apt install ./dist/splitdnsd-selfbuild_*.deb
+sudo apt install ./splitdnsd-selfbuild_*.deb
 # 3. Set where failures are emailed.
 sudo cp /usr/share/doc/splitdnsd-selfbuild/autobuild.conf.example /etc/splitdns/autobuild.conf
 sudoedit /etc/splitdns/autobuild.conf           # set ADMIN_EMAIL

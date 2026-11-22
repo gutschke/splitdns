@@ -80,10 +80,11 @@ A secure LAN forwarder with local (`.lan` / `.local`) and reverse-PTR names — 
 account, no token:
 
 ```sh
-./scripts/build-deb.sh && sudo apt install ./dist/splitdnsd_*.deb
-sudo cp examples/splitdnsd.minimal.toml /etc/splitdns/splitdnsd.toml
+# .debs from https://github.com/gutschke/splitdns/releases (or ./scripts/build-deb.sh)
+sudo apt install ./splitdnsd_*.deb
+sudo cp /usr/share/doc/splitdnsd/splitdnsd.minimal.toml /etc/splitdns/splitdnsd.toml
 sudoedit /etc/splitdns/splitdnsd.toml      # set your reverse zone
-splitdnsd -config /etc/splitdns/splitdnsd.toml -check-config   # validate first
+sudo -u splitdns splitdnsd -config /etc/splitdns/splitdnsd.toml -check-config
 sudo systemctl enable --now splitdnsd
 ```
 
