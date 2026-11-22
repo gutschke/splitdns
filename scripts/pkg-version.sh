@@ -20,7 +20,13 @@ here=$(cd "$(dirname "$0")" && pwd)
 
 gover=$(GOTOOLCHAIN=local "$GO" version | sed -n 's/.*go\([0-9.]*\).*/\1/p')   # 1.24.4
 gominor=$(echo "$gover" | sed -n 's/^\([0-9]*\.[0-9]*\).*/\1/p')               # 1.24
+# golang-1.NN is a metapackage; golang-1.NN-go (same source, same version) holds the
+# compiler and may be installed alone. Without either, the stamp falls back to
+# +go1.NN.P, which sorts ABOVE every later +go1.NN+apt... stamp, so backports would
+# never trigger a rebuild.
 aptver=$(dpkg-query -W -f='${Version}' "golang-${gominor}" 2>/dev/null || true)
+[ -n "$aptver" ] ||
+  aptver=$(dpkg-query -W -f='${Version}' "golang-${gominor}-go" 2>/dev/null || true)
 
 if [ -n "$aptver" ]; then
   aptrev=$(echo "$aptver" | sed 's/^[0-9]*://; s/[-~+]/./g')                   # 1.24.4.1ubuntu1.24.04.2
